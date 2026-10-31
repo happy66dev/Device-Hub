@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 应用清单：声明权限、前台服务、开机自启与主界面喵 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 上报需要网络喵 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Android 9 起明文 HTTP 需要显式允许，这里通过 application 属性开启喵 -->
+    <!-- 前台服务权限，Android 9 起必须声明喵 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14 起前台服务需要声明具体类型喵 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 开机自启权限喵 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Android 13 起发通知需要运行时权限喵 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 引导用户把本应用加入电池优化白名单喵 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 读取应用使用情况需要该特殊权限，由用户在设置页手动授予喵 -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+    <!-- Android 11 起要读取其它应用的名称必须声明可见性，这里声明查询全部应用喵 -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <application
+        android:name=".DeviceHubApp"
+        android:allowBackup="false"
+        android:label="Device Hub"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault.Light"
+        android:usesCleartextTraffic="true">
+
+        <!-- 主界面：权限引导与配置喵 -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:label="Device Hub">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 运行日志页：从主界面跳进来，不对外暴露喵 -->
+        <activity
+            android:name=".ui.LogActivity"
+            android:exported="false"
+            android:label="运行日志"
+            android:parentActivityName=".ui.MainActivity" />
+
+        <!-- 前台服务：定时采集与上报喵 -->
+        <service
+            android:name=".service.UploadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- 保活任务：定期检查服务是否还活着，重启后依然有效喵 -->
+        <service
+            android:name=".service.KeepAliveJob"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <!-- 开机与升级后自动拉起服务喵 -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <!-- 部分国产 ROM 重启后发的是快启广播喵 -->
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

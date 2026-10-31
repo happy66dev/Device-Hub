@@ -1,0 +1,13 @@
+{
+  "server_url": "http://192.168.2.245:8080",
+  "ingest_token": "change-me-device-hub-token",
+  "device_id": "",
+  "display_name": "",
+  "sample_interval_seconds": 5,
+  "report_interval_seconds": 60,
+  "request_timeout_seconds": 10,
+  "verify_tls": true,
+  "role": "workstation",
+  "tag": "",
+  "mirror_process_names": ["scrcpy.exe"]
+}

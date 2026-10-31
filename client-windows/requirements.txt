@@ -1,0 +1,7 @@
+# Windows 采集端依赖
+# 进程名、CPU、内存、磁盘、电量等系统信息喵
+psutil>=5.9,<7.0
+# 上报用的 HTTP 客户端，支持超时与 MockTransport 测试喵
+httpx>=0.27,<1.0
+# 单元测试喵
+pytest>=8.0,<9.0

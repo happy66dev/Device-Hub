@@ -1,0 +1,119 @@
+# device-hub 服务端配置示例
+# 用法：复制成 config.yaml 再按需改；改完要重启服务端进程才生效喵
+# 喵~注意：config.yaml 里会有 AppSecret 与口令，它不进版本库，只提交这份示例喵
+
+server:
+  # 监听地址，0.0.0.0 表示局域网与 Tailscale 都能连进来喵
+  host: "0.0.0.0"
+  # 监听端口，注意别和本机 new-api 的 3000、NapCat 的 6099/7998/8001 冲突喵
+  port: 8080
+  # SQLite 数据库路径，相对路径以本配置文件所在目录为基准喵
+  db_path: "data/device_hub.db"
+  # 日志级别，可选 debug / info / warning / error 喵
+  log_level: "info"
+
+ingest:
+  # 客户端上报时必须带的共享口令，至少 8 位，务必改成随机串喵
+  token: "change-me-device-hub-token"
+  # 单个请求体最大字节数，超过直接 413，防止恶意大包喵
+  max_payload_bytes: 262144
+
+retention:
+  # 原始上报记录保留天数，过期由清理任务删除喵
+  detail_days: 7
+  # 使用时长与电量聚合数据保留天数喵
+  aggregate_days: 30
+
+napcat:
+  # 是否随服务端一起启动 QQ 机器人（NapCat 需要另外单独跑）喵
+  enabled: false
+  # 指向 NapCat 新增的正向 WebSocket 服务端，端口 7999 专供本项目喵
+  ws_url: "ws://127.0.0.1:7999"
+  # 必须与 NapCat onebot11 配置里该服务端的 token 完全一致喵
+  token: ""
+  # 断线后多少秒重连喵
+  reconnect_seconds: 10
+  # 机器人自己的 QQ 号，用于识别消息里是否 @ 了它喵
+  self_qq: ""
+
+# 官方 QQ Bot 通道：与 NapCat 并存，填好 AppID / AppSecret 再把 enabled 打开喵
+qqbot:
+  # 是否启用官方通道（默认关闭，避免没凭据时启动报错）喵
+  enabled: false
+  # 开放平台（q.qq.com）里机器人详情页的 AppID 喵
+  app_id: ""
+  # 开放平台的 AppSecret，泄露等于把机器人交给别人，绝对不要提交到仓库喵
+  app_secret: ""
+  # 业务接口根地址，沙箱环境填 https://sandbox.api.sgroup.qq.com 喵
+  api_base: "https://api.bot.qq.com"
+  # 订阅事件位，33554432 是 GROUP_AND_C2C_EVENT（群与单聊消息）喵
+  intents: 33554432
+  # access_token 提前多少秒刷新（官方有效期内重复请求会返回同一个）喵
+  token_refresh_margin_seconds: 60
+  # 心跳提前量（秒），避免刚好卡在服务端要求的边界上喵
+  heartbeat_slack_seconds: 5
+  # 单次 HTTP 请求超时（秒）喵
+  request_timeout_seconds: 10.0
+  # 断线重连间隔（秒）喵
+  reconnect_seconds: 10
+  # 把收到的 group_openid / member_openid 打进日志，方便抄进下面的白名单喵
+  log_openids: true
+  # 是否把收到的原始事件与准入结论打进日志，排查「@ 了却不回复」时打开喵
+  # 喵~注意：打开后群里每条消息都会整条记进日志，长期开会让日志涨得很快喵
+  debug_events: false
+  # 允许免 @ 直接发命令的群 openid；留空表示所有群都必须 @ 机器人才响应喵
+  # 从日志里抄：搜「group_openid=」
+  free_command_group_openids: []
+  # 免 @ 时是否仍要求命令前缀（/ 或 ／）喵
+  free_command_require_prefix: true
+  # 免 @ 时的最低群内角色：any / admin / owner 喵
+  free_command_min_role: "any"
+
+acl:
+  # 允许响应的群号列表，留空表示任何群都不响应喵
+  # 例：whitelist_groups: [123456789, 987654321]
+  whitelist_groups: []
+  # 禁止使用命令的 QQ 号列表，优先于白名单群判断喵
+  # 例：blacklist_users: [10001]
+  blacklist_users: []
+  # 官方通道允许响应的 group_openid 列表（和上面的整数群号不是一套，别混填）喵
+  # 从日志里抄：搜「group_openid=」
+  whitelist_group_openids: []
+  # 官方通道禁止使用的 member_openid 列表喵
+  blacklist_member_openids: []
+  # 官方通道允许私聊的 user_openid 列表，留空表示私聊一律不响应喵
+  private_user_openids: []
+
+render:
+  # 设备详情里最多展示多少项硬件信息喵
+  max_hardware_fields: 8
+  # 是否允许把命令结果截成图片（需要系统里有 node 与 Edge/Chrome）喵
+  image_enabled: true
+
+roles:
+  # 强制标记为服务器的设备 ID 列表，服务器只在 RDP 会话活动时统计使用时长喵
+  # 也可以在 Web 看板里点按钮标记，两边都会生效（配置优先级更高）喵
+  # 例：servers: ["win-v77u51rt5c3-9c06"]
+  servers: []
+  # 强制标记为工作站的设备 ID 列表，用来纠正客户端自报的服务器角色喵
+  workstations: []
+
+gating:
+  # 是否启用「RDP 未连接就暂停统计」的门控喵
+  enabled: true
+  # RDP 状态超过多少秒没刷新就认为不可信（客户端可能已经退出）喵
+  rdp_stale_seconds: 180
+  # 是否启用远程桌面目标校验：连到自己人就由那台设备计时，认不出来的目标照常记 mstsc 喵
+  rdp_require_known_client: true
+  # 手动放行的目标地址或机器名，按自己人处理喵
+  rdp_allowed_clients: []
+
+# 授时：所有时间戳以阿里云 NTP 为准，不依赖客户端与浏览器时钟喵
+clock:
+  enabled: true
+  # 留空表示用内置的 ntp.aliyun.com ~ ntp4.aliyun.com 列表喵
+  servers: []
+  # 每 30 分钟对齐一次喵
+  sync_interval_seconds: 1800
+  # 单次握手超时（秒）喵
+  timeout_seconds: 2.0

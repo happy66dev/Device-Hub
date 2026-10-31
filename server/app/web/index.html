@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>device-hub 控制台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <!-- 顶部功能栏：品牌、功能导航、右侧操作喵 -->
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#/overview">
+        <span class="brand-mark">DH</span>
+        <span class="brand-text">
+          <strong>device-hub</strong>
+          <small>设备状态控制台</small>
+        </span>
+      </a>
+
+      <nav class="nav" id="nav" aria-label="功能导航">
+        <button class="nav-item active" data-tab="overview" type="button">概览</button>
+        <button class="nav-item" data-tab="devices" type="button">设备</button>
+        <button class="nav-item" data-tab="timeline" type="button">时间轴</button>
+        <button class="nav-item" data-tab="rankings" type="button">应用排行</button>
+        <button class="nav-item" data-tab="bot" type="button">命令测试</button>
+        <button class="nav-item" data-tab="config" type="button">配置</button>
+        <button class="nav-item" data-tab="settings" type="button">设置</button>
+      </nav>
+
+      <div class="topbar-actions">
+        <span class="live" id="live-indicator"><span class="live-dot"></span><span id="live-text">未连接</span></span>
+        <button class="icon-btn" id="refresh-btn" type="button" title="立即刷新">刷新</button>
+        <button class="btn primary" id="token-btn" type="button">口令</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="page">
+    <!-- 概览：KPI + 设备卡片喵 -->
+    <section class="tab-panel active" id="panel-overview">
+      <div class="kpi-row" id="kpi-row"></div>
+      <div class="section-head">
+        <h2>设备总览</h2>
+        <p class="muted">点卡片查看详情；被门控的设备会标出暂停原因</p>
+      </div>
+      <div class="card-grid" id="overview-grid"></div>
+    </section>
+
+    <!-- 设备：列表 + 详情喵 -->
+    <section class="tab-panel" id="panel-devices">
+      <div class="section-head">
+        <h2>设备列表</h2>
+        <p class="muted">点击任意一行查看电量曲线、使用时间轴与应用排行</p>
+      </div>
+      <div class="panel" id="device-table-wrap"></div>
+      <div id="device-detail"></div>
+    </section>
+
+    <!-- 时间轴：按天看 0-24 点的应用使用喵 -->
+    <section class="tab-panel" id="panel-timeline">
+      <div class="section-head">
+        <h2>时间轴</h2>
+        <p class="muted">按天查看 0-24 点的应用使用；45° 斜纹是空档（设备在线但人离开了），离线（没有心跳）直接留空</p>
+      </div>
+      <div class="panel">
+        <div class="toolbar">
+          <div class="toolbar-group">
+            <select id="tl-device" class="select"></select>
+            <input id="tl-date" type="date">
+            <button class="btn ghost" id="tl-prev" type="button">前一天</button>
+            <button class="btn ghost" id="tl-next" type="button">后一天</button>
+            <button class="btn ghost" id="tl-today" type="button">今天</button>
+            <button class="btn ghost" id="tl-people" type="button">编辑设备组</button>
+          </div>
+          <div class="toolbar-group">
+            <button class="btn ghost" id="tl-zoom-out" type="button" title="缩小时间轴">缩小</button>
+            <span class="muted" id="tl-zoom-label">1×</span>
+            <button class="btn ghost" id="tl-zoom-in" type="button" title="放大时间轴">放大</button>
+            <button class="btn ghost" id="tl-zoom-reset" type="button">复位</button>
+          </div>
+          <span class="muted" id="tl-summary"></span>
+        </div>
+        <div class="tl-scroll" id="tl-scroll">
+          <div class="tl-inner" id="tl-inner">
+            <div class="tl-axis" id="tl-axis"></div>
+            <div class="tl-track" id="tl-track"></div>
+            <div class="tl-lanes" id="tl-lanes"></div>
+            <div class="tl-now" id="tl-now" hidden></div>
+            <div class="tl-pointer" id="tl-pointer" hidden></div>
+            <div class="tl-tip" id="tl-tip" hidden></div>
+          </div>
+        </div>
+        <div class="tl-legend" id="tl-legend"></div>
+      </div>
+    </section>
+
+    <!-- 应用排行：跨设备汇总喵 -->
+    <section class="tab-panel" id="panel-rankings">
+      <div class="section-head">
+        <h2>应用排行</h2>
+        <p class="muted">按使用时长汇总所有设备，可切换时间窗口</p>
+      </div>
+      <div class="panel">
+        <div class="toolbar">
+          <div class="segmented" id="range-switch">
+            <button class="seg-item active" data-hours="24" type="button">近 24 小时</button>
+            <button class="seg-item" data-hours="72" type="button">近 3 天</button>
+            <button class="seg-item" data-hours="168" type="button">近 7 天</button>
+          </div>
+          <div class="segmented" id="rank-scope-switch">
+            <button class="seg-item active" data-scope="all" type="button">总排行</button>
+            <button class="seg-item" data-scope="device" type="button">按设备</button>
+            <button class="seg-item" data-scope="group" type="button">按组</button>
+          </div>
+          <span class="muted" id="ranking-summary"></span>
+        </div>
+        <div id="ranking-body"></div>
+      </div>
+    </section>
+
+    <!-- 命令测试：不经过 QQ 直接跑一遍命令喵 -->
+    <section class="tab-panel" id="panel-bot">
+      <div class="section-head">
+        <h2>命令测试</h2>
+        <p class="muted">不经过 QQ，直接把命令跑一遍，验证机器人的回复内容</p>
+      </div>
+      <div class="conn-note" id="bot-conn">正在读取机器人状态…</div>
+      <div class="bot-layout">
+        <div class="panel">
+          <h3>命令</h3>
+          <div class="field-row">
+            <input id="bot-input" type="text" placeholder="例如 /happy设备 或 happy在干嘛" autocomplete="off" spellcheck="false">
+            <button class="btn primary" id="bot-send" type="button">发送</button>
+          </div>
+          <div class="chips" id="bot-chips"></div>
+          <details class="acl-box">
+            <summary>模拟白名单检查（可选）</summary>
+            <div class="field-row">
+              <select id="bot-channel">
+                <option value="napcat">NapCat（OneBot）</option>
+                <option value="qqbot">官方 QQ Bot</option>
+              </select>
+              <input id="bot-group" type="text" placeholder="群号或 group_openid，留空则跳过白名单">
+              <input id="bot-user" type="text" placeholder="QQ 号或 member_openid，留空则不查黑名单">
+            </div>
+            <label class="check-row"><input id="bot-mention" type="checkbox" checked> 这条消息 @ 了机器人（官方通道免 @ 群可取消勾选）</label>
+            <p class="muted">NapCat 填整数群号；官方通道填 group_openid（日志里搜「group_openid=」）。</p>
+          </details>
+          <p class="bot-status muted" id="bot-status">还没有发送命令</p>
+        </div>
+        <div class="panel">
+          <div class="panel-head-row">
+            <h3>回复预览</h3>
+            <button class="btn ghost" id="bot-copy" type="button">复制文本</button>
+          </div>
+          <pre class="reply" id="bot-reply">—</pre>
+          <div id="bot-image"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 设置：口令、门控说明、接口说明喵 -->
+    <section class="tab-panel" id="panel-settings">
+      <div class="section-head">
+        <h2>设置</h2>
+        <p class="muted">口令只保存在这台浏览器里，不会发给第三方</p>
+      </div>
+      <div class="settings-grid">
+        <div class="panel">
+          <h3>上报口令</h3>
+          <p class="muted">与服务端 <code>config.yaml</code> 的 <code>ingest.token</code> 一致</p>
+          <div class="field-row">
+            <input id="settings-token" type="password" placeholder="X-Ingest-Token" autocomplete="off" spellcheck="false">
+            <button class="btn primary" id="settings-save" type="button">保存</button>
+            <button class="btn ghost" id="settings-clear" type="button">清除</button>
+          </div>
+          <h3>自动刷新</h3>
+          <label class="switch-row">
+            <input id="auto-refresh" type="checkbox" checked>
+            <span>每 30 秒自动刷新</span>
+          </label>
+        </div>
+
+        <div class="panel">
+          <h3>存储占用</h3>
+          <p class="muted">历史记录不会自动删除，库太大时在这里清理</p>
+          <div id="storage-stats" class="storage-stats"><p class="empty">加载中…</p></div>
+          <div class="field-row">
+            <label class="muted" for="storage-days">保留最近</label>
+            <input id="storage-days" type="number" min="1" max="3650" value="30">
+            <span class="muted">天</span>
+            <button class="btn ghost" id="storage-cleanup" type="button">清理更早的数据</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>统计门控规则</h3>
+          <table class="rules">
+            <thead><tr><th>场景</th><th>是否计时</th></tr></thead>
+            <tbody>
+              <tr><td>服务器角色，RDP 已连接且投屏窗口不在前台</td><td><span class="tag ok">计时</span></td></tr>
+              <tr><td>服务器角色，RDP 未连接</td><td><span class="tag warn">暂停</span></td></tr>
+              <tr><td>服务器角色，投屏窗口在前台（人在看手机）</td><td><span class="tag warn">暂停</span></td></tr>
+              <tr><td>安卓标签命中投屏窗口，且投屏窗口在前台</td><td><span class="tag ok">计时</span></td></tr>
+              <tr><td>安卓标签命中投屏窗口，但投屏窗口在后台</td><td><span class="tag warn">暂停</span></td></tr>
+              <tr><td>安卓标签没命中（直接拿手机用）</td><td><span class="tag ok">计时</span></td></tr>
+              <tr><td>前台是远程桌面客户端（mstsc / msrdc）</td><td><span class="tag warn">暂停</span></td></tr>
+              <tr><td>键鼠空闲超过 60 秒（AFK）</td><td><span class="tag warn">暂停</span></td></tr>
+            </tbody>
+          </table>
+          <p class="muted">暂停只停使用时长，心跳、电量、当前应用照常上报。</p>
+        </div>
+
+        <div class="panel">
+          <h3>接口</h3>
+          <ul class="api-list">
+            <li><code>GET /api/v1/dashboard</code> 设备卡片数据</li>
+            <li><code>GET /api/v1/devices/{id}</code> 单台详情</li>
+            <li><code>GET /api/v1/rankings</code> 跨设备应用排行</li>
+            <li><code>POST /api/v1/devices/{id}/role</code> 改角色</li>
+            <li><code>POST /api/v1/bot/command</code> 命令测试（不经过 QQ）</li>
+            <li><code>GET /api/v1/devices/{id}/windows</code> 当前打开的窗口</li>
+            <li><code>GET /api/v1/storage</code> / <code>POST /api/v1/storage/cleanup</code> 存储统计与清理</li>
+            <li><code>GET/POST /api/v1/icons</code> 应用图标</li>
+          </ul>
+          <p class="muted">全部需要请求头 <code>X-Ingest-Token</code>。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 配置：机器人通道、白名单、重启喵 -->
+    <section class="tab-panel" id="panel-config">
+      <div class="section-head">
+        <h2>配置</h2>
+        <p class="muted">直接改服务端 <code>config.yaml</code>，注释与排版保持不变；保存后<strong>立刻热更新生效</strong>，机器人通道会自动重连，只有端口与数据库路径需要重启</p>
+      </div>
+      <div class="panel">
+        <div class="config-toolbar">
+          <span class="muted" id="config-path">加载中…</span>
+          <span class="spacer"></span>
+          <button class="btn ghost" id="config-test-napcat" type="button">测试 NapCat 连接</button>
+          <button class="btn ghost" id="config-test-qqbot" type="button">测试官方通道</button>
+          <button class="btn primary" id="config-save" type="button">保存配置</button>
+          <button class="btn danger" id="config-restart" type="button">重启服务</button>
+        </div>
+        <p class="config-status" id="config-status"></p>
+        <div class="config-fields" id="config-fields"><p class="empty">加载中…</p></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    device-hub · 数据来自各设备上报，时间以服务端阿里云授时为准（东八区展示）
+  </footer>
+
+  <!-- 口令弹窗喵 -->
+  <div class="modal-backdrop hidden" id="token-modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="token-modal-title">
+      <h3 id="token-modal-title">填入口令</h3>
+      <p class="muted">与服务端 <code>config.yaml</code> 的 <code>ingest.token</code> 一致，只存在本机浏览器。</p>
+      <input id="modal-token" type="password" placeholder="X-Ingest-Token" autocomplete="off" spellcheck="false">
+      <div class="modal-actions">
+        <button class="btn ghost" id="modal-cancel" type="button">取消</button>
+        <button class="btn primary" id="modal-save" type="button">保存并加载</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 设备组编辑弹窗喵 -->
+  <div class="modal-backdrop hidden" id="people-modal">
+    <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="people-modal-title">
+      <h3 id="people-modal-title">设备组</h3>
+      <p class="muted">把多台设备归到一个人名下，组内顺序就是优先级：时间真重叠时靠前的设备保留完整时长，靠后的被裁掉。</p>
+      <div class="people-editor" id="people-editor"></div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="people-add" type="button">新增设备组</button>
+        <span class="spacer"></span>
+        <button class="btn ghost" id="people-cancel" type="button">取消</button>
+        <button class="btn primary" id="people-save" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast hidden" id="toast"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

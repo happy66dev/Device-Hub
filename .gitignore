@@ -1,0 +1,45 @@
+# Python 字节码缓存目录，运行时自动生成，不需要进版本库喵
+__pycache__/
+*.py[cod]
+# 本地虚拟环境目录，每台机器各自安装，不共享喵
+.venv/
+venv/
+# 测试与工具产生的缓存喵
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+# 运行期数据库文件，属于本机私有数据，不进版本库喵
+server/data/
+*.db
+*.db-wal
+*.db-shm
+# 客户端本地配置（含上报口令与自动生成的设备 ID），不进版本库喵
+client-windows/config.json
+# 服务端真实配置含 AppSecret 与上报口令，仓库里只放 config.example.yaml 喵
+server/config.yaml
+# Android 本机 SDK 配置与构建产物喵
+client-android/local.properties
+client-android/.gradle/
+client-android/**/build/
+client-android/.idea/
+*.iml
+# PyInstaller 打包产物喵
+client-windows/build/
+client-windows/dist/
+*.spec
+# Kotlin 编译器的会话缓存目录，构建时自动生成喵
+client-android/.kotlin/
+# Android / Gradle 构建产物喵
+client-android/.gradle/
+client-android/build/
+client-android/app/build/
+client-android/local.properties
+# IDE 配置喵
+.idea/
+*.iml
+.vscode/
+# 日志文件喵
+*.log
+logs/
+# 客户端运行期的待上报数据缓存，属于本机私有数据喵
+client-windows/usage-state.json
