@@ -1587,8 +1587,14 @@ def _load_day_timeline(
         # 查连续段：泳道口径保留重叠，合并口径按优先级裁剪喵
         if merged_view:
             segments = queries.day_usage_segments(connection, device_ids, start, end, merge_gap_seconds)
+            # 喵~注意：顶层色块要按优先级裁，否则同一时刻会叠两层颜色；
+            # 但**应用轴**必须保留每台设备的完整记录——低优先级设备的应用
+            # 在裁剪口径下会整段消失，图上就看不到那台设备到底用了什么喵
+            lane_segments = queries.day_usage_lanes(connection, device_ids, start, end, merge_gap_seconds)
         else:
             segments = queries.day_usage_lanes(connection, device_ids, start, end, merge_gap_seconds)
+            # 单设备不需要两套数据，应用轴直接复用喵
+            lane_segments = segments
         # 查心跳，用来区分「离线（没有心跳）」和「空档（在线但 AFK）」喵
         heartbeats = queries.day_heartbeats(connection, device_ids, start, end)
         # 设备 ID 到展示名的映射，给聚合泳道标设备名喵
@@ -1681,6 +1687,20 @@ def _load_day_timeline(
                 "device_name": device_names.get(segment.device_id, segment.device_id),
             }
             for segment in segments
+        ],
+        # 喵~注意：应用轴专用的一份数据，保留每台设备的完整记录、不按优先级裁剪。
+        # 顶层色块仍用上面的 segments（裁剪过的），两者分工不同喵
+        "lane_segments": [
+            {
+                "app": segment.app,
+                "package": segment.package,
+                "icon_key": _icon_key_of(icon_keys, segment.app, segment.package),
+                "start": segment.start.isoformat().replace("+00:00", "Z"),
+                "end": segment.end.isoformat().replace("+00:00", "Z"),
+                "seconds": segment.seconds,
+                "device_name": device_names.get(segment.device_id, segment.device_id),
+            }
+            for segment in lane_segments
         ],
         "title_spans": [
             {

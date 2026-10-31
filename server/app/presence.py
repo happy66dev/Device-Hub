@@ -37,6 +37,11 @@ EDGE_TOLERANCE_SECONDS = 180
 # 否则短空档（那一分钟里只剩几秒使用采样）永远画不出斜纹，色块之间留空白喵
 MIN_AFK_SECONDS_PER_MINUTE = 30
 
+# 喵~注意：短于这个秒数的状态段直接丢掉不留痕——把空档边界挪到客户端给的
+# 精确时刻时会在边界切出 0.0-0.9 秒的残余段（实测 95 个状态段里 41 个是这种），
+# 前端按百分比定位，0.6 秒折合宽度不到千分之一像素，画出来是一条若隐若现的竖线喵
+MIN_VISIBLE_SECONDS = 1
+
 # 喵~注意：精确区间补出来的空档碎片短于这个秒数就丢掉，避免时间轴上全是碎斜纹喵
 # 喵~注意：原来是 10 秒，但上报间隔 60 秒、AFK 边界帧往往还带 1-2 秒残留使用量，
 # 这 1-2 秒会从 AFK 碎片尾部扣掉，导致 10-11 秒的真实短空档只剩 8-9 秒被误丢，
@@ -468,24 +473,23 @@ def _fill_residual_afk(
     输入：已算好的区间列表、使用区间、心跳列表、心跳超时、窗口起止。
     输出：补过空隙后的区间列表（按时间升序）。
 
-    喵~注意：要补的只有一种空隙——设备**已经不再上报**（心跳断了、被判离线），
-    但"最后一段使用结束"和"离线判定起点"之间还漏着一截没人记录的空白。
+    喵~注意：要补的是「使用段之间、或使用段与离线段之间」漏着的那截空白。
     这一截既不是使用、也不是离线的正式起点，时间轴上就是一条白线，
     而主人明确要求「不允许出现无使用记录的空档」。
 
-    为什么不能整段窗口地扫：正常在线时"这段时间没开任何应用"本来就是
-    合法的空白，填成空档会把 afk 时长算错。所以这里只认紧挨着离线段的那种空隙，
-    而且只补在离线段**之前**——离线之后的部分本来就该是离线，不必补喵。
+    补成什么按心跳判断：那段期间还有心跳就补空档（人在但没操作），
+    心跳已经超时就补离线（客户端掉线了）。
+
+    为什么不能整段窗口地扫：窗口开头那段本来就该由整分钟判定归到离线，
+    不需要兜底；这里只认贴着使用段的那些缝，避免把合法的空白也算进来喵。
     """
     # 喵~防御：空窗口没什么可补的喵
     if end <= start:
         return intervals
-    # 只关心离线段，空档段有自己的精确边界喵
+    # 离线段：用来判定"缝的右端到哪为止"喵
     offline_spans = _merge_intervals(
         [(item.start, item.end) for item in intervals if item.kind == KIND_OFFLINE]
     )
-    if not offline_spans:
-        return intervals
     # 使用段合并后找"最后一段使用"喵
     merged_usage = _merge_intervals([(left, right) for left, right in usage_spans if right > left])
     # 已覆盖的区间：使用段 + 已判出的空档/离线喵
@@ -493,27 +497,58 @@ def _fill_residual_afk(
         [(item.start, item.end) for item in intervals if item.kind in (KIND_OFFLINE, KIND_AFK)]
         + merged_usage
     )
-    # 候选空隙锚点：每段离线的起点，以及每段使用段之后的位置喵
-    # 喵~注意：按分钟判定有盲区——心跳超时线落在分钟中间时，
-    # 那一分钟既有"还活着"的心跳记录、又没有任何使用，结果什么都不产出，
-    # 时间轴上就留下一条白线。所以使用段之后的位置也要当成锚点喵
-    anchors: list[datetime] = [offline_start for offline_start, _ in offline_spans]
-    # 每段使用段的结束时刻也作为锚点，接住"使用结束后就掉线"的情况喵
-    for _, usage_right in merged_usage:
-        anchors.append(usage_right)
-    # 逐个锚点找它前面那段没被覆盖的空白喵
+    # 候选空隙：只补紧贴使用段的那几种白线喵
+    # 喵~注意：按分钟判定有盲区——心跳超时线落在分钟中间时，那一分钟既有
+    # "还活着"的心跳记录、又没有任何使用，整分钟判定什么都不产出，
+    # 时间轴上就留下一条白线（实测 80 秒）。实测下来白线只有三类：
+    # ① 相邻两段使用之间；② 使用结束到离线判定起点之间；③ 离线结束后到使用开始之间。
+    # 三类都要盖上，否则时间轴会漏白喵
     patches: list[tuple[datetime, datetime]] = []
-    for offline_start in sorted(set(anchors)):
-        # 找这个锚点之前最后结束的使用段喵
-        previous_end: datetime | None = None
-        for usage_left, usage_right in merged_usage:
-            if usage_right <= offline_start:
-                previous_end = usage_right if previous_end is None else max(previous_end, usage_right)
-        # 喵~防御：锚点之前没有使用记录就没什么可接的喵
-        if previous_end is None:
+    # 空隙左端只取"紧贴使用段"的位置喵
+    # 喵~注意：为什么不把窗口起点、也不把"在线期间整段没开应用"的时段当左端——
+    # 窗口开头那段本来就该由整分钟判定归到离线，不需要兜底；
+    # 而"整段在线但没开任何应用"在真实数据里根本不会出现：客户端每轮上报
+    # 必然带 afk 标记（Windows 看键鼠空闲、安卓看是否息屏），
+    # 活着就一定有 afk=True 或 afk=False，不存在两边都不占的状态喵
+    left_edges: list[tuple[datetime, int]] = []
+    # ① 每段使用结束 → 接下一段使用开始 / 夹在中间的离线起点：覆盖"两段使用之间"喵
+    for index, (_, usage_end) in enumerate(merged_usage):
+        left_edges.append((usage_end, index + 1))
+    # ② 每段离线结束 → 接它之后的第一段使用：覆盖"离线判完后到使用开始"的白线喵
+    # 喵~注意：这类必须真有下一段使用才补，否则离线结束后的大段空白会被误填喵
+    for _, offline_end in offline_spans:
+        next_index = 0
+        while next_index < len(merged_usage) and merged_usage[next_index][0] <= offline_end:
+            next_index += 1
+        if next_index < len(merged_usage):
+            left_edges.append((offline_end, next_index))
+    # 喵~注意：最后一段使用之后也要补，但右端不能直接取窗口末尾——
+    # 那样会把好几小时涂成空档。右端取"心跳彻底失效"的时刻，
+    # 也就是最后一条心跳 + 超时；再往后属于客户端不在了，交给离线喵。
+    # ① 里最后一段使用结束已经作为左端入队了，这里不再重复加喵
+    for gap_left_raw, next_index in left_edges:
+        # 喵~防御：这已经越界了就没有右边的段喵
+        if next_index > len(merged_usage):
             continue
-        gap_left = max(previous_end, start)
-        gap_right = min(offline_start, end)
+        # 找下一段使用开始（没有就用窗口末尾）喵
+        next_start = (
+            merged_usage[next_index][0] if next_index < len(merged_usage) else end
+        )
+        # 喵~注意：右端优先取"紧跟其后的离线段起点"——离线段是按整分钟切出来的，
+        # 它和使用段之间常常差几十秒，那几十秒正是要补的白线喵
+        trimmed_by_offline = False
+        for offline_start in sorted(offline_spans):
+            if gap_left_raw < offline_start[0] < next_start:
+                next_start = offline_start[0]
+                trimmed_by_offline = True
+                break
+        # 喵~注意：没有下一段使用、也没有离线可接时，右端截到"心跳失效线"——
+        # 再往后是客户端不在了，由整分钟判定归到离线，不该由兜底填成空档喵
+        if not trimmed_by_offline and next_index >= len(merged_usage) and heartbeats:
+            last_beat_at = max(beat.reported_at for beat in heartbeats)
+            next_start = min(next_start, last_beat_at + timeout)
+        gap_left = max(gap_left_raw, start)
+        gap_right = min(next_start, end)
         if gap_right <= gap_left:
             continue
         # 从这段里扣掉已被覆盖的部分，剩下的才是真正漏掉的空白喵
@@ -529,7 +564,13 @@ def _fill_residual_afk(
         if cursor < gap_right:
             patches.append((cursor, gap_right))
     # 喵~防御：没有空隙就原样返回喵
-    patches = [(left, right) for left, right in patches if right > left]
+    # 喵~注意：只补"窄缝"——超过 RESIDUAL_AFK_SECONDS 的空白交给整分钟判定，
+    # 否则"最后一段使用之后"那几个小时会被整段涂成空档，afk 时长直接算爆喵
+    patches = [
+        (left, right)
+        for left, right in patches
+        if right > left and (right - left).total_seconds() <= RESIDUAL_AFK_SECONDS
+    ]
     if not patches:
         return intervals
     # 心跳按时间排好，下面用双指针扫喵
@@ -799,14 +840,24 @@ def build_presence(
                 _afk_covered_seconds(spans_by_device.get(beat.device_id, []), spans, minute_start, minute_end)
                 for beat in covered
             )
-        # 归类：一台设备都没心跳是离线；空档覆盖够久、或整分钟都在 AFK 才算空档喵
+        # 喵~注意：总轴合成按「使用帧 > 任意设备 AFK > 任意设备 Offline」的优先级喵
+        # ① 只要这一分钟有使用帧，就一定是"在用"，压过 AFK 和离线喵
+        # ② 没有使用帧时，只要还有任何一台设备在线且 AFK，就算空档，压过离线喵
+        # ③ 一台在线的都没有，才算离线喵
         kind: str | None = None
-        if not covered:
+        if used:
+            # 有使用帧 → 在用，不产出区间（色块由使用段自己画）喵
+            kind = None
+        elif not covered:
             kind = KIND_OFFLINE
             offline_seconds += SECONDS_PER_MINUTE
-        elif afk_cover >= MIN_AFK_SECONDS_PER_MINUTE or (all(beat.afk for beat in covered) and not used):
+        elif afk_cover >= MIN_AFK_SECONDS_PER_MINUTE or all(beat.afk for beat in covered):
             kind = KIND_AFK
             afk_seconds += SECONDS_PER_MINUTE
+        else:
+            # 喵~注意：有设备在线、既没使用也没判 AFK（例如"活跃但没开任何应用"），
+            # 这一分钟算使用态——总轴上它属于"人在电脑前"，不能留白也不能算离线喵
+            kind = None
         # 喵~防御：在用状态不产出区间，但要把已经累积的区间收尾喵
         if kind is None:
             flush(minute_start)
@@ -835,6 +886,16 @@ def build_presence(
     # 所以裁完之后把整个窗口再扫一遍，任何没被覆盖的空白都补上。
     # 空白期间还有心跳就补空档，心跳已超时就补离线喵
     intervals = _fill_residual_afk(intervals, spans, heartbeats, timeout, start, end)
+    # 喵~注意：最后再清一遍亚秒碎片——把空档边界挪到客户端给的精确时刻时，
+    # 会在边界处切出 0.0-0.9 秒的残余段（实测 95 个状态段里有 41 个是这种）。
+    # 前端按百分比定位色块，0.6 秒折合宽度不到千分之一像素，
+    # 画出来就是一条若隐若现的竖线，看起来像"无使用记录的碎片"。
+    # 丢掉它们不影响总时长：这些秒数本来就不到 1 秒，四舍五入后是 0 喵
+    intervals = [
+        item
+        for item in intervals
+        if (item.end - item.start).total_seconds() >= MIN_VISIBLE_SECONDS
+    ]
     # 兜底补完之后按区间重算两个总时长，保证和图上色块对得上喵
     afk_seconds = sum(item.seconds for item in intervals if item.kind == KIND_AFK)
     offline_seconds = sum(item.seconds for item in intervals if item.kind == KIND_OFFLINE)

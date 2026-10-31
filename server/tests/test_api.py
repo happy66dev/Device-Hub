@@ -688,6 +688,45 @@ def test_timeline_total_uses_union_not_sum(client: TestClient, connection) -> No
     assert body["total_seconds"] == 600
 
 
+def test_timeline_lane_segments_keep_low_priority_usage(client: TestClient, connection) -> None:
+    """重叠时顶层色块按优先级裁，但应用轴必须保留低优先级设备的记录喵。
+
+    喵~注意：这是主人报的 issue——同一个时刻两台设备都有上报时，
+    总轴只取优先级高的那台，低优先级设备的应用帧在图上整个消失了。
+    修法是让后端额外下发 lane_segments（不裁剪），应用轴用它来画喵。
+    """
+    # 造两台设备，应用不同、采样时间完全重叠喵
+    now = datetime.now(timezone.utc)
+    apps = [("High.exe", "high.exe"), ("Low.exe", "low.exe")]
+    for index, (app, package) in enumerate(apps):
+        device_id = f"win-lane-pri-{index}"
+        connection.execute(
+            """
+            INSERT INTO devices (device_id, platform, display_name, os_version, hardware_json,
+                                 current_app_json, client_version, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, '', '{}', NULL, '0.1.0', ?, ?)
+            """,
+            (device_id, "windows", f"机器{index}", to_utc_text(now), to_utc_text(now)),
+        )
+        connection.execute(
+            "INSERT INTO usage_samples (device_id, app_name, package, sampled_at, seconds) VALUES (?, ?, ?, ?, ?)",
+            (device_id, app, package, to_utc_text(now - timedelta(minutes=5)), 600),
+        )
+    connection.commit()
+    # 高优先级设备放前面喵
+    today = now.astimezone().strftime("%Y-%m-%d")
+    body = client.get(
+        "/api/v1/timeline?devices=win-lane-pri-0,win-lane-pri-1&date=" + today,
+        headers=AUTH_HEADERS,
+    ).json()
+    # 顶层色块只保留高优先级设备那一段喵
+    top_apps = {segment["app"] for segment in body["segments"]}
+    assert top_apps == {"High.exe"}, "顶层色块没有按优先级裁剪"
+    # 喵~注意：这是本条的验收点——应用轴必须能看到低优先级设备的应用喵
+    lane_apps = {segment["app"] for segment in body["lane_segments"]}
+    assert lane_apps == {"High.exe", "Low.exe"}, "低优先级设备的应用帧丢了"
+
+
 def test_device_timeline_separates_offline_and_afk(client: TestClient, connection) -> None:
     """时间轴要能区分离线（没心跳）与空档（在线但 AFK）喵。"""
     # 造三条心跳：9 分钟前、8 分钟前（AFK）、刚刚（AFK），中间留一段心跳空窗喵

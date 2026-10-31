@@ -1774,8 +1774,13 @@ function renderTimeline(body) {
   updateTimelineNowLine();
   }
   // 按应用汇总出泳道，顺便定好颜色喵
+  // 喵~注意：应用轴要用 lane_segments——它是每台设备的完整记录，不按优先级裁剪。
+  // 顶层色块用 segments（裁剪过）才能不叠色，两者分工不同喵
+  const laneSegments = (body.lane_segments && body.lane_segments.length ? body.lane_segments : segments)
+    .slice()
+    .sort((left, right) => new Date(left.start) - new Date(right.start));
   const byApp = new Map();
-  for (const segment of segments) {
+  for (const segment of laneSegments) {
     if (!byApp.has(segment.app)) byApp.set(segment.app, { app: segment.app, seconds: 0, blocks: [], devices: [] });
     const entry = byApp.get(segment.app);
     entry.seconds += segment.seconds;
