@@ -33,7 +33,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .clock import DEFAULT_SERVERS, TrustedClock, get_clock, set_clock
 
-from . import botcheck, db, icons, ingest, people, presence, queries, settings, storage
+from . import acl, botcheck, db, icons, ingest, people, presence, queries, settings, storage
 from .bot import simulate
 from .bot.runner import BotRunner
 from .config import AppConfig, ConfigError, load_config, resolve_config_path
@@ -139,7 +139,9 @@ def _verify_token(request: Request, config: AppConfig) -> bool:
     if provided_token is None:
         return False
     # 常量时间比较，避免通过响应时间猜测口令喵
-    return hmac.compare_digest(provided_token, config.ingest.token)
+    # 喵~注意：compare_digest 遇到含非 ASCII 字符的 str 会抛 TypeError，
+    # 直接比 str 会让「口令含中文」或「攻击者发高位字节」变成 500，这里统一编成 bytes 再比喵
+    return hmac.compare_digest(provided_token.encode("utf-8"), config.ingest.token.encode("utf-8"))
 
 
 # 重启用的分离启动器：等旧进程释放端口后再拉起新进程喵
@@ -939,6 +941,104 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             }
         )
 
+    @application.get("/api/v1/acl/blocklist")
+    async def list_blocklist(request: Request) -> JSONResponse:
+        """黑名单列表：WebUI 用来展示与解封喵。"""
+        # 取当前配置喵
+        active_config: AppConfig = request.app.state.config
+        # 喵~防御：名单属于管理数据，必须带口令喵
+        if not _verify_token(request, active_config):
+            return _error_response(401, "invalid_token", "X-Ingest-Token 缺失或不匹配")
+        # 线程池里读文件喵
+        entries = await run_in_threadpool(acl.load_blocklist, active_config.server.db_path)
+        # 配置里写死的那几条也一并返回，前端要标明「来自配置、不可在此删除」喵
+        from_config = [
+            {
+                "channel": "napcat",
+                "target": str(item),
+                "note": "",
+                "created_at": "",
+                # 喵~注意：来源标记让前端决定按钮是否可用喵
+                "source": "config",
+            }
+            for item in active_config.acl.blacklist_users
+        ] + [
+            {
+                "channel": "qqbot",
+                "target": str(item),
+                "note": "",
+                "created_at": "",
+                "source": "config",
+            }
+            for item in active_config.acl.blacklist_member_openids
+        ]
+        runtime = [
+            {
+                "channel": entry.channel,
+                "target": entry.target,
+                "note": entry.note,
+                "created_at": entry.created_at,
+                "source": "runtime",
+            }
+            for entry in entries
+        ]
+        # 返回结果喵
+        return JSONResponse(content={"ok": True, "entries": runtime + from_config})
+
+    @application.post("/api/v1/acl/blocklist")
+    async def add_blocklist(request: Request) -> JSONResponse:
+        """拉黑一个人，立刻生效（不需要重启）喵。"""
+        # 取当前配置喵
+        active_config: AppConfig = request.app.state.config
+        # 喵~防御：写操作必须带口令喵
+        if not _verify_token(request, active_config):
+            return _error_response(401, "invalid_token", "X-Ingest-Token 缺失或不匹配")
+        try:
+            # 解析请求体喵
+            payload = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            # 喵~防御：body 不是合法 JSON 时给出明确提示喵
+            return _error_response(422, "invalid_payload", "请求体必须是合法 JSON")
+        # 喵~防御：body 必须是对象，否则字段全取不到喵
+        if not isinstance(payload, dict):
+            return _error_response(422, "invalid_payload", "请求体必须是对象")
+        try:
+            # 落盘喵
+            added = await run_in_threadpool(
+                acl.add_entry,
+                active_config.server.db_path,
+                str(payload.get("channel", "napcat")),
+                str(payload.get("target", "")),
+                str(payload.get("note", "")),
+            )
+        except acl.AclError as error:
+            # 喵~防御：校验失败直接把原因返回给前端喵
+            return _error_response(422, "invalid_payload", str(error))
+        # 返回是否真的新增喵
+        return JSONResponse(content={"ok": True, "added": added})
+
+    @application.delete("/api/v1/acl/blocklist/{channel}/{target}")
+    async def delete_blocklist(request: Request, channel: str, target: str) -> JSONResponse:
+        """解除拉黑，立刻生效喵。"""
+        # 取当前配置喵
+        active_config: AppConfig = request.app.state.config
+        # 喵~防御：写操作必须带口令喵
+        if not _verify_token(request, active_config):
+            return _error_response(401, "invalid_token", "X-Ingest-Token 缺失或不匹配")
+        # 喵~防御：通道名写错时直接拒绝，别静默什么都不做喵
+        if channel not in ("napcat", "qqbot"):
+            return _error_response(422, "invalid_payload", "通道只能是 napcat 或 qqbot")
+        try:
+            # 从运行时名单里删喵
+            removed = await run_in_threadpool(
+                acl.remove_entry, active_config.server.db_path, channel, target
+            )
+        except acl.AclError as error:
+            # 喵~防御：校验失败直接把原因返回给前端喵
+            return _error_response(422, "invalid_payload", str(error))
+        # 返回是否真的删掉了喵
+        return JSONResponse(content={"ok": True, "removed": removed})
+
     @application.get("/api/v1/timeline")
     async def merged_timeline(request: Request) -> JSONResponse:
         """把多台设备合并成一条时间轴，自用时它们的时间不会重叠喵。"""
@@ -1455,7 +1555,8 @@ def _verify_query_token(request: Request, config: AppConfig) -> bool:
     if not raw:
         return False
     # 常量时间比较，避免时序侧信道喵
-    return hmac.compare_digest(raw, config.ingest.token)
+    # 喵~注意：同 _verify_token，先编 bytes 再比，否则中文口令会 500 而不是 401 喵
+    return hmac.compare_digest(raw.encode("utf-8"), config.ingest.token.encode("utf-8"))
 
 
 def _save_icon(config: AppConfig, app: str, package: str, png_bytes: bytes) -> str:

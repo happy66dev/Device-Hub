@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import platform
+import sys
 
 from agent import collector
 
@@ -183,3 +184,180 @@ def test_normalize_window_title_keeps_plain_titles() -> None:
     assert collector.normalize_window_title("") == ""
     # 纯空白标题也返回空串喵
     assert collector.normalize_window_title("   ") == ""
+
+
+class _FakeWinreg:
+    """模拟 winreg 模块，用来把注册表读显卡的各条分支都覆盖到喵。"""
+
+    HKEY_LOCAL_MACHINE = "HKLM"
+
+    def __init__(self, subkeys: list[str], values: dict[str, dict[str, str]] | None = None) -> None:
+        # 枚举出来的子键顺序喵
+        self._subkeys = subkeys
+        # 每个子键下有哪些值名喵
+        self._values = values or {}
+        # 记录被打开过的路径，方便断言喵
+        self.opened: list[str] = []
+
+    def OpenKey(self, _root: str, path: str):  # noqa: N802 - 故意对齐 winreg 的命名喵
+        """模拟打开注册表项喵。"""
+        # 记下路径喵
+        self.opened.append(path)
+        # 喵~防御：路径不在预期里就当键不存在喵
+        if path != collector.GPU_CLASS_PATH and not path.startswith(collector.GPU_CLASS_PATH + "\\"):
+            raise OSError("找不到注册表项")
+        # 用自己当上下文管理器喵
+        return self
+
+    def __enter__(self) -> "_FakeWinreg":
+        """支持 with 语法喵。"""
+        return self
+
+    def __exit__(self, *_exc_info: object) -> bool:
+        """退出 with 时不吞异常喵。"""
+        return False
+
+    def EnumKey(self, _key: object, index: int) -> str:  # noqa: N802 - 对齐 winreg 命名喵
+        """按索引返回子键名，越界时抛 OSError 表示枚举结束喵。"""
+        # 喵~注意：真实 winreg 就是靠抛 OSError 表示枚举到头喵
+        if index >= len(self._subkeys):
+            raise OSError("枚举结束")
+        return self._subkeys[index]
+
+    def QueryValueEx(self, key: object, name: str):  # noqa: N802 - 对齐 winreg 命名喵
+        """返回值内容，没有这个值名时抛 OSError 喵。"""
+        # 找当前打开的是哪个子键喵
+        current = self.opened[-1].split("\\")[-1]
+        # 取该子键的值表喵
+        table = self._values.get(current, {})
+        # 喵~防御：值名不存在就按真实 winreg 抛 OSError 喵
+        if name not in table:
+            raise OSError("找不到值")
+        return table[name], 1
+
+
+def _patch_winreg(monkeypatch, fake: _FakeWinreg) -> None:
+    """把 collector 内部的 winreg 导入替换成假模块喵。"""
+    # 用 sys.modules 注入，模块内的延迟 import 就会拿到假的喵
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+
+
+def test_read_gpu_name_from_registry_prefers_first_card(monkeypatch) -> None:
+    """应按子键顺序取第一块能读到型号的显卡喵。"""
+    fake = _FakeWinreg(
+        ["Properties", "0001", "0000"],
+        {
+            "0000": {"DriverDesc": "Intel(R) HD Graphics 4400"},
+            "0001": {"DriverDesc": "NVIDIA GeForce RTX 4090"},
+        },
+    )
+    _patch_winreg(monkeypatch, fake)
+    # 喵~注意：子键名会先排序，所以 0000 应排在 0001 前面喵
+    assert collector.read_gpu_name_from_registry() == "Intel(R) HD Graphics 4400"
+
+
+def test_read_gpu_name_from_registry_falls_back_to_second_value_name(monkeypatch) -> None:
+    """DriverDesc 缺省时应改用 Device Description 喵。"""
+    fake = _FakeWinreg(["0000"], {"0000": {"Device Description": "AMD Radeon RX 580"}})
+    _patch_winreg(monkeypatch, fake)
+    # 应读到第二个候选值名喵
+    assert collector.read_gpu_name_from_registry() == "AMD Radeon RX 580"
+
+
+def test_read_gpu_name_from_registry_skips_non_instance_subkeys(monkeypatch) -> None:
+    """非四位数字的子键（如 Properties）应被跳过喵。"""
+    fake = _FakeWinreg(["Properties", "Configuration"], {"Properties": {"DriverDesc": "不该被读到"}})
+    _patch_winreg(monkeypatch, fake)
+    # 全被跳过后应返回空串喵
+    assert collector.read_gpu_name_from_registry() == ""
+
+
+def test_read_gpu_name_from_registry_returns_empty_on_oserror(monkeypatch) -> None:
+    """注册表打不开时应安静地返回空串喵。"""
+    class BrokenWinreg(_FakeWinreg):
+        """一打开就报错的假模块喵。"""
+
+        def OpenKey(self, _root: str, path: str):  # noqa: N802 - 对齐 winreg 命名喵
+            """模拟被策略锁定的注册表喵。"""
+            raise OSError("拒绝访问")
+
+    _patch_winreg(monkeypatch, BrokenWinreg([]))
+    # 喵~防御：不能抛异常，要返回空串让上层兜底喵
+    assert collector.read_gpu_name_from_registry() == ""
+
+
+def test_read_gpu_name_prefers_registry_and_skips_wmic(monkeypatch) -> None:
+    """注册表读到时不应再起 wmic 子进程喵。"""
+    # 注册表有值喵
+    monkeypatch.setattr(collector, "read_gpu_name_from_registry", lambda: "Intel(R) UHD 630")
+
+    def _boom() -> str:
+        """被调用就说明兜底逻辑没走对喵。"""
+        raise AssertionError("注册表已读到型号，不该再调用 wmic 喵")
+
+    monkeypatch.setattr(collector, "_read_gpu_name_from_wmic", _boom)
+    # 应直接返回注册表结果喵
+    assert collector.read_gpu_name() == "Intel(R) UHD 630"
+
+
+def test_read_gpu_name_falls_back_to_wmic(monkeypatch) -> None:
+    """注册表读不到时应回退到 wmic 喵。"""
+    # 注册表空喵
+    monkeypatch.setattr(collector, "read_gpu_name_from_registry", lambda: "")
+    # wmic 有值喵
+    monkeypatch.setattr(collector, "_read_gpu_name_from_wmic", lambda: "NVIDIA GeForce GTX 750")
+    # 应取 wmic 结果喵
+    assert collector.read_gpu_name() == "NVIDIA GeForce GTX 750"
+
+
+def test_read_gpu_name_wmic_passes_creation_no_window(monkeypatch) -> None:
+    """调 wmic 必须带 CREATE_NO_WINDOW，否则 GUI 进程会弹黑窗喵。"""
+    # 记录实际传进 subprocess.run 的参数喵
+    captured: dict[str, object] = {}
+
+    class FakeCompleted:
+        """假装跑完了的进程喵。"""
+
+        def __init__(self) -> None:
+            """给出正常输出喵。"""
+            self.stdout = "Name\nIntel(R) HD Graphics 4400\n"
+            self.returncode = 0
+
+    def fake_run(_args, **kwargs):
+        """捕获关键字参数喵。"""
+        captured.update(kwargs)
+        return FakeCompleted()
+
+    monkeypatch.setattr(collector.subprocess, "run", fake_run)
+    # 跑一次喵
+    assert collector._read_gpu_name_from_wmic() == "Intel(R) HD Graphics 4400"
+    # 喵~注意：这一行就是防黑窗的关键，缺了它每半小时会闪一下喵
+    assert captured.get("creationflags") == getattr(collector.subprocess, "CREATE_NO_WINDOW", 0)
+    # 喵~防御：解码失败要能兜底，不能抛 UnicodeDecodeError 喵
+    assert captured.get("errors") == "replace"
+
+
+def test_read_gpu_name_wmic_returns_unknown_on_missing_binary(monkeypatch) -> None:
+    """wmic 不存在时应返回"未知"而不是抛异常喵。"""
+    def fake_run(_args, **_kwargs):
+        """模拟系统里没有 wmic 喵。"""
+        raise FileNotFoundError("wmic")
+
+    monkeypatch.setattr(collector.subprocess, "run", fake_run)
+    # 应安静返回"未知"喵
+    assert collector._read_gpu_name_from_wmic() == "未知"
+
+
+def test_read_gpu_name_wmic_truncates_long_output(monkeypatch) -> None:
+    """超长型号应截断到上限，避免撑大上报体喵。"""
+    class FakeCompleted:
+        """假装返回超长型号喵。"""
+
+        def __init__(self) -> None:
+            """拼一个远超上限的名字喵。"""
+            self.stdout = "Name\n" + "G" * 200 + "\n"
+            self.returncode = 0
+
+    monkeypatch.setattr(collector.subprocess, "run", lambda *_a, **_k: FakeCompleted())
+    # 长度应被截到上限喵
+    assert len(collector._read_gpu_name_from_wmic()) == collector.MAX_GPU_NAME_LENGTH

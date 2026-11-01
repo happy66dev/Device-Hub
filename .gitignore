@@ -43,3 +43,5 @@ client-android/local.properties
 logs/
 # 客户端运行期的待上报数据缓存，属于本机私有数据喵
 client-windows/usage-state.json
+# 图标调试用的临时图片，曾经误入库一次，这里拦住喵
+tmp_icon.png

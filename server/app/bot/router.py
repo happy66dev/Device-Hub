@@ -18,7 +18,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
-from .. import db, queries
+from .. import acl as acl_module, db, queries
 from ..config import AppConfig
 from . import commands, dataset, expr, happy
 from .channel import (
@@ -122,7 +122,8 @@ def inspect_normalized(message: NormalizedMessage, config: AppConfig) -> tuple[b
     if message.group_key not in acl.whitelist_groups:
         return False, "", REASON_GROUP_NOT_WHITELISTED
     # 喵~防御：黑名单用户即使 @ 了机器人也不响应喵
-    if message.user_key in acl.blacklist_users:
+    # 喵~注意：这里是「配置名单 + WebUI 运行时名单」的并集，后者改完即生效喵
+    if message.user_key in acl_module.effective_blacklist(config, message.channel):
         return False, "", REASON_USER_BLACKLISTED
     # 官方通道允许指定群免 @ 触发喵
     free_mode = message.channel == CHANNEL_QQBOT and message.group_key in config.qqbot.free_command_group_openids

@@ -68,6 +68,7 @@ SETTING_FIELDS: tuple[SettingField, ...] = (
     SettingField("acl", "whitelist_group_openids", "str_list", "白名单群 openid", "官方通道用"),
     SettingField("acl", "blacklist_member_openids", "str_list", "黑名单成员 openid", "官方通道用"),
     SettingField("acl", "private_user_openids", "str_list", "允许私聊的 user openid", "留空表示私聊不响应"),
+    SettingField("bot", "happy_group", "str", "happy 绑定的设备组名", "看板「设备组」里要有一模一样的组名"),
 )
 
 # 名字到字段定义的映射喵

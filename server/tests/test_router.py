@@ -316,7 +316,7 @@ def test_resolve_scope_not_found(connection: sqlite3.Connection, app_config: App
 
 
 def test_resolve_scope_empty_means_all(connection: sqlite3.Connection, app_config: AppConfig) -> None:
-    """空范围应按整个主人组处理喵。"""
+    """空范围应按整个 happy 组处理喵。"""
     # 插入两台设备喵
     _seed_device(connection, "win-alpha-1111", display_name="本机 Windows")
     _seed_device(connection, "and-beta-2222", display_name="手机", platform="android")
@@ -325,17 +325,16 @@ def test_resolve_scope_empty_means_all(connection: sqlite3.Connection, app_confi
     label, device_ids, note = commands._parse_happy_scope(
         "   ", _happy_context(connection, app_config, "   ")
     )
-    # 应是主人组全体喵
-    assert label == "主人"
+    # 应是 happy 组全体喵
+    assert label == "happy"
     assert device_ids == ["win-alpha-1111", "and-beta-2222"]
-    assert note.startswith("主人 · ")
-
+    assert note.startswith("happy · ")
 
 
 def _seed_own_group(config: AppConfig, device_ids: tuple[str, ...]) -> None:
-    """把设备写进看板里的「主人」组，happy 系列命令才认喵。"""
+    """把设备写进看板里的 happy 组，happy 系列命令才认喵。"""
     # 直接复用 people 模块的保存函数喵
-    people.save_people(config.server.db_path, [people.PersonGroup(name="主人", devices=device_ids)])
+    people.save_people(config.server.db_path, [people.PersonGroup(name="happy", devices=device_ids)])
 
 
 def test_build_reply_help(connection: sqlite3.Connection, app_config: AppConfig) -> None:
@@ -376,8 +375,8 @@ def test_build_reply_device_list(connection: sqlite3.Connection, app_config: App
     text = router.build_reply(connection, app_config, "happy设备")
     # 应包含设备 ID 喵
     assert "win-alpha-1111" in text
-    # 喵~注意：主人要求标题不带「主人 · N 台」这种统计喵
-    assert "主人" not in text
+    # 喵~注意：主人要求标题不带「组名 · N 台」这种统计喵
+    assert "happy · " not in text
     assert "台）" not in text
 
 

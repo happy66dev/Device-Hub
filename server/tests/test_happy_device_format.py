@@ -51,7 +51,7 @@ def _add_usage(connection, device_id: str, app: str, seconds: int, ago: int) -> 
 
 def _set_group(app_config: AppConfig, devices: tuple[str, ...]) -> None:
     """写「主人」设备组喵。"""
-    people.save_people(app_config.server.db_path, [people.PersonGroup(name="主人", devices=devices)])
+    people.save_people(app_config.server.db_path, [people.PersonGroup(name="happy", devices=devices)])
 
 
 def _render(client: TestClient) -> str:

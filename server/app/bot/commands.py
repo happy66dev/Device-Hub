@@ -174,6 +174,9 @@ def _happy_doing_scope(context: CommandContext) -> Mapping[str, Any]:
                 "device_id": device.device_id,
                 "has_current_app": bool(device.current_app),
                 "current_app": device.current_app,
+                # 喵~注意：标题为空时不展示，模板靠这个布尔挑分支喵
+                "has_current_title": bool(device.current_title),
+                "current_title": device.current_title,
                 "current_seconds": device.current_seconds,
                 "has_battery": device.battery_percent is not None,
                 "battery_percent": device.battery_percent or 0,
@@ -191,9 +194,9 @@ def _happy_doing_scope(context: CommandContext) -> Mapping[str, Any]:
 def _happy_done_scope(context: CommandContext) -> Mapping[str, Any]:
     """happy 干了什么：近 24 小时前 10 的应用排行喵。"""
     scope = _base_scope(context)
-    # 读主人组喵
+    # 读 happy 组喵
     devices = happy.load_happy_devices(context.connection, context.config, context.now)
-    # 只在主人组范围内做总排行喵
+    # 只在 happy 组范围内做总排行喵
     device_ids = [device.device_id for device in devices]
     rows = dataset.global_ranking_rows(
         context.connection, 0, 24 * 3600, 10, context.now, device_ids=device_ids
@@ -203,23 +206,25 @@ def _happy_done_scope(context: CommandContext) -> Mapping[str, Any]:
     scope["has_entries"] = bool(rows)
     scope["entry_count"] = len(rows)
     scope["total_seconds"] = sum(int(row["seconds"]) for row in rows)
-    # 主人组有几台设备也说一句喵
+    # happy 组有几台设备也说一句喵
     scope["device_count"] = len(devices)
-    scope["range_note"] = group_note(devices)
+    scope["range_note"] = group_note(devices, happy.resolve_group_name(context.config))
     return scope
 
 
-def group_note(devices: Sequence[happy.HappyDevice]) -> str:
+def group_note(devices: Sequence[happy.HappyDevice], group_name: str | None = None) -> str:
     """拼一句「组内有哪些设备」的说明喵。
 
-    输入：happy 设备列表。
-    输出：形如「主人 · 手机、本机 Windows」的说明。
-    边界：空列表时只给组名喵。
+    输入：happy 设备列表、可选组名。
+    输出：形如「happy · 手机、本机 Windows」的说明。
+    边界：空列表时只给组名；不传组名时用默认值喵。
     """
+    # 组名缺省时退回默认值喵
+    label = (group_name or happy.HAPPY_GROUP_NAME).strip() or happy.HAPPY_GROUP_NAME
     # 喵~防御：没有设备时只报组名喵
     if not devices:
-        return happy.HAPPY_GROUP_NAME
-    return f"{happy.HAPPY_GROUP_NAME} · " + "、".join(device.name for device in devices)
+        return label
+    return f"{label} · " + "、".join(device.name for device in devices)
 
 
 def _looks_like_time_window(text: str) -> bool:
@@ -238,15 +243,17 @@ def _parse_happy_scope(text: str, context: CommandContext) -> tuple[str, list[st
 
     输入：范围文本、执行上下文。
     输出：(展示文案, 设备 ID 列表, 范围说明)。
-    边界：空文本与「全部」都表示主人组；找不到设备时抛 DeviceLookupError喵。
+    边界：空文本与「全部」都表示 happy 组；找不到设备时抛 DeviceLookupError喵。
     """
-    # 先读主人组，作为「全部」的答案喵
+    # 先读 happy 组，作为「全部」的答案喵
     devices = happy.load_happy_devices(context.connection, context.config, context.now)
+    # 当前生效的组名喵
+    group_name = happy.resolve_group_name(context.config)
     # 去掉空白喵
     cleaned = text.strip()
     # 喵~防御：没写或写了「全部」都按主人组处理喵
     if not cleaned or cleaned in ("全部", "所有", "all") or "全部".startswith(cleaned.lower()):
-        return happy.HAPPY_GROUP_NAME, [device.device_id for device in devices], group_note(devices)
+        return group_name, [device.device_id for device in devices], group_note(devices, group_name)
     # 先按设备名做精确匹配，再按设备名做前缀匹配喵
     for device in devices:
         if device.name.strip().lower() == cleaned.lower():
@@ -266,7 +273,7 @@ def _parse_happy_scope(text: str, context: CommandContext) -> tuple[str, list[st
         raise DeviceLookupError(f"「{cleaned}」匹配到 {len(ambiguous)} 台设备：{shown}，请写完整一点。")
     # 都没命中时把可用设备列出来喵
     available = "、".join(device.name for device in devices)
-    raise DeviceLookupError(f"「{cleaned}」在主人组里找不到。可用：全部、{available}")
+    raise DeviceLookupError(f"「{cleaned}」在{group_name}组里找不到。可用：全部、{available}")
 
 
 def _look_rank_scope(context: CommandContext) -> Mapping[str, Any]:
@@ -409,9 +416,9 @@ def _default_timeline_end(context: CommandContext, day_start: datetime) -> str:
 
 
 def _happy_device_scope(context: CommandContext) -> Mapping[str, Any]:
-    """happy 设备：主人组每台设备一行喵。"""
+    """happy 设备：happy 组每台设备一行喵。"""
     scope = _base_scope(context)
-    # 读主人组喵
+    # 读 happy 组喵
     devices = happy.load_happy_devices(context.connection, context.config, context.now)
     # 逐台组装展示行喵
     rows: list[dict[str, Any]] = []
@@ -448,8 +455,9 @@ def _happy_device_scope(context: CommandContext) -> Mapping[str, Any]:
     scope["devices"] = rows
     scope["device_count"] = len(rows)
     scope["has_devices"] = bool(rows)
-    scope["group_name"] = happy.HAPPY_GROUP_NAME
-    scope["range_note"] = group_note(devices)
+    # 组名从配置读，模板里用 {组名} 展示喵
+    scope["group_name"] = happy.resolve_group_name(context.config)
+    scope["range_note"] = group_note(devices, happy.resolve_group_name(context.config))
     return scope
 
 
@@ -550,11 +558,13 @@ COMMANDS: tuple[Command, ...] = (
         summary="看看 happy 现在在做什么",
         alternate_flag="is_away",
         template="""happy正在使用{设备名}
-当前应用: {当前应用}{若 当前应用时长}（已持续 {当前应用时长|时长}）{/若}{若 有电量}
+当前应用: {当前应用}{若 当前应用时长}（已持续 {当前应用时长|时长}）{/若}{若 有标题}
+{标题}{/若}{若 有电量}
 设备剩余电量：{电量|数字}%{/若}""",
         alternate_template="""happy正在挂机...? 可能在处理事情
 最近使用: {设备名}
-当前应用: {当前应用}{若 当前应用时长}（已持续 {当前应用时长|时长}）{/若}{若 是手机}{若 有电量}
+当前应用: {当前应用}{若 当前应用时长}（已持续 {当前应用时长|时长}）{/若}{若 有标题}
+{标题}{/若}{若 是手机}{若 有电量}
 手机剩余电量：{电量|数字}%{/若}{/若}""",
         handler=_happy_doing_scope,
     ),
@@ -573,7 +583,7 @@ COMMANDS: tuple[Command, ...] = (
         summary="看看 happy 名下各台设备的状态",
         template="""happy 的设备
 
-{查询 当前 列表=设备列表 行=happy设备块 空="主人组里还没有设备。"}""",
+{查询 当前 列表=设备列表 行=happy设备块 空="{设备组名}组里还没有设备。"}""",
         handler=_happy_device_scope,
     ),
     Command(
@@ -583,8 +593,8 @@ COMMANDS: tuple[Command, ...] = (
         summary="",
         show_summary=False,
         # 喵~注意：时间范围的写法直接嵌在用法里，参数格式要一眼能抄喵
-        # 设备：全部 = 主人组所有设备合并；也可写设备名或名称前缀（本机、手机），
-        #       或者设备 ID 前缀（win-、and-），只认主人组里的设备喵
+        # 设备：全部 = happy 组所有设备合并；也可写设备名或名称前缀（本机、手机），
+        #       或者设备 ID 前缀（win-、and-），只认 happy 组里的设备喵
         # 排行榜 [时间范围]：默认近 24 小时，可写 30分钟 / 2小时 / 6小时 / 1天 / 3天 / 7天，
         #       超过 7 天按 7 天算喵
         # 时间轴 [起止时刻]：默认今天全天到此刻；可只写日期（2026-11-01），

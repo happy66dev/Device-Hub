@@ -66,6 +66,9 @@ class CurrentAppSnapshot:
     package: str | None
     # 进入前台时间，可能为空喵
     since: datetime | None
+    # 窗口标题，客户端没给时为空串喵
+    # 喵~注意：安卓端不采集标题，这里保持空串，调用方据此决定要不要展示喵
+    title: str = ""
 
 
 @dataclass(frozen=True)
@@ -275,6 +278,8 @@ def get_device(connection: sqlite3.Connection, device_id: str) -> DeviceDetail |
                 name=str(current_app_data["name"]),
                 package=current_app_data.get("package"),
                 since=since_moment,
+                # 喵~注意：标题可能是 null（安卓端不采集），统一收敛成空串喵
+                title=str(current_app_data.get("title") or "").strip(),
             )
     # 汇总近 24 小时使用总时长喵
     usage_rows = usage_ranking(connection, device_id, hours=24)

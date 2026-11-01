@@ -221,8 +221,8 @@ async def test_bot_end_to_end_replies_with_device_info(app_config: AppConfig) ->
     # 回复文本里应包含设备名喵
     reply_text = _extract_reply_text(received_actions[0])
     assert "测试台式机" in reply_text
-    # 喵~注意：主人要求标题不再带「主人 · N 台」统计喵
-    assert happy.HAPPY_GROUP_NAME not in reply_text
+    # 喵~注意：主人要求标题不再带「组名 · N 台」统计喵
+    assert f"{happy.HAPPY_GROUP_NAME} · " not in reply_text
 
 
 async def _noop_handler(event: dict[str, Any]) -> None:

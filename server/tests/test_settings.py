@@ -102,6 +102,32 @@ def test_update_config_text_appends_missing_section() -> None:
     assert "  enabled: true" in updated
 
 
+def test_update_config_text_adds_bot_section() -> None:
+    """老配置里没有 bot 段时，改 happy_group 应自动建出这一段喵。"""
+    # 样例配置里还没有独立的 bot 段喵
+    # 喵~注意：不能用 "bot:" in 判断，qqbot: 里也含这个子串，要按整行比喵
+    assert "\nbot:" not in SAMPLE_CONFIG
+    # 写一个新组名喵
+    updated = update_config_text(SAMPLE_CONFIG, {"bot.happy_group": "我的组"})
+    # 段与键都出现了喵
+    assert "\nbot:" in updated
+    assert '  happy_group: "我的组"' in updated
+    # 喵~注意：追加的段必须能被配置加载器认出来，否则等于白写喵
+    assert "  happy_group:" in updated
+
+
+def test_update_config_text_changes_existing_happy_group() -> None:
+    """已有 bot 段时就地改值，注释要保留喵。"""
+    # 手工拼一份带注释的 bot 段喵
+    text = SAMPLE_CONFIG + '\n# happy 命令用喵\nbot:\n  # 组名喵\n  happy_group: "happy"\n'
+    # 改成新名字喵
+    updated = update_config_text(text, {"bot.happy_group": "新组"})
+    # 新值生效且注释还在喵
+    assert '  happy_group: "新组"' in updated
+    assert "# 组名喵" in updated
+    assert "# happy 命令用喵" in updated
+
+
 def test_update_config_text_rejects_unknown_key() -> None:
     """白名单之外的键必须拒绝，防止被当成任意写入喵。"""
     # 不认识的配置项喵

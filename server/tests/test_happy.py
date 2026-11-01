@@ -68,7 +68,7 @@ def _seed_usage(connection: sqlite3.Connection, device_id: str, seconds: int, ag
     connection.commit()
 
 
-def _set_group(config, devices: tuple[str, ...], name: str = "主人") -> None:
+def _set_group(config, devices: tuple[str, ...], name: str = "happy") -> None:
     """写设备组喵。"""
     # 直接用 people 保存喵
     people.save_people(config.server.db_path, [people.PersonGroup(name=name, devices=devices)])
@@ -78,13 +78,13 @@ def _set_group(config, devices: tuple[str, ...], name: str = "主人") -> None:
 
 
 def test_load_happy_devices_requires_group(connection: sqlite3.Connection, app_config) -> None:
-    """没有主人组时要给出可操作的提示喵。"""
+    """没有 happy 组时要给出可操作的提示喵。"""
     # 造设备但不建组喵
     _seed_device(connection, "win-a", "本机 Windows")
     # 应报错并提示去建组喵
     with pytest.raises(happy.HappyError) as error:
         happy.load_happy_devices(connection, app_config, BASE_NOW)
-    assert "主人" in str(error.value)
+    assert "happy" in str(error.value)
 
 
 def test_load_happy_devices_requires_members(connection: sqlite3.Connection, app_config) -> None:
@@ -103,6 +103,49 @@ def test_load_happy_devices_requires_registered(connection: sqlite3.Connection, 
     with pytest.raises(happy.HappyError) as error:
         happy.load_happy_devices(connection, app_config, BASE_NOW)
     assert "还没有上报过数据" in str(error.value)
+
+
+def test_resolve_group_name_defaults_to_happy(app_config) -> None:
+    """没配 bot 节时应返回默认组名 happy喵。"""
+    # 喵~防御：老配置对象可能没有 bot 属性，这里用一个极简替身验证兜底喵
+    from types import SimpleNamespace
+
+    # 完全没有 bot 属性喵
+    assert happy.resolve_group_name(SimpleNamespace()) == "happy"
+    # bot 存在但组名是空白喵
+    blank = SimpleNamespace(bot=SimpleNamespace(happy_group="   "))
+    assert happy.resolve_group_name(blank) == "happy"
+    # 正常配置喵
+    assert happy.resolve_group_name(app_config) == "happy"
+
+
+def test_load_happy_devices_follows_configured_group_name(connection: sqlite3.Connection, app_config) -> None:
+    """改了 bot.happy_group 后应去读那个组，而不是写死的 happy喵。"""
+    from dataclasses import replace
+
+    # 设备和自定义组名喵
+    _seed_device(connection, "win-a", "本机 Windows")
+    _set_group(app_config, ("win-a",), name="我的组")
+    # 把配置指向自定义组名喵
+    custom = replace(app_config, bot=replace(app_config.bot, happy_group="我的组"))
+    # 应能读到这台设备喵
+    devices = happy.load_happy_devices(connection, custom, BASE_NOW)
+    assert [device.device_id for device in devices] == ["win-a"]
+    # 喵~注意：用默认配置读同一个库会找不到组，说明确实走的是配置喵
+    with pytest.raises(happy.HappyError):
+        happy.load_happy_devices(connection, app_config, BASE_NOW)
+
+
+def test_load_happy_devices_error_lists_available_groups(connection: sqlite3.Connection, app_config) -> None:
+    """组名对不上时要把现有组名列出来，方便主人直接改名喵。"""
+    # 建一个名字不匹配的组喵
+    _seed_device(connection, "win-a", "本机 Windows")
+    _set_group(app_config, ("win-a",), name="别的组")
+    with pytest.raises(happy.HappyError) as error:
+        happy.load_happy_devices(connection, app_config, BASE_NOW)
+    # 提示里应有可用组名与配置项名字喵
+    assert "别的组" in str(error.value)
+    assert "bot.happy_group" in str(error.value)
 
 
 def test_load_happy_devices_keeps_group_order(connection: sqlite3.Connection, app_config) -> None:

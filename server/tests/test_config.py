@@ -123,6 +123,61 @@ def test_load_config_napcat_requires_token(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="napcat.token"):
         load_config(config_path)
 
+
+def test_load_config_napcat_disabled_by_default(tmp_path: Path) -> None:
+    """不写 napcat 节时应默认关闭机器人，不能因缺 token 直接启动失败喵。"""
+    # 只写最少的 ingest 节，完全省略 napcat 喵
+    config_path = _write_config(tmp_path, "ingest:\n  token: \"0123456789abcdef\"\n")
+    # 喵~注意：默认值必须与 config.example.yaml 的 enabled: false 一致喵
+    config = load_config(config_path)
+    # 默认可加载且机器人关闭喵
+    assert config.napcat.enabled is False
+    # 没配 token 也不该有值喵
+    assert config.napcat.token == ""
+
+def test_load_config_happy_group_defaults_to_happy(tmp_path: Path) -> None:
+    """不写 bot 节时，happy 系列命令应默认绑定 happy 组喵。"""
+    # 只写最小配置喵
+    config_path = _write_config(tmp_path, "ingest:\n  token: \"0123456789abcdef\"\n")
+    # 默认组名喵
+    config = load_config(config_path)
+    assert config.bot.happy_group == "happy"
+
+
+def test_load_config_happy_group_can_be_overridden(tmp_path: Path) -> None:
+    """配置里写 bot.happy_group 时应生效，方便主人换组名喵。"""
+    # 显式指定自定义组名喵
+    config_path = _write_config(
+        tmp_path,
+        "ingest:\n  token: \"0123456789abcdef\"\nbot:\n  happy_group: \"我的组\"\n",
+    )
+    config = load_config(config_path)
+    assert config.bot.happy_group == "我的组"
+
+
+def test_load_config_happy_group_blank_falls_back(tmp_path: Path) -> None:
+    """组名写成空白串时不能真的绑到空组名上，应退回默认值喵。"""
+    # 故意写空串喵
+    config_path = _write_config(
+        tmp_path,
+        "ingest:\n  token: \"0123456789abcdef\"\nbot:\n  happy_group: \"   \"\n",
+    )
+    # 喵~防御：空白组名永远匹配不到任何组，必须兜底喵
+    config = load_config(config_path)
+    assert config.bot.happy_group == "happy"
+
+
+def test_load_config_rejects_unknown_bot_key(tmp_path: Path) -> None:
+    """bot 节里拼错键名要报错，别让主人以为改生效了喵。"""
+    # 把 happy_group 拼成 happy_grop 喵
+    config_path = _write_config(
+        tmp_path,
+        "ingest:\n  token: \"0123456789abcdef\"\nbot:\n  happy_grop: \"happy\"\n",
+    )
+    with pytest.raises(ConfigError, match="未知字段"):
+        load_config(config_path)
+
+
 # ==================== 示例配置 ====================
 
 

@@ -23,8 +23,9 @@ from .. import people, queries
 from ..config import AppConfig
 from ..db import parse_utc_text, to_utc_text
 
-# happy 固定绑定这个设备组喵
-HAPPY_GROUP_NAME = "主人"
+# happy 默认绑定的设备组名，真正生效的组名从配置读喵
+# 喵~注意：保留这个常量只作默认值与错误提示用，实际判断一律走 resolve_group_name喵
+HAPPY_GROUP_NAME = "happy"
 
 # 「正在使用」的判定窗口：最近 3 分钟内有使用记录喵
 ACTIVE_WINDOW_SECONDS = 3 * 60
@@ -65,6 +66,9 @@ class HappyDevice:
     afk: bool
     # 当前前台应用名喵
     current_app: str
+    # 当前应用窗口标题，没有时为空串喵
+    # 喵~注意：只有 Windows 端会采集标题，安卓端恒为空喵
+    current_title: str
     # 当前应用已持续秒数喵
     current_seconds: int
     # 电量百分比，未知时 None 喵
@@ -97,30 +101,46 @@ class HappySnapshot:
     reason: str
 
 
+def resolve_group_name(config: AppConfig) -> str:
+    """取出当前生效的 happy 设备组名喵。
+
+    输入：服务端配置。
+    输出：组名，缺配置时退回默认值。
+    边界：配置里写了空白串时同样退回默认值，避免匹配到空组名喵。
+    """
+    # 喵~防御：老配置对象可能没有 bot 节，用 getattr 兜底喵
+    section = getattr(config, "bot", None)
+    name = getattr(section, "happy_group", "") if section is not None else ""
+    return name.strip() or HAPPY_GROUP_NAME
+
+
 def load_happy_devices(
     connection: sqlite3.Connection,
     config: AppConfig,
     now: datetime,
 ) -> list[HappyDevice]:
-    """读出「主人」组里的全部设备，按组内顺序排列喵。
+    """读出 happy 设备组里的全部设备，按组内顺序排列喵。
 
     输入：数据库连接、服务端配置、基准时间。
     输出：HappyDevice 列表，下标 0 优先级最高。
     边界：组不存在或组里没有任何已注册设备时抛 HappyError喵。
     """
+    # 当前生效的组名喵
+    group_name = resolve_group_name(config)
     # 读设备组喵
     groups = people.load_people(config.server.db_path)
-    # 喵~防御：找不到「主人」组时给出可操作的提示喵
-    target = next((group for group in groups if group.name.strip() == HAPPY_GROUP_NAME), None)
+    # 喵~防御：找不到目标组时给出可操作的提示喵
+    target = next((group for group in groups if group.name.strip() == group_name), None)
     if target is None:
         available = "、".join(group.name for group in groups) or "（还没有任何设备组）"
         raise HappyError(
-            f'没有叫「{HAPPY_GROUP_NAME}」的设备组，happy 不知道该看谁。'
-            f"请在看板「设备组」里建一个名为「{HAPPY_GROUP_NAME}」的组。可用：{available}"
+            f'没有叫「{group_name}」的设备组，happy 不知道该看谁。'
+            f"请看板「设备组」里建一个名为「{group_name}」的组，"
+            f"或改配置里的 bot.happy_group。可用：{available}"
         )
     # 喵~防御：组是空的同样没法回答喵
     if not target.devices:
-        raise HappyError(f'设备组「{HAPPY_GROUP_NAME}」里还没有设备，请先在看板里添加。')
+        raise HappyError(f'设备组「{group_name}」里还没有设备，请先在看板里添加。')
     # 近 24 小时的使用总时长一次查完，避免逐台重复查库喵
     usage_totals = queries.device_usage_totals(connection, hours=24, now=now)
     # 逐台取详情，组内顺序即优先级喵
@@ -131,6 +151,16 @@ def load_happy_devices(
         # 喵~防御：设备可能已从库里清掉，跳过而不是整个报错喵
         if detail is None:
             continue
+        # 应用名优先取最新使用采样，标题只能取上报快照喵
+        reported_app = _latest_reported_app(connection, device_id)
+        snapshot_app = detail.current_app.name if detail.current_app is not None else ""
+        # 最终展示的应用名喵
+        shown_app = reported_app or snapshot_app
+        # 喵~注意：应用名和标题必须来自同一次上报，否则会出现「应用是 A、
+        # 标题是 B 的窗口」这种自相矛盾的输出喵
+        # 喵~防御：应用名对不上时直接丢掉标题，宁可少一行也不给错信息喵
+        snapshot_title = detail.current_app.title if detail.current_app is not None else ""
+        shown_title = snapshot_title if snapshot_title and snapshot_app == shown_app else ""
         # 组装一台设备喵
         devices.append(
             HappyDevice(
@@ -140,8 +170,9 @@ def load_happy_devices(
                 last_seen=detail.summary.last_seen_at,
                 online=queries.is_online(detail.summary.last_seen_at, now),
                 afk=_latest_afk(connection, device_id),
-                current_app=_latest_reported_app(connection, device_id)
-                or (detail.current_app.name if detail.current_app is not None else ""),
+                current_app=shown_app,
+                # 喵~注意：安卓端不采集标题，这里恒为空喵
+                current_title=shown_title,
                 current_seconds=_current_app_seconds(detail, now),
                 battery_percent=detail.battery.percent if detail.battery is not None else None,
                 battery_charging=bool(detail.battery.charging) if detail.battery is not None else False,
@@ -152,7 +183,7 @@ def load_happy_devices(
         )
     # 喵~防御：组里写着的设备全都不在库里喵
     if not devices:
-        raise HappyError(f'设备组「{HAPPY_GROUP_NAME}」里的设备都还没有上报过数据，请先启动客户端。')
+        raise HappyError(f'设备组「{group_name}」里的设备都还没有上报过数据，请先启动客户端。')
     return devices
 
 

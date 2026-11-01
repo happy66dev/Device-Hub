@@ -59,6 +59,9 @@ ALIASES: dict[str, str] = {
     "充电状态": "battery_text",
     "有当前应用": "has_current_app",
     "当前应用": "current_app",
+    # 喵~注意：窗口标题只有 Windows 端会上报，安卓端恒为空喵
+    "有标题": "has_current_title",
+    "标题": "current_title",
     "当前应用时长": "current_app_seconds",
     "有硬件": "has_hardware",
     "硬件": "hardware",
@@ -116,6 +119,9 @@ ALIASES: dict[str, str] = {
     "当前应用": "current_app",
     "当前应用时长": "current_seconds",
     "有当前应用": "has_current_app",
+    # 喵~注意：这里的「标题」指当前应用窗口标题，安卓端不采集所以恒为空喵
+    "有标题": "has_current_title",
+    "标题": "current_title",
     "有电量": "has_battery",
     "电量": "battery_percent",
     "充电状态": "battery_charging",

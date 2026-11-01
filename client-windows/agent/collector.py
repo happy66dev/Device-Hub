@@ -13,6 +13,7 @@ import os
 import platform
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -67,6 +68,21 @@ def normalize_window_title(raw: str) -> str:
 
 # 取显卡型号时调用 wmic 的超时秒数喵
 WMIC_TIMEOUT_SECONDS = 8
+
+# 显示适配器设备类 GUID，所有显卡都挂在这个类下面喵
+GPU_CLASS_GUID = "{4d36e968-e325-11ce-bfc1-08002be10318}"
+
+# 显卡型号所在的完整注册表路径喵
+GPU_CLASS_PATH = rf"SYSTEM\CurrentControlSet\Control\Class\{GPU_CLASS_GUID}"
+
+# 显卡型号在注册表里的候选值名，不同驱动写的键名不一样喵
+GPU_REGISTRY_VALUE_NAMES = ("DriverDesc", "Device Description")
+
+# 注册表里显卡子键的命名规则，形如 0000 / 0001 喵
+GPU_SUBKEY_PATTERN = re.compile(r"\d{4}")
+
+# 显卡型号的最大长度，避免个别驱动写超长串把上报体撑大喵
+MAX_GPU_NAME_LENGTH = 80
 
 # SM_REMOTESESSION：非 0 表示当前会话是远程桌面会话喵
 SM_REMOTESESSION = 0x1000
@@ -457,12 +473,108 @@ def read_cpu_name() -> str:
     return fallback_value or "未知"
 
 
+def read_gpu_name_from_registry() -> str:
+    """从注册表读取显卡型号喵。
+
+    输入：无。
+    输出：型号字符串，读不到时返回空串（由调用方决定兜底文案）。
+    边界：非 Windows、注册表被策略锁定、键不存在都返回空串，不抛异常喵。
+    """
+    # 喵~防御：非 Windows 平台没有注册表，直接返回空串喵
+    if sys.platform != "win32":
+        return ""
+    try:
+        # 延迟导入 winreg，非 Windows 平台导入会失败喵
+        import winreg
+    except ImportError:
+        # 喵~防御：导入失败按读不到处理喵
+        return ""
+    try:
+        # 打开"显示适配器"设备类所在的注册表项喵
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, GPU_CLASS_PATH) as class_key:
+            # 枚举它的子键，形如 0000 / 0001 的就是一块显卡喵
+            subkey_names: list[str] = []
+            # 喵~注意：EnumKey 靠索引递增遍历，取不到就抛 OSError 表示到头了喵
+            index = 0
+            while True:
+                try:
+                    subkey_names.append(winreg.EnumKey(class_key, index))
+                except OSError:
+                    break
+                index += 1
+    except OSError:
+        # 喵~防御：注册表读不了属于正常情况，交给上层兜底喵
+        LOGGER.debug("打开显卡注册表项失败，改用其它方式取型号")
+        return ""
+    # 喵~注意：子键名是字典序，这里排一下保证多显卡时取的顺序稳定喵
+    for subkey_name in sorted(subkey_names):
+        # 只认四位数字的显卡实例键，跳过 Properties 之类的附属键喵
+        if not GPU_SUBKEY_PATTERN.fullmatch(subkey_name):
+            continue
+        # 读这块显卡的型号喵
+        gpu_name = _read_gpu_name_from_subkey(subkey_name)
+        # 喵~防御：第一块读到了就直接用，和 wmic 只取一块的口径一致喵
+        if gpu_name:
+            return gpu_name
+    # 喵~防御：枚举完一块都没读到，返回空串喵
+    return ""
+
+
+def _read_gpu_name_from_subkey(subkey_name: str) -> str:
+    """读取单个显卡子键下的型号值喵。
+
+    输入：形如 "0000" 的子键名。
+    输出：型号字符串，读不到返回空串。
+    边界：值名不存在或类型不是字符串都返回空串喵。
+    """
+    try:
+        # 延迟导入，与调用方保持一致喵
+        import winreg
+
+        # 拼出这块显卡的完整路径喵
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"{GPU_CLASS_PATH}\{subkey_name}") as gpu_key:
+            # 按候选值名逐个尝试，不同驱动写的键名不一样喵
+            for value_name in GPU_REGISTRY_VALUE_NAMES:
+                try:
+                    raw_value, _value_type = winreg.QueryValueEx(gpu_key, value_name)
+                except OSError:
+                    # 喵~防御：这个值名没有就试下一个喵
+                    continue
+                # 清掉空白喵
+                cleaned_value = str(raw_value).strip()
+                # 喵~防御：空字符串没有意义，继续试下一个值名喵
+                if cleaned_value:
+                    return cleaned_value[:MAX_GPU_NAME_LENGTH]
+    except (OSError, ImportError):
+        # 喵~防御：单个子键读失败、或平台没有 winreg，都不影响其它显卡喵
+        return ""
+    # 喵~防御：候选值名都没有，返回空串喵
+    return ""
+
+
 def read_gpu_name() -> str:
     """读取显卡型号喵。
 
     输入：无。
     输出：型号字符串，取不到时返回 "未知"。
-    边界：wmic 不存在、执行超时、输出为空都返回 "未知"喵。
+    边界：优先走注册表（wmic 自 Win11 24H2 起已不在系统里），
+    注册表读不到时才回退到 wmic，两者都失败返回 "未知"喵。
+    """
+    # 喵~注意：注册表优先，既不弹黑窗也不依赖已弃用的 wmic 喵
+    registry_name = read_gpu_name_from_registry()
+    # 喵~防御：注册表读到了就不必再起子进程喵
+    if registry_name:
+        return registry_name
+    # 喵~防御：注册表没读到（老系统/策略限制）时回退到 wmic 喵
+    return _read_gpu_name_from_wmic()
+
+
+def _read_gpu_name_from_wmic() -> str:
+    """用 wmic 读取显卡型号，作为注册表读不到时的兜底喵。
+
+    输入：无。
+    输出：型号字符串，取不到时返回 "未知"。
+    边界：wmic 不存在、执行超时、解码异常、输出为空都返回 "未知"喵。
     """
     try:
         # 调用 wmic 查询显卡名称喵
@@ -472,9 +584,13 @@ def read_gpu_name() -> str:
             text=True,
             timeout=WMIC_TIMEOUT_SECONDS,
             check=False,
+            # 喵~注意：不加这个 GUI 进程会为 wmic 弹出黑窗口，每半小时闪一下喵
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            # 喵~防御：输出编码不确定时用替换字符兜底，别让 UnicodeDecodeError 掀翻采集循环喵
+            errors="replace",
         )
-    except (OSError, subprocess.SubprocessError):
-        # 喵~防御：新版 Windows 可能移除了 wmic，属于正常情况喵
+    except (OSError, subprocess.SubprocessError, ValueError):
+        # 喵~防御：新版 Windows 已移除 wmic，属于正常情况喵
         LOGGER.debug("wmic 调用失败，显卡型号未知")
         return "未知"
     # 逐行清洗输出，去掉表头与空行喵
@@ -487,7 +603,8 @@ def read_gpu_name() -> str:
     if not candidate_lines:
         return "未知"
     # 多显卡时只取第一块，避免字符串过长喵
-    return candidate_lines[0][:80]
+    return candidate_lines[0][:MAX_GPU_NAME_LENGTH]
+
 
 
 def read_os_version() -> str:

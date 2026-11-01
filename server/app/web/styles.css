@@ -446,6 +446,28 @@ input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-
 .config-switch { flex-direction: row; align-items: center; gap: 8px; padding-top: 18px; }
 .config-switch input { width: 16px; height: 16px; accent-color: var(--primary); }
 
+/* 黑名单：一行输入 + 按钮，窄屏自动换行喵 */
+.blocklist-add { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.blocklist-add select,
+.blocklist-add input {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+}
+/* 标识框放宽一些，openid 有 32 位喵 */
+.blocklist-add input#blocklist-target { flex: 1 1 220px; min-width: 160px; }
+.blocklist-add input#blocklist-note { flex: 1 1 180px; min-width: 140px; }
+
+/* 表格里的小按钮，别抢视觉焦点喵 */
+.btn.small { padding: 3px 10px; font-size: 11px; border-radius: 6px; }
+
+/* 黑名单表格顶部留点距离喵 */
+.blocklist-table { margin-top: 12px; }
+
 /* 多行列表输入框喵 */
 .config-item textarea {
   padding: 8px 10px;

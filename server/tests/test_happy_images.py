@@ -89,7 +89,7 @@ def test_look_rank_defaults_to_24h(connection: sqlite3.Connection, app_config) -
     """不写窗口时默认 24 小时喵。"""
     # 造一台设备并放进主人组喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 跑排行榜分支喵
     scope = commands._look_happy_scope(_context(connection, app_config, ("全部", "排行榜")))
     # 窗口应是 24 小时喵
@@ -103,7 +103,7 @@ def test_look_rank_window_capped_to_7_days(connection: sqlite3.Connection, app_c
     """窗口超过 7 天要夹到 7 天，和保留期对齐喵。"""
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 写一个 30 天喵
     scope = commands._look_happy_scope(_context(connection, app_config, ("全部", "排行榜", "30天")))
     # 应被夹到 7 天喵
@@ -114,7 +114,7 @@ def test_look_rank_bad_window_raises(connection: sqlite3.Connection, app_config)
     """窗口写错时报错，不能静默按默认值跑喵。"""
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 写一个看不懂的窗口喵
     with pytest.raises(commands.DeviceLookupError) as error:
         commands._look_happy_scope(_context(connection, app_config, ("全部", "排行榜", "很久")))
@@ -126,7 +126,7 @@ def test_look_rank_device_by_name(connection: sqlite3.Connection, app_config) ->
     # 两台设备喵
     _seed(connection, "win-a", "本机 Windows")
     _seed(connection, "and-b", "手机")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("and-b", "win-a"))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("and-b", "win-a"))])
     # 点名手机喵
     scope = commands._look_happy_scope(_context(connection, app_config, ("手机", "排行榜")))
     # 只应包含手机喵
@@ -138,7 +138,7 @@ def test_look_rank_device_by_prefix(connection: sqlite3.Connection, app_config) 
     # 两台设备喵
     _seed(connection, "win-a", "本机 Windows")
     _seed(connection, "and-b", "手机")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("and-b", "win-a"))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("and-b", "win-a"))])
     # 名字前缀喵
     by_name = commands._look_happy_scope(_context(connection, app_config, ("本机", "排行榜")))
     assert by_name["device_ids"] == ["win-a"]
@@ -151,11 +151,11 @@ def test_look_rank_unknown_device_raises(connection: sqlite3.Connection, app_con
     """拼不出设备时要把可用的列出来喵。"""
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 写一个不存在的名字喵
     with pytest.raises(commands.DeviceLookupError) as error:
         commands._look_happy_scope(_context(connection, app_config, ("冰箱", "排行榜")))
-    assert "在主人组里找不到" in str(error.value)
+    assert "在happy组里找不到" in str(error.value)
 
 
 # ==================== 看看happy：时间轴分支 ====================
@@ -165,7 +165,7 @@ def test_look_timeline_defaults_to_today(connection: sqlite3.Connection, app_con
     """不写日期时默认今天，不写时刻时给默认窗口喵。"""
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 跑时间轴分支喵
     scope = commands._look_happy_scope(_context(connection, app_config, ("全部", "时间轴")))
     # 应标记为时间轴分支喵
@@ -182,7 +182,7 @@ def test_look_timeline_explicit_window(connection: sqlite3.Connection, app_confi
     """写了起止时刻就照抄喵。"""
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 给一个窗口喵
     scope = commands._look_happy_scope(
         _context(connection, app_config, ("全部", "时间轴", "09:00", "12:00"))
@@ -195,7 +195,7 @@ def test_look_timeline_explicit_date(connection: sqlite3.Connection, app_config)
     """写了日期就用那天喵。"""
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 指定过去的一天喵
     scope = commands._look_happy_scope(
         _context(connection, app_config, ("全部", "时间轴", "2026-10-30"))
@@ -209,7 +209,7 @@ def test_look_timeline_rejects_reversed_window(connection: sqlite3.Connection, a
     """起止写反时要报错喵。"""
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 写反喵
     with pytest.raises(commands.DeviceLookupError) as error:
         commands._look_happy_scope(
@@ -222,7 +222,7 @@ def test_look_timeline_rejects_three_moments(connection: sqlite3.Connection, app
     """三个时刻没法判断意图，应报错喵。"""
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 写三个时刻喵
     with pytest.raises(commands.DeviceLookupError) as error:
         commands._look_happy_scope(
@@ -238,7 +238,7 @@ def test_look_happy_requires_two_args(connection: sqlite3.Connection, app_config
     """只写范围没写子命令时要给用法喵。"""
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 只给一个参数喵
     with pytest.raises(commands.DeviceLookupError) as error:
         commands._look_happy_scope(_context(connection, app_config, ("全部",)))
@@ -249,7 +249,7 @@ def test_look_happy_rejects_unknown_subcommand(connection: sqlite3.Connection, a
     """子命令认不出时要提示两种写法喵。"""
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 写一个不存在的子命令喵
     with pytest.raises(commands.DeviceLookupError) as error:
         commands._look_happy_scope(_context(connection, app_config, ("全部", "曲线")))
@@ -260,7 +260,7 @@ def test_look_happy_alias_subcommands(connection: sqlite3.Connection, app_config
     """排行/时间轴 等简写也要认喵。"""
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 排行榜简写喵
     rank_scope = commands._look_happy_scope(_context(connection, app_config, ("全部", "排行")))
     assert not rank_scope.get("is_timeline")
@@ -301,7 +301,7 @@ def test_build_image_rank_passes_hours(
     app_config = replace(app_config, render=replace(app_config.render, image_enabled=True))
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 走 7 天喵
     params = _capture_params(monkeypatch, "看看happy 全部 排行榜 7天", connection, app_config)
     # 7 天 = 168 小时喵
@@ -319,7 +319,7 @@ def test_build_image_timeline_passes_window(
     app_config = replace(app_config, render=replace(app_config.render, image_enabled=True))
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 跑 09:00-12:00 喵
     params = _capture_params(monkeypatch, "看看happy 全部 时间轴 09:00 12:00", connection, app_config)
     # 窗口与倍率都要在喵
@@ -337,7 +337,7 @@ def test_build_image_timeline_passes_date(
     app_config = replace(app_config, render=replace(app_config.render, image_enabled=True))
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 指定日期喵
     params = _capture_params(monkeypatch, "看看happy 全部 时间轴 2026-10-30", connection, app_config)
     assert params["from"] == "2026-10-30"
@@ -351,7 +351,7 @@ def test_build_image_ignores_other_commands(
     app_config = replace(app_config, render=replace(app_config.render, image_enabled=True))
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 设备清单与状态都不该出图喵
     assert router.build_image(connection, app_config, "happy设备") is None
     assert router.build_image(connection, app_config, "happy在干嘛") is None
@@ -373,7 +373,7 @@ def test_build_image_node_missing_falls_back(
     app_config = replace(app_config, render=replace(app_config.render, image_enabled=True))
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 假装没有 node 喵
     monkeypatch.setattr(snapshot, "_node_available", lambda: False)
     # 应返回 None 喵
@@ -388,7 +388,7 @@ def test_build_image_shot_error_falls_back(
     app_config = replace(app_config, render=replace(app_config.render, image_enabled=True))
     # 造设备喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 假装截图失败喵
     monkeypatch.setattr(snapshot, "_node_available", lambda: True)
 
@@ -468,7 +468,7 @@ def test_happy_device_scope_online_phone(connection: sqlite3.Connection, app_con
         ("and-b", BASE_NOW.isoformat().replace("+00:00", "Z")),
     )
     connection.commit()
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("and-b",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("and-b",))])
     # 跑设备命令喵
     scope = commands._happy_device_scope(_context(connection, app_config, (), "happy设备"))
     row = scope["devices"][0]
@@ -487,7 +487,7 @@ def test_happy_device_scope_offline_phone(connection: sqlite3.Connection, app_co
         ("and-b", (BASE_NOW - timedelta(hours=5)).isoformat().replace("+00:00", "Z")),
     )
     connection.commit()
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("and-b",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("and-b",))])
     # 跑设备命令喵
     scope = commands._happy_device_scope(_context(connection, app_config, (), "happy设备"))
     row = scope["devices"][0]
@@ -501,7 +501,7 @@ def test_happy_device_scope_windows_without_battery(connection: sqlite3.Connecti
     """没有电量的设备不该显示电量喵。"""
     # 造本机喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 跑设备命令喵
     scope = commands._happy_device_scope(_context(connection, app_config, (), "happy设备"))
     row = scope["devices"][0]
@@ -518,7 +518,7 @@ def test_happy_doing_scope_active_state(connection: sqlite3.Connection, app_conf
         ("win-a", (BASE_NOW - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")),
     )
     connection.commit()
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 跑在干嘛喵
     scope = commands._happy_doing_scope(_context(connection, app_config, (), "happy在干嘛"))
     # 三个开关只能亮一个喵
@@ -532,7 +532,7 @@ def test_happy_doing_scope_away_without_usage(connection: sqlite3.Connection, ap
     """从来没有使用记录时走「不在」分支且没有设备喵。"""
     # 造设备但不造使用记录喵
     _seed(connection, "win-a", "本机 Windows")
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 跑在干嘛喵
     scope = commands._happy_doing_scope(_context(connection, app_config, (), "happy在干嘛"))
     # 应该是 away 且没有最近上线喵
@@ -552,7 +552,7 @@ def test_happy_done_scope_ranks_within_group(connection: sqlite3.Connection, app
             (device_id, app, (BASE_NOW - timedelta(minutes=30)).isoformat().replace("+00:00", "Z")),
         )
     connection.commit()
-    _set_group(app_config, [people.PersonGroup(name="主人", devices=("win-a",))])
+    _set_group(app_config, [people.PersonGroup(name="happy", devices=("win-a",))])
     # 跑干了什么喵
     scope = commands._happy_done_scope(_context(connection, app_config, (), "happy干了什么"))
     # 只应出现主人组的应用喵

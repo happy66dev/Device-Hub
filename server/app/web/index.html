@@ -247,6 +247,27 @@
         <p class="config-status" id="config-status"></p>
         <div class="config-fields" id="config-fields"><p class="empty">加载中…</p></div>
       </div>
+
+      <!-- 黑名单：拉黑后立刻生效，不用重启喵 -->
+      <div class="panel">
+        <h3>黑名单</h3>
+        <p class="muted">
+          被拉黑的人 @ 机器人也不会得到任何回复，<strong>立刻生效</strong>，不用重启。
+          全局生效：拉黑一次，所有白名单群都不响应。
+          <code>config.yaml</code> 的 <code>acl</code> 段里写死的条目也会列在下面，标为「配置」，只能改配置文件移除。
+        </p>
+        <div class="blocklist-add">
+          <select id="blocklist-channel">
+            <option value="napcat">NapCat（QQ 号）</option>
+            <option value="qqbot">官方通道（member_openid）</option>
+          </select>
+          <input id="blocklist-target" type="text" placeholder="QQ 号或 openid" spellcheck="false" autocomplete="off">
+          <input id="blocklist-note" type="text" placeholder="备注（可选，例如「刷屏」）" spellcheck="false" autocomplete="off">
+          <button class="btn primary" id="blocklist-add" type="button">拉黑</button>
+        </div>
+        <p class="config-status" id="blocklist-status"></p>
+        <div id="blocklist-list"><p class="empty">加载中…</p></div>
+      </div>
     </section>
   </main>
 

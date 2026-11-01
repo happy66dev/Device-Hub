@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -23,6 +24,7 @@ def _seed(
     seen_seconds_ago: int = 5,
     usage: dict[str, int] | None = None,
     hardware: dict[str, str] | None = None,
+    current_app: dict[str, Any] | None = None,
 ) -> None:
     """插入一台设备及其使用记录，时间全部相对当前喵。"""
     # 上报时间喵
@@ -30,24 +32,26 @@ def _seed(
     # 默认给一条使用记录喵
     usage_items = usage if usage is not None else {"Code.exe": 60}
     # 构造上报体喵
-    payload = ReportPayload.model_validate(
-        make_payload(
-            device_id=device_id,
-            platform=platform,
-            display_name=display_name or device_id,
-            reported_at=reported_at.isoformat(),
-            hardware=hardware if hardware is not None else {"cpu": "Ryzen 7 9700X"},
-            usage_delta=[{"app": name, "seconds": seconds} for name, seconds in usage_items.items()],
-        )
-    )
+    overrides: dict[str, Any] = {
+        "device_id": device_id,
+        "platform": platform,
+        "display_name": display_name or device_id,
+        "reported_at": reported_at.isoformat(),
+        "hardware": hardware if hardware is not None else {"cpu": "Ryzen 7 9700X"},
+        "usage_delta": [{"app": name, "seconds": seconds} for name, seconds in usage_items.items()],
+    }
+    # 喵~注意：只有调用方显式给了 current_app 才覆盖，否则用默认值喵
+    if current_app is not None:
+        overrides["current_app"] = current_app
+    payload = ReportPayload.model_validate(make_payload(**overrides))
     # 落库喵
     ingest.save_report(connection, payload, datetime.now(timezone.utc))
 
 
-def _set_group(config: AppConfig, device_ids: tuple[str, ...]) -> None:
-    """把设备写进看板里的「主人」组，happy 系列命令才认喵。"""
+def _set_group(config: AppConfig, device_ids: tuple[str, ...], name: str = "happy") -> None:
+    """把设备写进看板里的 happy 组，happy 系列命令才认喵。"""
     # 直接复用 people 模块的保存函数喵
-    people.save_people(config.server.db_path, [people.PersonGroup(name="主人", devices=device_ids)])
+    people.save_people(config.server.db_path, [people.PersonGroup(name=name, devices=device_ids)])
 
 
 def test_list_device_rows_has_expected_fields(connection: sqlite3.Connection) -> None:
@@ -306,8 +310,8 @@ def test_help_has_no_group_footer(connection: sqlite3.Connection, app_config: Ap
     # 那句结尾已经删了喵
     assert "认的是看板里名为" not in text
     assert "组内顺序就是优先级" not in text
-    # 喵~注意：帮助里不该再出现「主人」这个内部组名喵
-    assert "主人" not in text
+    # 喵~注意：帮助里不该再出现「组名 · 设备」这种范围说明喵
+    assert " · " not in text
 
 
 def test_build_reply_active_command(connection: sqlite3.Connection, app_config: AppConfig) -> None:
@@ -348,8 +352,153 @@ def test_build_reply_active_command_without_group(connection: sqlite3.Connection
     # 渲染命令喵
     text = router.build_reply(connection, app_config, "happy在干嘛")
     # 应提示去建组喵
-    assert "主人" in text
+    assert "happy" in text
     assert "设备组" in text
+
+
+def test_all_resolves_to_configured_group_name(connection: sqlite3.Connection, app_config: AppConfig) -> None:
+    """「全部」应解析到配置里的组名，换组名后依然生效喵。"""
+    from dataclasses import replace
+
+    # 设备放进自定义组名的组喵
+    _seed(connection, "win-live", display_name="活跃机", usage={"Code.exe": 60})
+    _set_group(app_config, ("win-live",), name="我的组")
+    # 把配置指向这个组喵
+    custom = replace(app_config, bot=replace(app_config.bot, happy_group="我的组"))
+    # 解析「全部」喵
+    label, device_ids, note = commands._parse_happy_scope(
+        "全部", commands.CommandContext(
+            connection=connection,
+            config=custom,
+            name="看看happy",
+            args=("全部", "排行榜"),
+            now=datetime.now(timezone.utc),
+        )
+    )
+    # 标签应为配置里的组名喵
+    assert label == "我的组"
+    assert device_ids == ["win-live"]
+    assert note.startswith("我的组 · ")
+
+
+def test_happy_device_empty_text_uses_group_name(connection: sqlite3.Connection, app_config: AppConfig) -> None:
+    """设备清单为空时，「空=」文案里的组名占位符要能被替换喵。"""
+    # 直接渲染模板里那段查询，只验证占位符替换喵
+    scope = {"devices": [], "group_name": "我的组"}
+    env = dataset.TemplateEnv(commands.fragment_nodes(), {})
+    text = expr.render_text(
+        '{查询 当前 列表=设备列表 行=happy设备块 空="{设备组名}组里还没有设备。"}',
+        (scope,),
+        env,
+    )
+    # 占位符应被替换成组名喵
+    assert text == "我的组组里还没有设备。"
+
+
+def test_build_reply_shows_window_title_under_current_app(
+    connection: sqlite3.Connection, app_config: AppConfig
+) -> None:
+    """有窗口标题时要在「当前应用:」下方多一行标题喵。"""
+    # 造一台带标题的 Windows 设备喵
+    _seed(
+        connection,
+        "win-live",
+        display_name="活跃机",
+        usage={"java": 60},
+        current_app={"name": "java", "package": "java.exe", "title": "Minecraft 1.7.10"},
+    )
+    _set_group(app_config, ("win-live",))
+    text = router.build_reply(connection, app_config, "happy在干嘛")
+    # 当前应用那一行必须还在喵
+    assert "当前应用: java" in text
+    # 标题要单独占一行喵
+    assert "\nMinecraft 1.7.10" in text
+    # 喵~注意：标题行紧跟在「当前应用」之后，中间不能插别的内容喵
+    app_line = next(line for line in text.splitlines() if line.startswith("当前应用:"))
+    title_index = text.splitlines().index(app_line) + 1
+    assert text.splitlines()[title_index] == "Minecraft 1.7.10"
+
+
+def test_build_reply_omits_title_line_when_missing(
+    connection: sqlite3.Connection, app_config: AppConfig
+) -> None:
+    """取不到标题时不能多出一行空白喵。"""
+    # 造一台没有标题的 Windows 设备喵
+    _seed(
+        connection,
+        "win-notitle",
+        display_name="无标题机",
+        current_app={"name": "Code.exe", "package": "Code.exe"},
+    )
+    _set_group(app_config, ("win-notitle",))
+    text = router.build_reply(connection, app_config, "happy在干嘛")
+    # 当前应用行还在喵
+    assert "当前应用: Code.exe" in text
+    # 喵~注意：不能出现紧跟其后的空行喵
+    assert "\n\n" not in text
+
+
+def test_build_reply_omits_title_line_when_blank(
+    connection: sqlite3.Connection, app_config: AppConfig
+) -> None:
+    """标题是空串或纯空白时同样不展示，避免画出空行喵。"""
+    # 三种"没标题"的写法都要被吃掉喵
+    for index, blank_title in enumerate(("", "   ")):
+        device_id = f"win-blank{index}"
+        _seed(
+            connection,
+            device_id,
+            display_name=f"空白机{index}",
+            current_app={"name": "Code.exe", "package": "Code.exe", "title": blank_title},
+        )
+        _set_group(app_config, (device_id,))
+        text = router.build_reply(connection, app_config, "happy在干嘛")
+        assert "当前应用: Code.exe" in text
+        # 喵~注意：空标题绝不能变成一行空白喵
+        assert "\n\n" not in text
+
+
+def test_android_current_app_has_no_title(
+    connection: sqlite3.Connection, app_config: AppConfig
+) -> None:
+    """安卓端不采集标题，解析后必须是空串喵。"""
+    # 造一台安卓设备，客户端传的就是 null 标题喵
+    _seed(
+        connection,
+        "and-title",
+        display_name="手机",
+        platform="android",
+        usage={"QQ": 60},
+        current_app={"name": "QQ", "package": "com.tencent.mobileqq", "title": None},
+    )
+    _set_group(app_config, ("and-title",))
+    text = router.build_reply(connection, app_config, "happy在干嘛")
+    # 当前应用行正常喵
+    assert "当前应用: QQ" in text
+    # 喵~注意：安卓不该有标题行，也不该留空行喵
+    assert "\n\n" not in text
+    assert "None" not in text
+
+
+def test_title_dropped_when_app_mismatch(
+    connection: sqlite3.Connection, app_config: AppConfig
+) -> None:
+    """标题所属应用与当前应用对不上时丢掉标题，不能张冠李戴喵。"""
+    # 喵~注意：应用名取最新使用采样、标题取上报快照，两者可能不同步；
+    # 这种情况宁可少一行，也不能把 A 应用的窗口标题挂到 B 应用下面喵
+    _seed(
+        connection,
+        "win-mismatch",
+        display_name="错位机",
+        usage={"Code.exe": 60},
+        current_app={"name": "java", "package": "java.exe", "title": "Minecraft 1.7.10"},
+    )
+    _set_group(app_config, ("win-mismatch",))
+    text = router.build_reply(connection, app_config, "happy在干嘛")
+    # 应用名以使用采样为准喵
+    assert "当前应用: Code.exe" in text
+    # 喵~防御：Java 的标题绝不能出现在 Code.exe 下面喵
+    assert "Minecraft" not in text
 
 
 def test_build_reply_global_ranking(connection: sqlite3.Connection, app_config: AppConfig) -> None:
@@ -362,7 +511,7 @@ def test_build_reply_global_ranking(connection: sqlite3.Connection, app_config: 
     text = router.build_reply(connection, app_config, "happy干了什么")
     # 应包含应用名与范围说明喵
     assert "QQ.exe" in text
-    assert "主人 · 本机、平板" in text
+    assert "happy · 本机、平板" in text
 
 
 def test_build_reply_global_ranking_alias(connection: sqlite3.Connection, app_config: AppConfig) -> None:

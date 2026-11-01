@@ -125,6 +125,13 @@ const el = {
   configTestNapcat: document.getElementById("config-test-napcat"),
   configTestQqbot: document.getElementById("config-test-qqbot"),
   configRestart: document.getElementById("config-restart"),
+  // 黑名单元素喵
+  blocklistChannel: document.getElementById("blocklist-channel"),
+  blocklistTarget: document.getElementById("blocklist-target"),
+  blocklistNote: document.getElementById("blocklist-note"),
+  blocklistAdd: document.getElementById("blocklist-add"),
+  blocklistStatus: document.getElementById("blocklist-status"),
+  blocklistList: document.getElementById("blocklist-list"),
   modal: document.getElementById("token-modal"),
   modalInput: document.getElementById("modal-token"),
   modalSave: document.getElementById("modal-save"),
@@ -2451,6 +2458,7 @@ function renderSettings() {
 
 // 配置段的显示顺序与中文标题喵
 const CONFIG_SECTIONS = [
+  ["bot", "happy 命令"],
   ["napcat", "NapCat（OneBot 11）"],
   ["qqbot", "官方 QQ Bot"],
   ["acl", "访问控制"],
@@ -2624,6 +2632,124 @@ async function saveConfig() {
   }
 }
 
+/** 拉取黑名单并渲染喵。 */
+async function loadBlocklist() {
+  if (!el.blocklistList) return;
+  try {
+    const body = await api("/api/v1/acl/blocklist");
+    renderBlocklist(body.entries || []);
+  } catch (error) {
+    if (error.unauthorized) {
+      handleUnauthorized();
+      return;
+    }
+    el.blocklistList.innerHTML = `<p class="empty">加载失败：${escapeHtml(error.message)}</p>`;
+  }
+}
+
+/** 把黑名单渲染成表格喵。 */
+function renderBlocklist(entries) {
+  if (!el.blocklistList) return;
+  if (!entries.length) {
+    el.blocklistList.innerHTML = '<p class="empty">还没有人进黑名单。</p>';
+    return;
+  }
+  const rows = entries.map((entry) => {
+    const fromConfig = entry.source === "config";
+    // 喵~注意：配置里写死的条目在这里删不掉，按钮置灰并说明原因喵
+    const action = fromConfig
+      ? '<span class="muted">改 config.yaml</span>'
+      : `<button class="btn ghost small" type="button" data-action="unblock"
+           data-channel="${escapeHtml(entry.channel)}" data-target="${escapeHtml(entry.target)}">解除</button>`;
+    const channelText = entry.channel === "qqbot" ? "官方通道" : "NapCat";
+    const sourceTag = fromConfig
+      ? '<span class="tag warn">配置</span>'
+      : '<span class="tag ok">运行中</span>';
+    const created = entry.created_at ? formatClock(entry.created_at) : "—";
+    return `<tr>
+      <td>${escapeHtml(channelText)}</td>
+      <td><code>${escapeHtml(entry.target)}</code></td>
+      <td>${escapeHtml(entry.note || "—")}</td>
+      <td>${sourceTag}</td>
+      <td>${escapeHtml(created)}</td>
+      <td>${action}</td>
+    </tr>`;
+  }).join("");
+  el.blocklistList.innerHTML = `<table class="rules blocklist-table">
+    <thead><tr><th>通道</th><th>标识</th><th>备注</th><th>来源</th><th>拉黑时间</th><th>操作</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+/** 新增一条黑名单喵。 */
+async function addBlocklistEntry() {
+  if (!el.blocklistAdd) return;
+  const target = (el.blocklistTarget.value || "").trim();
+  if (!target) {
+    showToast("标识不能为空", "warn");
+    return;
+  }
+  el.blocklistAdd.disabled = true;
+  el.blocklistStatus.textContent = "添加中…";
+  try {
+    const body = await api("/api/v1/acl/blocklist", {
+      method: "POST",
+      body: JSON.stringify({
+        channel: el.blocklistChannel.value,
+        target,
+        note: (el.blocklistNote.value || "").trim(),
+      }),
+    });
+    // 喵~注意：added 为 false 说明这人本来就在名单里，提示要说清楚喵
+    if (body.added) {
+      el.blocklistStatus.textContent = `已拉黑 ${target}，立刻生效`;
+      showToast("已拉黑，立刻生效", "ok");
+    } else {
+      el.blocklistStatus.textContent = `${target} 已经在黑名单里了`;
+      showToast("已经在名单里", "warn");
+    }
+    // 清空输入框方便连续拉黑喵
+    el.blocklistTarget.value = "";
+    el.blocklistNote.value = "";
+    await loadBlocklist();
+  } catch (error) {
+    if (error.unauthorized) {
+      handleUnauthorized();
+      return;
+    }
+    el.blocklistStatus.textContent = `添加失败：${error.message}`;
+    showToast(`添加失败：${error.message}`, "error");
+  } finally {
+    el.blocklistAdd.disabled = false;
+  }
+}
+
+/** 解除一条黑名单喵。 */
+async function removeBlocklistEntry(channel, target) {
+  el.blocklistStatus.textContent = "解除中…";
+  try {
+    const body = await api(
+      `/api/v1/acl/blocklist/${encodeURIComponent(channel)}/${encodeURIComponent(target)}`,
+      { method: "DELETE" }
+    );
+    if (body.removed) {
+      el.blocklistStatus.textContent = `已解除 ${target}`;
+      showToast("已解除，立刻生效", "ok");
+    } else {
+      el.blocklistStatus.textContent = `运行时名单里没有 ${target}（可能来自配置文件）`;
+      showToast("没有可删的运行时条目", "warn");
+    }
+    await loadBlocklist();
+  } catch (error) {
+    if (error.unauthorized) {
+      handleUnauthorized();
+      return;
+    }
+    el.blocklistStatus.textContent = `解除失败：${error.message}`;
+    showToast(`解除失败：${error.message}`, "error");
+  }
+}
+
 /** 测试某个机器人通道能不能连上喵。 */
 async function testBotChannel(channel) {
   if (!el.configStatus) return;
@@ -2721,7 +2847,10 @@ function switchTab(tab) {
     renderSettings();
     loadStorage();
   }
-  if (tab === "config") loadConfig();
+  if (tab === "config") {
+    loadConfig();
+    loadBlocklist();
+  }
   // 时间轴的增量刷新跟着标签页走喵
   syncTimelineTicker();
   updateHash();
@@ -3065,6 +3194,19 @@ el.configSave.addEventListener("click", saveConfig);
 el.configTestNapcat.addEventListener("click", () => testBotChannel("napcat"));
 el.configTestQqbot.addEventListener("click", () => testBotChannel("qqbot"));
 el.configRestart.addEventListener("click", restartServer);
+
+// 黑名单：拉黑、解除喵
+el.blocklistAdd.addEventListener("click", addBlocklistEntry);
+// 喵~注意：解除按钮是动态渲染的，用事件委托挂在外层容器上喵
+el.blocklistList.addEventListener("click", (event) => {
+  const button = event.target.closest('[data-action="unblock"]');
+  if (!button) return;
+  removeBlocklistEntry(button.dataset.channel, button.dataset.target);
+});
+// 输入框里回车等于点「拉黑」喵
+el.blocklistTarget.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") addBlocklistEntry();
+});
 
 el.autoRefresh.addEventListener("change", () => {
   state.autoRefresh = el.autoRefresh.checked;

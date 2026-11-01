@@ -40,7 +40,7 @@ def _seed_device(connection: sqlite3.Connection, device_id: str) -> None:
 def _set_group(config: AppConfig, device_ids: tuple[str, ...]) -> None:
     """把设备写进看板里的「主人」组，happy 系列命令才认喵。"""
     # 直接复用 people 模块的保存函数喵
-    people.save_people(config.server.db_path, [people.PersonGroup(name="主人", devices=device_ids)])
+    people.save_people(config.server.db_path, [people.PersonGroup(name="happy", devices=device_ids)])
 
 
 def test_simulate_help_without_acl(connection: sqlite3.Connection, app_config: AppConfig) -> None:
@@ -75,8 +75,8 @@ def test_simulate_device_list(connection: sqlite3.Connection, app_config: AppCon
     result = simulate.simulate_command(connection, app_config, "/happy设备")
     # 回复里应有设备名喵
     assert "测试机" in result.text
-    # 喵~注意：主人要求标题不再带「主人 · N 台」统计喵
-    assert "主人" not in result.text
+    # 喵~注意：主人要求标题不再带「组名 · N 台」统计喵
+    assert "happy · " not in result.text
 
 
 def test_simulate_look_happy_reports_wait_text(connection: sqlite3.Connection, app_config: AppConfig) -> None:

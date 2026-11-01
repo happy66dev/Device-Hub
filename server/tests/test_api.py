@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -13,6 +14,7 @@ from conftest import TEST_INGEST_TOKEN, make_payload
 
 from app import presence
 from app.db import to_utc_text
+from app.main import _verify_token
 
 # 统一的请求头喵
 AUTH_HEADERS = {"X-Ingest-Token": TEST_INGEST_TOKEN}
@@ -34,6 +36,46 @@ def test_report_rejects_wrong_token(client: TestClient) -> None:
     response = client.post("/api/v1/report", json=make_payload(), headers={"X-Ingest-Token": "wrong-token-000"})
     # 状态码应为 401 喵
     assert response.status_code == 401
+
+
+def test_non_ascii_token_header_is_401_not_500(client: TestClient) -> None:
+    """口令含非 ASCII 字符时应是 401，不能让 compare_digest 抛 TypeError 变 500 喵。"""
+    # 喵~注意：hmac.compare_digest 比 str 时遇到非 ASCII 会抛 TypeError。
+    # 请求头是原始字节，Starlette 会按 latin-1 解码成含非 ASCII 的字符串，
+    # 这里直接发字节头模拟攻击者，确认已经被编成 bytes 比较，鉴权失败要走 401 喵
+    response = client.post(
+        "/api/v1/report",
+        json=make_payload(),
+        headers={"X-Ingest-Token": b"\xe4\xb8\xad\xe6\x96\x87"},
+    )
+    # 必须是 401 而不是 500 喵
+    assert response.status_code == 401
+    # 错误码保持统一喵
+    assert response.json()["error"] == "invalid_token"
+
+
+def test_non_ascii_query_token_is_401_not_500(client: TestClient) -> None:
+    """查询串里的非 ASCII 口令同样只能 401，不能 500 喵。"""
+    # 图标接口允许 ?token=，这里故意塞中文喵
+    response = client.get("/api/v1/icons/whatever?token=%E4%B8%AD%E6%96%87%E5%8F%A3%E4%BB%A4")
+    # 喵~注意：以前这里会 500，因为 _verify_query_token 也直接比 str 喵
+    assert response.status_code == 401
+    # 错误码保持统一喵
+    assert response.json()["error"] == "invalid_token"
+
+
+def test_non_ascii_configured_token_still_matches() -> None:
+    """主人真把口令配成中文时，正确的口令必须能通过校验喵。"""
+    # 用最小替身代替 Request 与 AppConfig，只测比较逻辑喵
+    secret = "中文口令九个字"
+    # 请求头带正确的中文口令喵
+    request = SimpleNamespace(headers={"x-ingest-token": secret})
+    # 配置里的口令与之一致喵
+    config = SimpleNamespace(ingest=SimpleNamespace(token=secret))
+    # 喵~注意：编成 bytes 后非 ASCII 也能正常比较，不再抛 TypeError 喵
+    assert _verify_token(request, config) is True
+    # 不匹配时仍返回 False 喵
+    assert _verify_token(SimpleNamespace(headers={"x-ingest-token": "别的口令"}), config) is False
 
 
 def test_report_accepts_valid_payload(client: TestClient) -> None:

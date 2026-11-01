@@ -108,6 +108,11 @@ gating:
   # 手动放行的目标地址或机器名，按自己人处理喵
   rdp_allowed_clients: []
 
+# happy 系列命令：/happy在干嘛、/happy设备、/看看happy 等命令共用一个设备组喵
+bot:
+  # happy 系列命令绑定的设备组名，看板「设备组」里必须有同名组喵
+  happy_group: "happy"
+
 # 授时：所有时间戳以阿里云 NTP 为准，不依赖客户端与浏览器时钟喵
 clock:
   enabled: true

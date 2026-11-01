@@ -66,7 +66,9 @@ class NapCatSection:
     """QQ 机器人（OneBot 11）连接参数喵。"""
 
     # 是否随服务端启动机器人喵
-    enabled: bool = True
+    # 喵~注意：默认必须关闭，与 config.example.yaml 保持一致；
+    # 默认开着会让「只写 ingest 节」的精简配置因缺 napcat.token 直接启动失败喵
+    enabled: bool = False
     # NapCat 正向 WebSocket 地址喵
     ws_url: str = "ws://127.0.0.1:7999"
     # 与 NapCat 侧一致的访问口令喵
@@ -170,6 +172,15 @@ class RenderSection:
 
 
 @dataclass(frozen=True)
+class BotSection:
+    """happy 系列命令的参数喵。"""
+
+    # happy 系列命令绑定的设备组名，看板「设备组」里必须有同名组喵
+    # 喵~注意：以前这里硬编码成「主人」，现在改成可配置，默认 happy喵
+    happy_group: str = "happy"
+
+
+@dataclass(frozen=True)
 class RolesSection:
     """设备角色标记，服务器端配置优先于客户端自报喵。"""
 
@@ -228,6 +239,8 @@ class AppConfig:
     gating: GatingSection
     # 配置文件所在目录，用于解析相对路径喵
     base_dir: Path
+    # happy 系列命令参数（带默认值，方便测试只传关心的字段）喵
+    bot: BotSection = field(default_factory=BotSection)
     # 授时参数（带默认值，方便测试只传关心的字段）喵
     clock: ClockSection = field(default_factory=ClockSection)
     # 官方 QQ Bot 通道参数（带默认值，默认关闭）喵
@@ -479,6 +492,8 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
     roles_raw = _read_section(raw_config, "roles", ("servers", "workstations"))
     gating_raw = _read_section(raw_config, "gating", ("enabled", "rdp_stale_seconds", "rdp_require_known_client", "rdp_allowed_clients"))
     clock_raw = _read_section(raw_config, "clock", ("enabled", "servers", "sync_interval_seconds", "timeout_seconds"))
+    # happy 系列命令的配置节喵
+    bot_raw = _read_section(raw_config, "bot", ("happy_group",))
 
     # 数据库路径按配置文件所在目录解析，保证从任何工作目录启动都指向同一个库喵
     raw_db_path = _as_str(server_raw, "server", "db_path", "data/device_hub.db")
@@ -505,7 +520,7 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
     )
     # 组装机器人连接配置喵
     napcat_section = NapCatSection(
-        enabled=_as_bool(napcat_raw, "napcat", "enabled", True),
+        enabled=_as_bool(napcat_raw, "napcat", "enabled", False),
         ws_url=_as_str(napcat_raw, "napcat", "ws_url", "ws://127.0.0.1:7999"),
         token=_as_str(napcat_raw, "napcat", "token", ""),
         reconnect_seconds=_as_int(napcat_raw, "napcat", "reconnect_seconds", 10, minimum=1, maximum=600),
@@ -562,6 +577,11 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         timeout_seconds=_as_float(clock_raw, "clock", "timeout_seconds", 2.0, minimum=0.2, maximum=10.0),
     )
 
+    # happy 系列命令绑定的设备组名喵
+    bot_section = BotSection(
+        happy_group=_as_str(bot_raw, "bot", "happy_group", "happy").strip() or "happy",
+    )
+
     # 喵~防御：上报口令太短等于没有口令，白名单群之外任何人都能伪造数据喵
     if len(ingest_section.token) < 8:
         # 提示主人改成随机长串喵
@@ -603,5 +623,6 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         gating=gating_section,
         clock=clock_section,
         qqbot=qqbot_section,
+        bot=bot_section,
         base_dir=resolved_path.parent,
     )

@@ -428,6 +428,32 @@ Android 端的判定口径与 Windows 对齐，但信号源不同：**息屏（`
 
 `GET /api/v1/timeline?devices=a,b,c` 里的**顺序就是优先级**：自用时各设备时间一般不会重叠，真重叠时靠前的设备保留完整时长，靠后的设备被裁掉重叠部分（秒数按剩余长度等比例折算）。
 
+## 黑名单接口
+
+被拉黑的人在群里 @ 机器人也不会有任何回复。名单存 `data/acl.json`，
+**改完立刻生效，不需要重启**；`config.yaml` 里 `acl.blacklist_users` /
+`acl.blacklist_member_openids` 写死的条目仍然有效，两者取并集喵。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/v1/acl/blocklist` | 读取名单，`source` 标出 `runtime`（可删）或 `config`（只能改配置文件） |
+| POST | `/api/v1/acl/blocklist` | 拉黑，body 为 `{"channel":"napcat\|qqbot","target":"...","note":"可选"}` |
+| DELETE | `/api/v1/acl/blocklist/{channel}/{target}` | 解除拉黑 |
+
+```json
+{
+  "ok": true,
+  "entries": [
+    { "channel": "napcat", "target": "123456", "note": "刷屏",
+      "created_at": "2026-11-01T05:31:07Z", "source": "runtime" }
+  ]
+}
+```
+
+- `channel` 决定标识的命名空间：`napcat` 填 QQ 号，`qqbot` 填 member_openid，两者互不干扰。
+- 重复拉黑同一个人返回 `added: false`，不会产生多条记录。
+- 拉黑只影响机器人响应，设备上报接口不受影响。
+
 ## 设备组（人）接口
 
 把多台设备归到一个人名下，组内顺序即优先级；数据存在 `data/people.json`，前端可编辑喵。
