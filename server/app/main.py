@@ -1724,7 +1724,7 @@ def _load_day_timeline(
             segments = queries.day_usage_lanes(connection, device_ids, start, end, merge_gap_seconds)
             # 单设备不需要两套数据，应用轴直接复用喵
             lane_segments = segments
-        # 查心跳，用来区分「离线（没有心跳）」和「空档（在线但 AFK）」喵
+        # 查心跳，用来区分「离线（没有心跳）」和「空档（在线但无使用记录）」喵
         heartbeats = queries.day_heartbeats(connection, device_ids, start, end)
         # 设备 ID 到展示名的映射，给聚合泳道标设备名喵
         device_names = queries.device_name_map(connection)
@@ -1771,7 +1771,7 @@ def _load_day_timeline(
     else:
         # 超出心跳保留期，状态一律留空，避免看板编造「离线 24 小时」喵
         states, offline_seconds, afk_seconds = [], 0, 0
-    # 空档沿用 idle_seconds 字段名，语义改成「在线但 AFK」喵
+    # 空档沿用 idle_seconds 字段名，语义是「在线但无使用记录」喵
     idle_seconds = afk_seconds
     # 组装返回喵
     return {

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -64,6 +65,27 @@ def _seed_usage(connection: sqlite3.Connection, device_id: str, seconds: int, ag
     connection.execute(
         "INSERT INTO usage_samples (device_id, app_name, package, sampled_at, seconds) VALUES (?, ?, '', ?, ?)",
         (device_id, app, _stamp(moment), seconds),
+    )
+    connection.commit()
+
+
+def _set_current_app(
+    connection: sqlite3.Connection,
+    device_id: str,
+    name: str,
+    since: datetime | None,
+    title: str = "",
+) -> None:
+    """直接写 devices.current_app_json 快照喵。"""
+    # 快照结构与客户端上报一致喵
+    payload: dict[str, object] = {"name": name, "package": name}
+    if since is not None:
+        payload["since"] = since.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if title:
+        payload["title"] = title
+    connection.execute(
+        "UPDATE devices SET current_app_json = ? WHERE device_id = ?",
+        (json.dumps(payload, ensure_ascii=False), device_id),
     )
     connection.commit()
 
@@ -214,31 +236,45 @@ def test_state_active_ignores_tiny_usage(connection: sqlite3.Connection, app_con
     assert state != happy.STATE_ACTIVE
 
 
-def test_state_afk_needs_flag_and_usage(connection: sqlite3.Connection, app_config) -> None:
-    """在线 + AFK + 十分钟内用过，判为挂机喵。"""
-    # 造设备：AFK，五分钟前用过喵
+def test_state_afk_when_gap_under_ten_minutes(connection: sqlite3.Connection, app_config) -> None:
+    """在线 + 空档不到 10 分钟，判为挂机喵。"""
+    # 造设备：五分钟前用过，空档 5 分钟喵
     _seed_device(connection, "win-a", "本机 Windows", afk=True)
     _seed_usage(connection, "win-a", 120, 5 * 60)
     _set_group(app_config, ("win-a",))
     devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
-    _set_group(app_config, ("win-a",))
     # 判定喵
     state, device, _reason = happy.judge_state(connection, devices, BASE_NOW)
     assert state == happy.STATE_AFK
     assert device is not None and device.name == "本机 Windows"
 
 
-def test_state_afk_requires_usage(connection: sqlite3.Connection, app_config) -> None:
-    """AFK 但十分钟内没用过就是没人用，不算挂机喵。"""
-    # 造设备：AFK，但一小时前才用过喵
-    _seed_device(connection, "win-a", "本机 Windows", afk=True)
-    _seed_usage(connection, "win-a", 120, 60 * 60)
+def test_state_afk_does_not_need_heartbeat_flag(connection: sqlite3.Connection, app_config) -> None:
+    """判挂机只看空档，不看心跳里的 afk 标记喵。
+
+    喵~注意：被门控暂停计时的设备（例如服务器投屏在前台）afk=false，
+    但时间轴上照样画斜纹，这时候人可能还在，必须也判成挂机喵。
+    """
+    # 造设备：心跳说没 AFK，但已经 4 分钟没有使用记录喵
+    _seed_device(connection, "win-a", "本机 Windows", afk=False)
+    _seed_usage(connection, "win-a", 60, 4 * 60)
     _set_group(app_config, ("win-a",))
     devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
-    _set_group(app_config, ("win-a",))
-    # 不该是挂机喵
+    # 依然算挂机喵
     state, _device, _reason = happy.judge_state(connection, devices, BASE_NOW)
-    assert state != happy.STATE_AFK
+    assert state == happy.STATE_AFK
+
+
+def test_state_away_when_gap_over_ten_minutes(connection: sqlite3.Connection, app_config) -> None:
+    """空档超过 10 分钟就是不在，不给挂机喵。"""
+    # 造设备：AFK，但二十分钟前才用过喵
+    _seed_device(connection, "win-a", "本机 Windows", afk=True)
+    _seed_usage(connection, "win-a", 120, 20 * 60)
+    _set_group(app_config, ("win-a",))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    # 该走「不在」喵
+    state, _device, _reason = happy.judge_state(connection, devices, BASE_NOW)
+    assert state == happy.STATE_AWAY
 
 
 def test_state_away_when_stale(connection: sqlite3.Connection, app_config) -> None:
@@ -267,6 +303,152 @@ def test_state_away_without_any_usage(connection: sqlite3.Connection, app_config
     state, device, _reason = happy.judge_state(connection, devices, BASE_NOW)
     assert state == happy.STATE_AWAY
     assert device is None
+
+
+def test_gap_seconds_measures_time_axis_hatch(connection: sqlite3.Connection, app_config) -> None:
+    """gap_seconds 就是时间轴上那段斜纹的长度喵。"""
+    # 造设备：七分钟前用过喵
+    _seed_device(connection, "win-a", "本机 Windows")
+    _seed_usage(connection, "win-a", 60, 7 * 60)
+    _set_group(app_config, ("win-a",))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    # 空档应约等于 7 分钟喵
+    assert devices[0].gap_seconds is not None
+    assert 7 * 60 - 5 <= devices[0].gap_seconds <= 7 * 60 + 5
+
+
+def test_gap_seconds_is_none_without_usage(connection: sqlite3.Connection, app_config) -> None:
+    """从没使用过时没有空档可言，字段必须是 None 而不是 0 喵。"""
+    # 造设备但不造使用记录喵
+    _seed_device(connection, "win-a", "本机 Windows")
+    _set_group(app_config, ("win-a",))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    # 喵~注意：用 0 会被误判成「刚开始空档」而亮挂机，必须是 None 喵
+    assert devices[0].gap_seconds is None
+
+
+def test_future_usage_sample_does_not_fake_active(connection: sqlite3.Connection, app_config) -> None:
+    """客户端时钟快于服务端时，未来时刻的采样不能点亮「在用」喵。
+
+    喵~注意：这是实测踩到的坑——库里有 sampled_at 晚于 now 的采样时，
+    MAX(sampled_at) 会取到那个未来时刻，空档被压成 0，状态永远停在「在用」喵。
+    """
+    # 造设备，再插一条「半小时之后」的使用记录喵
+    _seed_device(connection, "win-a", "本机 Windows")
+    _seed_usage(connection, "win-a", 120, -30 * 60)
+    _set_group(app_config, ("win-a",))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    # 喵~注意：未来采样要被上界挡掉，这台设备于是「从没用过」喵
+    assert devices[0].gap_seconds is None
+    assert devices[0].last_usage is None
+    # 状态不能是「在用」喵
+    state, _device, _reason = happy.judge_state(connection, devices, BASE_NOW)
+    assert state != happy.STATE_ACTIVE
+
+
+def test_future_sample_ignored_but_real_usage_still_wins(connection: sqlite3.Connection, app_config) -> None:
+    """未来采样被挡掉时，真实的历史采样仍要正常参与判定喵。"""
+    # 造设备：五分钟前有真实使用，另有一条未来的脏采样喵
+    _seed_device(connection, "win-a", "本机 Windows")
+    _seed_usage(connection, "win-a", 120, 5 * 60)
+    _seed_usage(connection, "win-a", 999, -60 * 60)
+    _set_group(app_config, ("win-a",))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    # 空档应约等于 5 分钟，而不是被未来的采样压成 0 喵
+    assert devices[0].gap_seconds is not None
+    assert 5 * 60 - 5 <= devices[0].gap_seconds <= 5 * 60 + 5
+    # 于是判成挂机喵
+    state, _device, _reason = happy.judge_state(connection, devices, BASE_NOW)
+    assert state == happy.STATE_AFK
+
+
+def test_offline_device_is_never_afk(connection: sqlite3.Connection, app_config) -> None:
+    """离线设备即使刚用过也不算挂机，挂机要求设备在线喵。"""
+    # 造离线设备，但五分钟前有使用记录喵
+    _seed_device(connection, "win-a", "本机 Windows", last_seen=BASE_NOW - timedelta(hours=2))
+    _seed_usage(connection, "win-a", 60, 5 * 60)
+    _set_group(app_config, ("win-a",))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    # 该走「不在」喵
+    state, _device, _reason = happy.judge_state(connection, devices, BASE_NOW)
+    assert state == happy.STATE_AWAY
+
+
+# ==================== 当前应用时长 ====================
+
+
+def test_current_app_seconds_counts_from_since(connection: sqlite3.Connection, app_config) -> None:
+    """应用时长就是「现在减 since」，正常情况要如实报喵。"""
+    # 造一台设备：十分钟前切到 Code.exe，最近一直在用喵
+    _seed_device(connection, "win-a", "本机 Windows")
+    _seed_usage(connection, "win-a", 60, 60, app="Code.exe")
+    _set_current_app(connection, "win-a", "Code.exe", BASE_NOW - timedelta(minutes=10))
+    _set_group(app_config, ("win-a",))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    # 十分钟就是六百秒喵
+    assert 10 * 60 - 5 <= devices[0].current_seconds <= 10 * 60 + 5
+
+
+def test_current_app_seconds_zero_when_since_missing(connection: sqlite3.Connection, app_config) -> None:
+    """老客户端不带 since 时不报时长，模板那一行整段消失喵。"""
+    # 造快照但没有 since 喵
+    _seed_device(connection, "win-a", "本机 Windows")
+    _seed_usage(connection, "win-a", 60, 60, app="Code.exe")
+    _set_current_app(connection, "win-a", "Code.exe", None)
+    _set_group(app_config, ("win-a",))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    assert devices[0].current_seconds == 0
+
+
+def test_current_app_seconds_zero_when_since_in_future(connection: sqlite3.Connection, app_config) -> None:
+    """客户端时钟比服务端快时，负值要夹成 0 而不是负数喵。"""
+    # since 在半小时之后喵
+    _seed_device(connection, "win-a", "本机 Windows")
+    _seed_usage(connection, "win-a", 60, 60, app="Code.exe")
+    _set_current_app(connection, "win-a", "Code.exe", BASE_NOW + timedelta(minutes=30))
+    _set_group(app_config, ("win-a",))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    # 喵~注意：不夹的话会渲染出「已持续 -1800 秒」喵
+    assert devices[0].current_seconds == 0
+
+
+def test_current_app_seconds_zero_when_stale_snapshot(connection: sqlite3.Connection, app_config) -> None:
+    """快照老到超过一天时按取不到处理，不报「已持续 120 小时」喵。"""
+    # 快照是五天前的旧值（COALESCE 保留的典型形态）喵
+    _seed_device(connection, "win-a", "本机 Windows")
+    _seed_usage(connection, "win-a", 60, 60, app="Code.exe")
+    _set_current_app(connection, "win-a", "Code.exe", BASE_NOW - timedelta(days=5))
+    _set_group(app_config, ("win-a",))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    # 喵~注意：超过 MAX_CURRENT_APP_SECONDS 就不报喵
+    assert devices[0].current_seconds == 0
+
+
+def test_current_app_seconds_zero_when_app_name_differs(connection: sqlite3.Connection, app_config) -> None:
+    """应用名与快照对不上时不报时长，避免「应用是 A、时长是 B 的」喵。"""
+    # 最新采样是 Code.exe，快照却停在十分钟前的 Minecraft 喵
+    _seed_device(connection, "win-a", "本机 Windows")
+    _seed_usage(connection, "win-a", 60, 60, app="Code.exe")
+    _set_current_app(connection, "win-a", "Minecraft", BASE_NOW - timedelta(minutes=10))
+    _set_group(app_config, ("win-a",))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    # 应用名取自采样喵
+    assert devices[0].current_app == "Code.exe"
+    # 喵~防御：时长必须跟着一起丢掉，否则两者不同源自相矛盾喵
+    assert devices[0].current_seconds == 0
+
+
+def test_current_app_seconds_kept_when_names_match(connection: sqlite3.Connection, app_config) -> None:
+    """应用名与快照一致时照常报时长喵。"""
+    # 两边都是 Code.exe 喵
+    _seed_device(connection, "win-a", "本机 Windows")
+    _seed_usage(connection, "win-a", 60, 60, app="Code.exe")
+    _set_current_app(connection, "win-a", "Code.exe", BASE_NOW - timedelta(minutes=5))
+    _set_group(app_config, ("win-a",))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    assert devices[0].current_app == "Code.exe"
+    # 五分钟喵
+    assert 5 * 60 - 5 <= devices[0].current_seconds <= 5 * 60 + 5
 
 
 # ==================== 优先级 ====================

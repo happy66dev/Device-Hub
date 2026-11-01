@@ -62,7 +62,6 @@ ALIASES: dict[str, str] = {
     # 喵~注意：窗口标题只有 Windows 端会上报，安卓端恒为空喵
     "有标题": "has_current_title",
     "标题": "current_title",
-    "当前应用时长": "current_app_seconds",
     "有硬件": "has_hardware",
     "硬件": "hardware",
     "使用时长": "usage_total",
@@ -138,6 +137,14 @@ ALIASES: dict[str, str] = {
     "最近使用": "last_usage_device",
     "最近一次上线": "last_usage",
     "有最近一次上线": "has_last_usage",
+    # 三档状态开关喵
+    "正在使用": "is_active",
+    "挂机": "is_afk",
+    "不在": "is_away",
+    # 空档时长：时间轴上那段斜纹有多长喵
+    "空档": "gap_seconds",
+    "空档时长": "gap_seconds",
+    "有空档": "has_gap",
     # 命令计数喵
     "命令数": "command_count",
     "设备数": "device_count",

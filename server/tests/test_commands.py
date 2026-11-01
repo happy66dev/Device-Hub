@@ -329,7 +329,7 @@ def test_build_reply_active_command(connection: sqlite3.Connection, app_config: 
 
 
 def test_build_reply_active_command_empty(connection: sqlite3.Connection, app_config: AppConfig) -> None:
-    """很久没用时应走「挂机/不在」分支喵。"""
+    """很久没用时应走「不在」分支，不能说自己正在使用喵。"""
     # 一台设备，但使用记录在两小时前喵
     _seed(connection, "win-quiet", display_name="安静机")
     _set_group(app_config, ("win-quiet",))
@@ -340,9 +340,126 @@ def test_build_reply_active_command_empty(connection: sqlite3.Connection, app_co
     connection.commit()
     # 渲染命令喵
     text = router.build_reply(connection, app_config, "happy在干嘛")
-    # 应说明可能在处理事情，而不是「正在使用」喵
+    # 喵~注意：空档两小时远超 10 分钟，必须走「不在」而不是「挂机」喵
+    assert "happy不在诶" in text
+    assert "happy正在使用" not in text
+    assert "可能在处理事情" not in text
+    # 不在时要带上最近一次使用的时间与空档长度喵
+    assert "最近一次使用" in text
+    assert "没有动静" in text
+
+
+def test_build_reply_afk_when_gap_under_ten_minutes(connection: sqlite3.Connection, app_config: AppConfig) -> None:
+    """空档不到 10 分钟走挂机分支，文案要说「可能在处理事情」喵。"""
+    # 造一台五分钟前用过、现在没有新记录的设备喵
+    _seed(connection, "win-afk", display_name="挂机机")
+    _set_group(app_config, ("win-afk",))
+    connection.execute(
+        "UPDATE usage_samples SET sampled_at = ?",
+        ((datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),),
+    )
+    connection.commit()
+    # 渲染命令喵
+    text = router.build_reply(connection, app_config, "happy在干嘛")
+    # 喵~注意：这一档的文案是「正在挂机」，以前它被错接到「不在」上了喵
+    assert "happy正在挂机" in text
     assert "可能在处理事情" in text
     assert "happy正在使用" not in text
+    assert "happy不在诶" not in text
+
+
+def test_build_reply_afk_ignores_heartbeat_flag(connection: sqlite3.Connection, app_config: AppConfig) -> None:
+    """门控暂停计时的设备 afk=false，空档短时仍要判挂机喵。"""
+    # 造设备：心跳没报 AFK，但四分钟没有使用记录喵
+    _seed(connection, "win-gated", display_name="门控机", current_app={"name": "Code.exe", "package": "Code.exe"})
+    _set_group(app_config, ("win-gated",))
+    connection.execute(
+        "UPDATE usage_samples SET sampled_at = ?",
+        ((datetime.now(timezone.utc) - timedelta(minutes=4)).strftime("%Y-%m-%dT%H:%M:%SZ"),),
+    )
+    connection.execute("UPDATE devices SET afk = 0")
+    connection.commit()
+    # 渲染命令喵
+    text = router.build_reply(connection, app_config, "happy在干嘛")
+    # 照样是挂机喵
+    assert "happy正在挂机" in text
+
+
+def test_build_reply_afk_has_no_duration(connection: sqlite3.Connection, app_config: AppConfig) -> None:
+    """挂机档不显示「已持续多久」喵。
+
+    喵~注意：那个数是「应用当台前的自然时间」，人走开多久它都在涨，
+    在挂机档里报出来和「可能在处理事情」自相矛盾，所以整段不显示喵。
+    """
+    # 造一台挂机设备，快照里的 since 是三小时前（应用一直没切）喵
+    _seed(
+        connection,
+        "win-afk2",
+        display_name="挂机机2",
+        current_app={
+            "name": "Code.exe",
+            "package": "Code.exe",
+            "since": (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+    )
+    _set_group(app_config, ("win-afk2",))
+    connection.execute(
+        "UPDATE usage_samples SET sampled_at = ?",
+        ((datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),),
+    )
+    connection.commit()
+    # 渲染命令喵
+    text = router.build_reply(connection, app_config, "happy在干嘛")
+    # 确实是挂机档喵
+    assert "happy正在挂机" in text
+    # 喵~防御：不能出现「已持续 3 小时」这种误导人的数喵
+    assert "已持续" not in text
+    assert "3 小时" not in text
+
+
+def test_build_reply_active_shows_duration(connection: sqlite3.Connection, app_config: AppConfig) -> None:
+    """在用档要保留「已持续多久」，那里 since 是新鲜的喵。"""
+    # 造一台正在用的设备，since 是两分钟前喵
+    _seed(
+        connection,
+        "win-live2",
+        display_name="活跃机2",
+        current_app={
+            "name": "Code.exe",
+            "package": "Code.exe",
+            "since": (datetime.now(timezone.utc) - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+    )
+    _set_group(app_config, ("win-live2",))
+    # 渲染命令喵
+    text = router.build_reply(connection, app_config, "happy在干嘛")
+    assert "happy正在使用" in text
+    # 在用档有时长喵
+    assert "已持续" in text
+
+
+def test_build_reply_three_states_are_exclusive(connection: sqlite3.Connection, app_config: AppConfig) -> None:
+    """三档文案互斥，同一份回复里只能出现一种开头喵。"""
+    # 逐档造数据并检查开头唯一喵
+    for ago_minutes, expected in ((0, "happy正在使用"), (5, "happy正在挂机"), (120, "happy不在诶")):
+        # 每轮清空重来喵
+        connection.execute("DELETE FROM usage_samples")
+        connection.execute("DELETE FROM devices")
+        connection.commit()
+        device_id = f"win-s{ago_minutes}"
+        _seed(connection, device_id, display_name="状态机")
+        _set_group(app_config, (device_id,))
+        connection.execute(
+            "UPDATE usage_samples SET sampled_at = ?",
+            ((datetime.now(timezone.utc) - timedelta(minutes=ago_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ"),),
+        )
+        connection.commit()
+        # 渲染并检查只有一个开头喵
+        text = router.build_reply(connection, app_config, "happy在干嘛")
+        openings = ("happy正在使用", "happy正在挂机", "happy不在诶")
+        assert expected in text, text
+        # 喵~防御：另外两个开头不能同时出现喵
+        assert sum(opening in text for opening in openings) == 1, text
 
 
 def test_build_reply_active_command_without_group(connection: sqlite3.Connection, app_config: AppConfig) -> None:

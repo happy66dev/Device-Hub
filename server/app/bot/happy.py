@@ -6,8 +6,12 @@
 
 三条判据的方向说明：
 - 「有行为」看 usage_samples 而不是心跳——心跳只证明设备开着，使用记录才证明人在用喵；
-- 「挂机」看心跳里的 afk 标记，且要求窗口内还有使用记录，否则是没人用而不是挂机喵；
-- 「不在」看最后一笔使用记录，用来回答「最近一次上线」喵。
+- 「挂机」看空档时长——设备在线、但距最后一次使用不到 10 分钟，就是时间轴上那段斜纹喵；
+- 「不在」看空档超过 10 分钟，用最后一笔使用记录回答「最近一次上线」喵。
+
+喵~注意：「空档」与客户端自报的 `afk` 标记不是一回事。空档的定义是「设备在线，
+但这一分钟没有任何使用记录」，被门控暂停计时（投屏、RDP 未连接）时客户端 `afk=false`，
+时间轴照样画斜纹，所以判定挂机不能看那个标记，只能看空档本身有多长喵。
 
 喵~注意：所有判定都以调用方传进来的 now 为准，不在模块里读真实时钟，
 否则单元测试没法把时间钉死喵。
@@ -30,11 +34,17 @@ HAPPY_GROUP_NAME = "happy"
 # 「正在使用」的判定窗口：最近 3 分钟内有使用记录喵
 ACTIVE_WINDOW_SECONDS = 3 * 60
 
-# 「挂机」的判定窗口：最近 10 分钟内有使用记录喵
+# 「挂机」的判定窗口：在线但空档（无使用记录）不超过 10 分钟喵
 AFK_WINDOW_SECONDS = 10 * 60
 
 # 窗口内累计使用达到这么久（秒）才算「有行为」，避免一次误采样就点亮状态喵
 MIN_ACTIVITY_SECONDS = 10
+
+# 「当前应用已持续多久」的上限：超过就按取不到处理喵
+# 喵~注意：since 只在应用切换时重置，长时间不换应用会一直累加；而 current_app_json
+# 是 COALESCE 保留的快照，客户端偶尔不带时会留成几天前的旧值。上限用来挡住这两种
+# 明显失真的情况，宁可少一行也不报「已持续 120 小时」这种数喵
+MAX_CURRENT_APP_SECONDS = 24 * 3600
 
 # 状态：正在使用喵
 STATE_ACTIVE = "active"
@@ -63,7 +73,11 @@ class HappyDevice:
     # 现在是否在线（加载时按 now 算好）喵
     online: bool
     # 最近一次心跳里是否 AFK 喵
+    # 喵~注意：这个标记只用来在「设备」列表里写「挂机」，判定三档状态不许看它喵
     afk: bool
+    # 空档时长：距最后一次使用记录过了多少秒，从没用过时 None 喵
+    # 喵~注意：这就是时间轴上那段斜纹的长度，是判定挂机/不在的唯一依据喵
+    gap_seconds: int | None
     # 当前前台应用名喵
     current_app: str
     # 当前应用窗口标题，没有时为空串喵
@@ -161,6 +175,12 @@ def load_happy_devices(
         # 喵~防御：应用名对不上时直接丢掉标题，宁可少一行也不给错信息喵
         snapshot_title = detail.current_app.title if detail.current_app is not None else ""
         shown_title = snapshot_title if snapshot_title and snapshot_app == shown_app else ""
+        # 喵~注意：「已持续多久」算的是快照里 since 到现在的差，而应用名取的是
+        # 最新使用采样，两者不同源。对不上时会出现「应用是 A、时长是 B 的」，
+        # 所以这里跟标题一样做同源校验，对不上就不报时长喵
+        same_app = not reported_app or reported_app == snapshot_app
+        # 最后一次使用记录，判定挂机/不在全靠它喵
+        last_usage = _last_usage_moment(connection, device_id, now)
         # 组装一台设备喵
         devices.append(
             HappyDevice(
@@ -170,14 +190,17 @@ def load_happy_devices(
                 last_seen=detail.summary.last_seen_at,
                 online=queries.is_online(detail.summary.last_seen_at, now),
                 afk=_latest_afk(connection, device_id),
+                # 喵~注意：空档时长就是「现在减最后一次使用」，负数（时钟回拨）按 0 算喵
+                gap_seconds=None if last_usage is None else max(0, int((now - last_usage).total_seconds())),
                 current_app=shown_app,
                 # 喵~注意：安卓端不采集标题，这里恒为空喵
                 current_title=shown_title,
-                current_seconds=_current_app_seconds(detail, now),
+                # 喵~防御：应用名与快照对不上时说 0，模板就不显示「已持续」喵
+                current_seconds=_current_app_seconds(detail, now) if same_app else 0,
                 battery_percent=detail.battery.percent if detail.battery is not None else None,
                 battery_charging=bool(detail.battery.charging) if detail.battery is not None else False,
                 usage_24h_seconds=int(usage_totals.get(device_id, 0)),
-                last_usage=_last_usage_moment(connection, device_id),
+                last_usage=last_usage,
                 priority=priority,
             )
         )
@@ -218,13 +241,25 @@ def _current_app_seconds(detail: queries.DeviceDetail, now: datetime) -> int:
     """算当前应用已持续的秒数喵。
 
     输入：设备详情、基准时间。
-    输出：秒数；没有当前应用时返回 0。
-    边界：时钟回拨导致负数时按 0 处理喵。
+    输出：秒数；没有当前应用、或数据明显不可信时返回 0。
+    边界：时钟回拨导致负数时按 0 处理；超过 MAX_CURRENT_APP_SECONDS 时按 0 处理喵。
+
+    喵~注意：`since` 是「这个应用切到前台的时刻」，只要应用不换就一直不重置，
+    所以它能一直累加到几个小时。`current_app_json` 又是 upsert 时的 COALESCE 快照，
+    客户端偶尔不带 current_app 时会保留几天前的旧值。这两种情况都不能直接把差值
+    报给主人，否则会出现「已持续 120 小时」这种明显不对的文案喵。
     """
     # 喵~防御：没有当前应用就没有时长喵
     if detail.current_app is None or detail.current_app.since is None:
         return 0
-    return max(0, int((now - detail.current_app.since).total_seconds()))
+    # 喵~防御：负值（客户端时钟快于服务端）按 0 处理喵
+    seconds = int((now - detail.current_app.since).total_seconds())
+    if seconds <= 0:
+        return 0
+    # 喵~防御：超过上限说明是陈旧快照，宁可不报也不报个离谱的数喵
+    if seconds > MAX_CURRENT_APP_SECONDS:
+        return 0
+    return seconds
 
 
 def _latest_afk(connection: sqlite3.Connection, device_id: str) -> bool:
@@ -245,18 +280,32 @@ def _latest_afk(connection: sqlite3.Connection, device_id: str) -> bool:
     return bool(row["afk"])
 
 
-def _last_usage_moment(connection: sqlite3.Connection, device_id: str) -> datetime | None:
+def _last_usage_moment(
+    connection: sqlite3.Connection,
+    device_id: str,
+    now: datetime | None = None,
+) -> datetime | None:
     """取这台设备最后一次有使用记录的时刻喵。
 
-    输入：连接、设备 ID。
+    输入：连接、设备 ID、可选基准时间（作为上界）。
     输出：UTC 时刻；从没用过时返回 None。
     边界：只认 seconds > 0 的采样，避免空采样点亮状态喵。
     """
-    # 取最大采样时刻喵
-    row = connection.execute(
-        "SELECT MAX(sampled_at) AS moment FROM usage_samples WHERE device_id = ? AND seconds > 0",
-        (device_id,),
-    ).fetchone()
+    # 喵~防御：上界必须卡在基准时间，否则客户端时钟快于服务端时，
+    # 未来时刻的采样会被当成「刚刚用过」，空档恒为 0、永远判成在用喵
+    if now is None:
+        # 取最大采样时刻喵
+        row = connection.execute(
+            "SELECT MAX(sampled_at) AS moment FROM usage_samples WHERE device_id = ? AND seconds > 0",
+            (device_id,),
+        ).fetchone()
+    else:
+        # 带上上界喵
+        row = connection.execute(
+            "SELECT MAX(sampled_at) AS moment FROM usage_samples "
+            "WHERE device_id = ? AND seconds > 0 AND sampled_at <= ?",
+            (device_id, to_utc_text(now)),
+        ).fetchone()
     # 喵~防御：没有记录时返回 None 喵
     if row is None or row["moment"] is None:
         return None
@@ -268,19 +317,29 @@ def usage_seconds_since(
     connection: sqlite3.Connection,
     device_id: str,
     since: datetime,
+    until: datetime | None = None,
 ) -> int:
     """统计这台设备自某个时刻以来的使用秒数喵。
 
-    输入：连接、设备 ID、起点时刻。
+    输入：连接、设备 ID、起点时刻、可选的终点时刻（作为上界）。
     输出：累计秒数。
     边界：没有记录时返回 0 喵。
     """
-    # 直接按采样时刻汇总喵
-    row = connection.execute(
-        "SELECT COALESCE(SUM(seconds), 0) AS total FROM usage_samples "
-        "WHERE device_id = ? AND sampled_at >= ?",
-        (device_id, to_utc_text(since)),
-    ).fetchone()
+    # 不带终点时只卡下界，兼容老的调用方式喵
+    if until is None:
+        # 直接按采样时刻汇总喵
+        row = connection.execute(
+            "SELECT COALESCE(SUM(seconds), 0) AS total FROM usage_samples "
+            "WHERE device_id = ? AND sampled_at >= ?",
+            (device_id, to_utc_text(since)),
+        ).fetchone()
+    else:
+        # 喵~防御：两端都卡住，未来时刻的采样不能算进任何一个窗口喵
+        row = connection.execute(
+            "SELECT COALESCE(SUM(seconds), 0) AS total FROM usage_samples "
+            "WHERE device_id = ? AND sampled_at >= ? AND sampled_at <= ?",
+            (device_id, to_utc_text(since), to_utc_text(until)),
+        ).fetchone()
     return int(row["total"]) if row is not None else 0
 
 
@@ -299,16 +358,21 @@ def judge_state(
     # 先看最近 3 分钟：在线且有足够长的使用记录就算在用喵
     for device in devices:
         # 窗口内的使用秒数喵
-        seconds = usage_seconds_since(connection, device.device_id, now - timedelta(seconds=ACTIVE_WINDOW_SECONDS))
+        # 喵~防御：上界卡在 now，未来时刻的采样不能点亮「在用」喵
+        seconds = usage_seconds_since(
+            connection, device.device_id, now - timedelta(seconds=ACTIVE_WINDOW_SECONDS), now
+        )
         # 喵~注意：单次误采样不算，要求累计达到下限且设备在线喵
         if seconds >= MIN_ACTIVITY_SECONDS and device.online:
             return STATE_ACTIVE, device, f"{device.name} 最近 3 分钟使用了 {seconds} 秒"
-    # 再看最近 10 分钟：在线、心跳 AFK、且窗口内确实用过才算挂机喵
+    # 再看空档时长：在线但空档不超过 10 分钟，说明人还在，只是没在动喵
     for device in devices:
-        # 窗口内的使用秒数喵
-        seconds = usage_seconds_since(connection, device.device_id, now - timedelta(seconds=AFK_WINDOW_SECONDS))
-        if device.online and device.afk and seconds > 0:
-            return STATE_AFK, device, f"{device.name} 心跳 AFK，最近 10 分钟用过 {seconds} 秒"
+        # 喵~注意：判的是空档有多长（= 时间轴上那段斜纹），不是心跳里的 afk 标记；
+        # 被门控暂停计时的设备 afk=false 但照样是空档，只看标记会漏掉它们喵
+        if not device.online or device.gap_seconds is None:
+            continue
+        if device.gap_seconds <= AFK_WINDOW_SECONDS:
+            return STATE_AFK, device, f"{device.name} 空档 {device.gap_seconds} 秒，还没到 10 分钟"
     # 其余一律算不在喵
     best = most_recent_usage(devices)
     # 喵~防御：从来没记录过时连设备都不给，让模板走「没有记录」分支喵
@@ -349,7 +413,9 @@ def active_device(
     # 按优先级顺序找第一台达标的喵
     for device in devices:
         # 窗口内的使用秒数喵
-        if usage_seconds_since(connection, device.device_id, now - timedelta(seconds=window_seconds)) >= MIN_ACTIVITY_SECONDS:
+        # 喵~防御：上界同样卡在 now，未来时刻的采样不算这个小窗口里的行为喵
+        window_start = now - timedelta(seconds=window_seconds)
+        if usage_seconds_since(connection, device.device_id, window_start, now) >= MIN_ACTIVITY_SECONDS:
             return device
     return None
 

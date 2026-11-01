@@ -36,6 +36,10 @@ PRUNE_INTERVAL_SECONDS = 3600
 # 发送失败时可以退回文本的异常集合喵
 SEND_ERRORS = (ConnectionError, asyncio.TimeoutError, ChannelError, OSError)
 
+# 忙时回给群里的话喵
+# 喵~注意：这里只是「告诉对方现在忙」，没有任何排队或稍后补发的机制喵
+BUSY_REPLY_TEXT = "稍等，正在处理上一个命令，这条先不处理了，等会再发一次吧。"
+
 
 class BotRunner:
     """机器人后台任务，负责启动通道、处理消息、定期清理喵。"""
@@ -45,6 +49,14 @@ class BotRunner:
         self._config = config
         # 已启用的通道，键是通道名喵
         self._channels: dict[str, BotChannel] = {}
+        # 命令与截图同一时刻只允许跑一个喵
+        # 喵~注意：截图要起无头浏览器，一次 4–9 秒还吃满一个 CPU 核；
+        # 两个命令撞在一起时浏览器互相抢资源，容易双双超时拍出空白图喵
+        # 这里用普通布尔标志而不是 asyncio.Lock：需要的是「抢不到就立刻让路」，
+        # 而 Lock 的获取是协程，await 前后会留出竞态空档喵
+        self._busy = False
+        # 当前正在处理的消息摘要，日志和排查用喵
+        self._busy_text = ""
         # NapCat 通道，配置关闭时不创建喵
         if config.napcat.enabled:
             self._channels[CHANNEL_NAPCAT] = NapCatChannel(config, self._handle_message)
@@ -140,6 +152,85 @@ class BotRunner:
         # 喵~防御：通道被关掉后残留的消息直接丢弃喵
         if channel is None:
             return
+        # 喵~注意：命令与截图同一时刻只跑一个，忙的时候这条直接丢弃喵
+        # 喵~防御：判断与占位必须在同一段同步代码里做完，中间不能 await，
+        # 否则两条消息同时到达时两边都看到「空闲」，于是各跑各的喵
+        if not self._try_occupy_busy():
+            LOGGER.info(
+                "已有命令在处理（%s），丢弃并发命令：%s", self._busy_text or "未知", command_text
+            )
+            await self._send_busy(channel, message)
+            return
+        self._busy_text = command_text
+        try:
+            await self._run_command(channel, message, command_text)
+        finally:
+            # 喵~防御：无论成功失败都要让出位置，否则机器人会永远卡在忙喵
+            self._busy_text = ""
+            self._release_busy()
+
+    def _try_occupy_busy(self) -> bool:
+        """同步地抢占忙位，抢不到立刻返回 False 喵。
+
+        输入：无。
+        输出：True 表示这次由我来跑，False 表示别人正在跑。
+        边界：纯同步、无 await，所以判断与占位之间不会有交错喵。
+        """
+        # 已经有人在跑就直接让路喵
+        if self._busy:
+            return False
+        # 喵~注意：普通赋值就是原子的，这里占住之后别的消息会看到 True 喵
+        self._busy = True
+        return True
+
+    def _release_busy(self) -> None:
+        """释放忙位喵。
+
+        输入：无。
+        输出：无。
+        边界：没被占用时什么也不做喵。
+        """
+        # 复位标志，下一条消息就能跑喵
+        self._busy = False
+
+    async def _send_busy(self, channel: BotChannel, message: NormalizedMessage) -> None:
+        """忙时告诉对方这条不处理了喵。
+
+        输入：通道、原始消息。
+        输出：无。
+        边界：只发一次提示，**不排队、不重试、不承诺补发**喵。
+
+        喵~注意：多任务同时进来时不做队列，除了正在跑的那条，其余全部丢弃。
+        截图一次要起浏览器、占满一个核，排队只会让所有人一起等，
+        还不如让对方过会儿自己再发一次喵。
+        """
+        # 群里回复时尽量 @ 提问的人，单聊不需要喵
+        mention_key = message.user_key if message.scope == SCOPE_GROUP else None
+        try:
+            # 发送「稍等」提示喵
+            await channel.send_text(
+                message.group_key,
+                BUSY_REPLY_TEXT,
+                scope=message.scope,
+                reply_token=message.reply_token,
+                mention_user_key=mention_key,
+            )
+        except SEND_ERRORS as send_error:
+            # 喵~防御：忙时提示发不出去也不影响主流程喵
+            LOGGER.warning("回复 %s 的「稍等」失败：%s", message.group_key, send_error)
+
+    async def _run_command(
+        self,
+        channel: BotChannel,
+        message: NormalizedMessage,
+        command_text: str,
+    ) -> None:
+        """真正执行一条命令：记账、出图或出文本、发送喵。
+
+        输入：通道、原始消息、命令文本。
+        输出：无。
+        边界：调用方必须已持有 busy 锁喵。
+        """
         # 喵~注意：只记真正执行了命令的人，方便在看板里反查 openid 拉黑喵
         # 这一步放在 ACL 之后，被拦下的消息不会占存储喵
         await asyncio.to_thread(self._record_seen, message)

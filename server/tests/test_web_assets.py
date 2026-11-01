@@ -75,6 +75,9 @@ function appIconHtml() { return ""; }
 function laneDeviceSuffix() { return ""; }
 // 桩：取色是异步的，这里不触发喵
 function ensureIconColors() {}
+// 桩：就绪标记与截图定位不参与渲染断言喵
+function markShotReady() {}
+function applyPendingShotFocus() {}
 function iconColorKey() { return ""; }
 // 桩：图标色缓存，空表表示一个图标色都没取到喵
 const iconColorCache = new Map();

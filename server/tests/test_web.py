@@ -532,6 +532,8 @@ function escapeHtml(value) { return String(value); }
 function appIconHtml() { return ""; }
 function appColor() { return "rgb(100, 150, 200)"; }
 function formatDuration(seconds) { return `${seconds} 秒`; }
+// 桩：就绪标记不参与排行断言喵
+function markShotReady() {}
 // 桩：全局状态与元素喵
 const state = { rankings: [], rankingScope: "all", rankingGroups: [] };
 const el = { rankingBody: { innerHTML: "" }, rankingSummary: { textContent: "" } };

@@ -58,6 +58,8 @@ const state = {
   timer: null,
   // 时间轴增量刷新定时器喵
   timelineTimer: null,
+  // 截图挂起的定位请求，等时间轴画完再执行喵
+  pendingShotFocus: null,
   loading: false,
 };
 
@@ -1530,6 +1532,8 @@ async function loadTimeline(options = {}) {
     el.tlTrack.innerHTML = '<p class="empty" style="margin:0">还没有任何设备</p>';
     el.tlLanes.innerHTML = "";
     el.tlLegend.innerHTML = "";
+    // 喵~注意：这一页也算画完了，标记要置上，否则截图会白等到超时喵
+    markShotReady("timeline");
     return;
   }
   state.timelineDeviceId = deviceId;
@@ -1537,6 +1541,9 @@ async function loadTimeline(options = {}) {
   state.timelineDate = date;
   if (!silent) {
     el.tlSummary.textContent = "加载中…";
+    // 喵~注意：非静默刷新才清就绪标记——自动刷新和增量刷新都是 silent，
+    // 它们不该把「已经画好了」的结论撤销，否则截图会一直等不到喵
+    clearShotReady();
     // 喵~注意：换设备或换日期时先清空，否则旧色块会一直挂到新数据回来喵
     el.tlTrack.innerHTML = "";
     el.tlLanes.innerHTML = "";
@@ -1557,6 +1564,16 @@ async function loadTimeline(options = {}) {
     // 记下当前是不是合并视图，泳道标题要靠它决定标不标设备名喵
     state.timelineMerged = isMerged;
     const mergedIds = groupDevices || state.devices.map((device) => device.device_id);
+    // 喵~防御：设备列表还没拉回来时 mergedIds 是空的，直接发请求会被服务端判 422，
+    // 时间轴于是一直空着——这正是截图拍到空轨道的原因之一，这里先等等再走喵
+    if (isMerged && !mergedIds.length) {
+      el.tlSummary.textContent = "加载中…";
+      // 稍后重试，设备列表回来后这次就能正常发请求喵
+      window.setTimeout(() => {
+        if (state.tab === "timeline") loadTimeline(options);
+      }, 300);
+      return;
+    }
     const url = isMerged
         ? `/api/v1/timeline?devices=${encodeURIComponent(mergedIds.join(","))}&${query}`
         : `/api/v1/devices/${encodeURIComponent(deviceId)}/timeline?${query}`;
@@ -1582,16 +1599,23 @@ async function loadTimeline(options = {}) {
     if (el.tlScroll && scrollLeft > 0) el.tlScroll.scrollLeft = scrollLeft;
   } catch (error) {
     if (error.unauthorized) {
+      // 喵~注意：口令无效时页面会弹遮罩，截图那边有专门的自检会拦下，这里照样置位
+      // 免得后端白等到超时喵
+      markShotReady("timeline");
       handleUnauthorized();
       return;
     }
     // 喵~防御：静默刷新失败时保留已有画面，只把错误说一声喵
     if (silent) {
       setLive("error", "时间轴刷新失败");
+      // 静默刷新失败时旧画面还在，本来就已就绪，标记保持即可喵
+      markShotReady("timeline");
       return;
     }
     el.tlSummary.textContent = "";
     el.tlTrack.innerHTML = `<p class="empty" style="margin:0">加载失败：${escapeHtml(error.message)}</p>`;
+    // 喵~注意：加载失败也要置位，把错误画面截下来总比后端一直等到超时好喵
+    markShotReady("timeline");
   }
 }
 
@@ -1612,7 +1636,7 @@ function buildStateBlocks(body, nowRatio) {
     const left = Math.max(0, Math.min(DAY_MINUTES, startMinute));
     const right = Math.max(0, Math.min(DAY_MINUTES, endMinute, limitMinute));
     if (right - left < 0.05) continue;
-    const tip = `空档（在线但人离开了） ${formatClock(interval.start)}-${formatClock(interval.end)} · ${formatDuration(interval.seconds)}`;
+    const tip = `AFK ${formatClock(interval.start)}-${formatClock(interval.end)} · ${formatDuration(interval.seconds)}`;
     blocks.push(
       // 原生 title 会弹系统灰框，改成 role + aria-label，读屏软件照样能读到喵
       `<div class="tl-gap" role="img" aria-label="${escapeHtml(tip)}" style="left:${((left / DAY_MINUTES) * 100).toFixed(3)}%;width:${(((right - left) / DAY_MINUTES) * 100).toFixed(3)}%"></div>`
@@ -1623,13 +1647,14 @@ function buildStateBlocks(body, nowRatio) {
 
 /** 时间轴汇总行文案喵。 */
 function timelineSummaryText(body, segmentCount) {
-  const timeout = Math.round((body.heartbeat_timeout_seconds || 180) / 60);
-  return `${body.date} · 总计 ${formatDuration(body.total_seconds)} · 空档 ${formatDuration(body.afk_seconds || 0)} · 离线 ${formatDuration(body.offline_seconds || 0)} · ${segmentCount} 段（离线留空，${timeout} 分钟没心跳算离线）`;
+  // 喵~注意：服务端默认心跳超时是 60 秒，这里的兜底值要和它一致喵
+  const timeout = Math.round((body.heartbeat_timeout_seconds || 60) / 60);
+  return `${body.date} · 总计 ${formatDuration(body.total_seconds)} · AFK ${formatDuration(body.afk_seconds || 0)} · 离线 ${formatDuration(body.offline_seconds || 0)} · ${segmentCount} 段（离线留空，${timeout} 分钟没心跳算离线）`;
 }
 
 /** 时间轴图例里关于状态的说明喵。 */
 function stateLegendHtml() {
-  return `<span><i class="lg-gap"></i>空档（在线但 AFK）</span><span><i class="lg-blank"></i>离线（无心跳，留空）</span>`;
+  return `<span><i class="lg-gap"></i>AFK</span><span><i class="lg-blank"></i>离线（无心跳，留空）</span>`;
 }
 
 /** 时间轴泳道上的设备名后缀：合并视图（组 / 所有设备）始终标注，单设备视图不标喵。 */
@@ -1764,7 +1789,7 @@ function renderTimeline(body) {
   // 标题区间与当天的段一起存起来，指针悬浮时要用喵
   state.timelineTitles = body.title_spans || [];
   const segments = (body.segments || []).slice().sort((left, right) => new Date(left.start) - new Date(right.start));
-  // 状态区间：离线（没心跳）与空档（在线但 AFK），先算好再决定怎么画喵
+  // 状态区间：离线（没心跳）与空档（在线但无使用记录），先算好再决定怎么画喵
   const nowRatio = timelineNowRatio(body);
   const stateBlocks = buildStateBlocks(body, nowRatio);
   if (!segments.length) {
@@ -1778,9 +1803,11 @@ function renderTimeline(body) {
     state.timelineColors = new Map();
     // 应用设备清单同样清空，别拿上一屏的清单算深浅喵
     state.timelineAppDevices = new Map();
+    // 喵~注意：空数据也是画完了，标记必须置上，否则这一天没记录时截图会白等到超时喵
+    markShotReady("timeline");
+    // 没有使用记录时也要把「现在」竖线摆好喵
+    updateTimelineNowLine();
     return;
-  // 没有使用记录时也要把「现在」竖线摆好喵
-  updateTimelineNowLine();
   }
   // 按应用汇总出泳道，顺便定好颜色喵
   // 喵~注意：应用轴要用 lane_segments——它是每台设备的完整记录，不按优先级裁剪。
@@ -1874,6 +1901,12 @@ function renderTimeline(body) {
   el.tlSummary.textContent = timelineSummaryText(body, segments.length);
   // 今天的话画一条「现在」竖线喵
   updateTimelineNowLine();
+  // 喵~注意：图标取色是异步的，取回来会再重画一次时间轴。这里先置上就绪标记，
+  // 让截图不必干等取色；后端拿到标记后还会再等一小会儿（SHOT_READY_SETTLE），
+  // 那点时间足够二次重绘落定喵
+  markShotReady("timeline");
+  // 截图时要定位到某个时刻，等宽度按缩放撑开之后再滚，否则算出来的是旧宽度喵
+  applyPendingShotFocus();
 }
 
 /** 按天数偏移切换日期喵。 */
@@ -2033,7 +2066,8 @@ function stateAt(moment) {
 
 /** 把状态类型翻成人话，用来解释「有颜色但没有使用记录」喵。 */
 function stateLabel(kind) {
-  if (kind === "afk") return "空档（在线但 AFK）";
+  // 喵~注意：主人要求前端只标 AFK，不再堆"在线但无使用记录"这类解释喵
+  if (kind === "afk") return "AFK";
   if (kind === "offline") return "离线（无心跳）";
   return "无使用记录";
 }
@@ -2290,6 +2324,8 @@ function renderRankings() {
   if (!entries.length && !groups.length) {
     el.rankingSummary.textContent = "";
     el.rankingBody.innerHTML = '<p class="empty">这个时间窗口内还没有使用数据</p>';
+    // 喵~注意：空数据也是画完了，标记要置上，否则空窗口截图会白等到超时喵
+    markShotReady("rankings");
     return;
   }
   // 同名应用先合并，摘要里的「N 个应用」才不会被同一软件的多台设备重复计数喵
@@ -2301,6 +2337,7 @@ function renderRankings() {
   // 没有分组数据时退回总排行，避免接口没跟上就白屏喵
   if (!groups.length) {
     el.rankingBody.innerHTML = rankingListHtml(entries);
+    markShotReady("rankings");
     return;
   }
   el.rankingBody.innerHTML = groups
@@ -2314,6 +2351,8 @@ function renderRankings() {
       </section>`,
     )
     .join("");
+  // 排行行都插进 DOM 了，这一页就算画完喵
+  markShotReady("rankings");
 }
 
 /* ==================== 命令测试 ==================== */
@@ -2892,9 +2931,40 @@ async function restartServer() {
 
 /* ==================== 标签页路由 ==================== */
 
+/** 标记这一页的数据已经画完，供无头浏览器截图时等待喵。 */
+function markShotReady(tab) {
+  // 喵~注意：机器人截图会轮询这个属性，只有数据和配色都落定后才有意义喵
+  document.body.dataset.shotReady = tab;
+  // 带一个时间戳，后端读到标记后可以判断「是不是刚画的」喵
+  document.body.dataset.shotReadyAt = String(Date.now());
+}
+
+/** 清掉就绪标记，截图内容即将变化时调用喵。 */
+function clearShotReady() {
+  // 喵~注意：换页签 / 换日期 / 换设备之后，旧标记代表的画面已经不成立了喵
+  delete document.body.dataset.shotReady;
+  delete document.body.dataset.shotReadyAt;
+}
+
+/** 执行挂起的截图定位请求，时间轴画完之后才有正确的宽度喵。 */
+function applyPendingShotFocus() {
+  // 没有挂起请求时什么也不做喵
+  const pending = state.pendingShotFocus;
+  if (!pending) return;
+  // 喵~注意：先清掉再定位，避免二次重绘时又滚一次把位置弄乱喵
+  state.pendingShotFocus = null;
+  if (pending.mode === "window") {
+    focusTimelineWindow(pending.from, pending.to);
+  } else if (pending.mode === "at") {
+    focusTimelineAt(pending.at);
+  }
+}
+
 /** 切换标签页并按需加载数据喵。 */
 function switchTab(tab) {
   state.tab = tab;
+  // 喵~注意：换页签等于换画面，先把旧的就绪标记清掉，别让截图等到上一页的喵
+  clearShotReady();
   // 顶部导航高亮喵
   el.nav.querySelectorAll(".nav-item").forEach((item) => {
     item.classList.toggle("active", item.dataset.tab === tab);
@@ -2930,8 +3000,7 @@ function switchTab(tab) {
 }
 
 /** 把当前标签页写进地址栏，刷新后能停在原地喵。 */
-function updateHash() {
-  const suffix = state.tab === "devices" && state.selectedId ? `/${encodeURIComponent(state.selectedId)}` : "";
+function updateHash() {  const suffix = state.tab === "devices" && state.selectedId ? `/${encodeURIComponent(state.selectedId)}` : "";
   const target = `#/${state.tab}${suffix}`;
   if (location.hash !== target) history.replaceState(null, "", target);
 }
@@ -3104,10 +3173,14 @@ async function loadRankings() {
     renderRankings();
   } catch (error) {
     if (error.unauthorized) {
+      // 喵~注意：口令失效的自检在截图脚本里有专门一条，这里照样置位免得白等喵
+      markShotReady("rankings");
       handleUnauthorized();
       return;
     }
     el.rankingBody.innerHTML = `<p class="empty">加载失败：${escapeHtml(error.message)}</p>`;
+    // 喵~注意：加载失败也要置位，把错误画面截下来总比后端一直等到超时好喵
+    markShotReady("rankings");
   }
 }
 
@@ -3183,6 +3256,8 @@ async function applyToken(rawToken) {
 function handleUnauthorized() {
   state.token = "";
   localStorage.removeItem(TOKEN_KEY);
+  // 喵~注意：口令失效后画面全换成「口令无效」，旧的就绪标记不再成立喵
+  clearShotReady();
   state.devices = [];
   state.rankings = [];
   state.selectedId = null;
@@ -3303,6 +3378,8 @@ el.rankScopeSwitch.addEventListener("click", (event) => {
   el.rankScopeSwitch.querySelectorAll(".seg-item").forEach((item) => {
     item.classList.toggle("active", item === button);
   });
+  // 喵~注意：换口径等于换画面，先清掉就绪标记再重新加载喵
+  clearShotReady();
   loadRankings();
 });
 
@@ -3319,6 +3396,8 @@ el.rangeSwitch.addEventListener("click", (event) => {
   el.rangeSwitch.querySelectorAll(".seg-item").forEach((item) => {
     item.classList.toggle("active", item === button);
   });
+  // 喵~注意：换时间窗口等于换画面，先清掉就绪标记再重新加载喵
+  clearShotReady();
   loadRankings();
 });
 
@@ -3428,11 +3507,11 @@ function bootstrap() {
   const shot = readShotParams();
   if (tab === "timeline") {
     if (shot.from_time && shot.to_time) {
-      // 窗口模式：等数据回来并画完，再把这一段居中喵
-      window.setTimeout(() => focusTimelineWindow(shot.from_time, shot.to_time), 800);
+      // 窗口模式：记下要居中的片段，等 renderTimeline 画完再滚喵
+      state.pendingShotFocus = { mode: "window", from: shot.from_time, to: shot.to_time };
     } else if (shot.at) {
-      // 单点模式：等这一轮数据回来并画完再定位，早于渲染算出来的宽度是旧的喵
-      window.setTimeout(() => focusTimelineAt(shot.at), 800);
+      // 单点模式：同上，靠渲染完成来触发喵
+      state.pendingShotFocus = { mode: "at", at: shot.at };
     }
   }
   if (state.token) {

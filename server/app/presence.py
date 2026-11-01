@@ -3,8 +3,12 @@
 为什么要单独一个模块：看板要把一天的每一分钟分成三类——
 
 - **离线**：这段时间没有任何心跳，说明采集端没在跑（软件没启动、被关掉、机器关机）；
-- **空档**：心跳正常但人离开了（AFK），统计按规则暂停，但设备其实在线；
-- **在用**：心跳正常且没有 AFK，正常情况下这段时间应该有使用记录。
+- **空档**：设备在线，但这一分钟没有任何使用记录；
+- **在用**：这一分钟有使用记录，时间轴上画成应用色块。
+
+喵~注意：空档的定义是「在线但无使用记录」，不是「在线且报 AFK」。两者不等价：
+手机亮屏（afk=false）却因为被投屏门控暂停计时时同样没有使用记录，那也是空档。
+主人的口径是「时间轴上不允许出现无使用记录的空档」，所以只要有心跳、没色块，就是空档喵。
 
 这三类的判定逻辑不依赖数据库和 HTTP，放在这里就能直接用单元测试锁住喵。
 """
@@ -17,7 +21,7 @@ from datetime import datetime, timedelta
 # 离线区间喵
 KIND_OFFLINE = "offline"
 
-# 空档（在线但 AFK）区间喵
+# 空档（在线但没有使用记录）区间喵
 KIND_AFK = "afk"
 
 # 一分钟的秒数喵
@@ -33,9 +37,10 @@ DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 60
 # 空档边界容差：客户端给的精确时刻与整分钟结果相差超过这个值就认为时钟不可信喵
 EDGE_TOLERANCE_SECONDS = 180
 
-# 喵~注意：一分钟里被"精确空档区间"覆盖到这个秒数就算空档，
-# 否则短空档（那一分钟里只剩几秒使用采样）永远画不出斜纹，色块之间留空白喵
-MIN_AFK_SECONDS_PER_MINUTE = 30
+# 喵~注意：这里原来有个 MIN_AFK_SECONDS_PER_MINUTE = 30，用来要求
+# "这一分钟里被 AFK 覆盖够 30 秒才算空档"。主人的口径改成
+# 「无使用记录就是空档」之后，在线且没使用的分钟一律算空档，
+# 这个阈值不再参与判定，删掉避免误导喵
 
 # 喵~注意：短于这个秒数的状态段直接丢掉不留痕——把空档边界挪到客户端给的
 # 精确时刻时会在边界切出 0.0-0.9 秒的残余段（实测 95 个状态段里 41 个是这种），
@@ -725,36 +730,6 @@ def subtract_usage_from_offline(
     return kept
 
 
-def _afk_covered_seconds(
-    device_spans: list[tuple[datetime, datetime]],
-    usage_spans: list[tuple[datetime, datetime]],
-    minute_start: datetime,
-    minute_end: datetime,
-) -> float:
-    """算这一分钟里"真正的空档"有多少秒喵。
-
-    输入：这台设备的 AFK 区间、使用区间、分钟的起止。
-    输出：秒数（浮点）；区间先裁到分钟里，再扣掉与使用段重叠的部分喵。
-    边界：只认客户端给的区间；没有区间时返回 0，调用方退回整分钟逻辑喵。
-    """
-    covered = 0.0
-    # 逐段累加落在这一分钟里的空档秒数喵
-    for span_start, span_end in _merge_intervals(device_spans):
-        left = max(span_start, minute_start)
-        right = min(span_end, minute_end)
-        # 喵~防御：没交集就跳过喵
-        if right <= left:
-            continue
-        seconds = (right - left).total_seconds()
-        # 喵~注意：这一分钟里还在用的那几秒属于色块，不能算空档喵
-        for usage_start, usage_end in usage_spans:
-            overlap = (min(right, usage_end) - max(left, usage_start)).total_seconds()
-            if overlap > 0:
-                seconds -= overlap
-        covered += max(0.0, seconds)
-    return covered
-
-
 def build_presence(
     heartbeats: list[Heartbeat],
     start: datetime,
@@ -832,17 +807,9 @@ def build_presence(
         if span_index < len(spans):
             span_start, span_end = spans[span_index]
             used = span_start < minute_end and span_end > minute_start
-        # 喵~注意：短空档常常整段夹在两条上报之间，靠"整分钟全 AFK"永远判不出来，
-        # 这里改成量"这一分钟真正被空档覆盖了多少秒"喵
-        afk_cover = 0.0
-        if covered and spans_by_device:
-            afk_cover = min(
-                _afk_covered_seconds(spans_by_device.get(beat.device_id, []), spans, minute_start, minute_end)
-                for beat in covered
-            )
-        # 喵~注意：总轴合成按「使用帧 > 任意设备 AFK > 任意设备 Offline」的优先级喵
-        # ① 只要这一分钟有使用帧，就一定是"在用"，压过 AFK 和离线喵
-        # ② 没有使用帧时，只要还有任何一台设备在线且 AFK，就算空档，压过离线喵
+        # 喵~注意：总轴合成按「使用帧 > 任何设备在线 > 全部离线」的优先级喵
+        # ① 只要这一分钟有使用帧，就一定是"在用"，压过一切喵
+        # ② 没有使用帧、但还有设备在线，就算空档，压过离线喵
         # ③ 一台在线的都没有，才算离线喵
         kind: str | None = None
         if used:
@@ -851,13 +818,17 @@ def build_presence(
         elif not covered:
             kind = KIND_OFFLINE
             offline_seconds += SECONDS_PER_MINUTE
-        elif afk_cover >= MIN_AFK_SECONDS_PER_MINUTE or all(beat.afk for beat in covered):
+        else:
+            # 喵~注意：主人的口径是「无使用记录就是空档」——只要设备还在线，
+            # 这一分钟没画出色块就一定是空档，不许留白喵
+            # 喵~注意：这里原来还要求 afk_cover 够 30 秒、或所有设备都报 AFK，
+            # 否则 kind 留 None（注释说"算使用态"，实际既不画色块也不画斜纹，
+            # 时间轴上就是一条白缝，正是它自己说不能留的那种白）。
+            # 实测踩到：手机亮屏但被投屏门控暂停计时，afk=false 又没有使用记录，
+            # 14:00-16:28 整整 148 分钟全白。现在不看 afk 标记——
+            # 在线且没使用就是空档，afk 只影响边界精确度，不影响是否算空档喵
             kind = KIND_AFK
             afk_seconds += SECONDS_PER_MINUTE
-        else:
-            # 喵~注意：有设备在线、既没使用也没判 AFK（例如"活跃但没开任何应用"），
-            # 这一分钟算使用态——总轴上它属于"人在电脑前"，不能留白也不能算离线喵
-            kind = None
         # 喵~防御：在用状态不产出区间，但要把已经累积的区间收尾喵
         if kind is None:
             flush(minute_start)

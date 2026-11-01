@@ -326,6 +326,213 @@ class _StubChannel:
         self.images.append(group_key)
 
 
+class _SlowChannel:
+    """发送时故意慢一拍的假通道，用来验证命令确实被串行化了喵。"""
+
+    def __init__(self) -> None:
+        # 通道名喵
+        self.name = "qqbot"
+        # 已发送的文本喵
+        self.texts: list[tuple[str, str]] = []
+        # 发送顺序记录，用来断言没有交错喵
+        self.order: list[str] = []
+
+    async def run(self) -> None:
+        """假通道不跑网络喵。"""
+        return None
+
+    async def stop(self) -> None:
+        """假通道无需停止喵。"""
+        return None
+
+    def is_connected(self) -> bool:
+        """假通道始终在线喵。"""
+        return True
+
+    async def send_text(self, group_key: str, text: str, **kwargs: Any) -> None:
+        """慢一点发送，模拟真实通道的往返耗时喵。"""
+        self.order.append(text)
+        # 故意让出事件循环，给并发留出空子喵
+        await asyncio.sleep(0.02)
+        self.texts.append((group_key, text))
+
+    async def send_image(self, group_key: str, image_bytes: bytes, **kwargs: Any) -> None:
+        """图片同样记一次发送喵。"""
+        self.order.append("<image>")
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_concurrent_command(app_config: AppConfig) -> None:
+    """前一个命令没结束时，新命令只回「稍等」不执行喵。"""
+    # 打开官方通道喵
+    config = dataclasses.replace(
+        app_config,
+        qqbot=QQBotSection(enabled=True, app_id="app-id", app_secret="app-secret"),
+        acl=dataclasses.replace(app_config.acl, whitelist_group_openids=("GROUP_OPENID_A",)),
+    )
+    # 建机器人并换上慢通道喵
+    runner = BotRunner(config)
+    slow = _SlowChannel()
+    runner._channels = {"qqbot": slow}  # noqa: SLF001
+    # 喵~注意：要测的是「命令」并发，不是「发送」并发——忙时提示本来就该
+    # 和正在跑的命令并行发出，所以这里统计命令体的并发峰值喵
+    running = 0
+    peak = 0
+    # 包一层真正的命令执行喵
+    original_run = runner._run_command  # noqa: SLF001
+
+    async def counting_run(*args: Any, **kwargs: Any) -> None:
+        """记下命令体的并发峰值再交给原实现喵。"""
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        try:
+            await asyncio.sleep(0.05)
+            await original_run(*args, **kwargs)
+        finally:
+            running -= 1
+
+    runner._run_command = counting_run  # type: ignore[assignment]  # noqa: SLF001
+    # 造两条消息，一条先跑一条撞上来喵
+    first = NormalizedMessage(
+        channel="qqbot",
+        group_key="GROUP_OPENID_A",
+        user_key="MEMBER_OPENID_X",
+        text="/happy帮助",
+        mentioned=True,
+    )
+    second = NormalizedMessage(
+        channel="qqbot",
+        group_key="GROUP_OPENID_A",
+        user_key="MEMBER_OPENID_Y",
+        text="/happy设备",
+        mentioned=True,
+    )
+    # 两条一起发，让它们抢忙位喵
+    await asyncio.gather(
+        runner._handle_message(first),  # noqa: SLF001
+        runner._handle_message(second),  # noqa: SLF001
+    )
+    # 喵~防御：任何时候都不能有两个命令同时执行喵
+    assert peak == 1, f"出现了 {peak} 个并发命令"
+    # 第二条要么是「稍等」，要么（如果恰好错开了）真的跑完；两种都不许并发喵
+    assert any("/happy帮助" in text for _group, text in slow.texts)
+    # 忙位要让出来，别卡住后续消息喵
+    assert runner._busy is False  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_queue_dropped_command(app_config: AppConfig) -> None:
+    """被丢弃的命令不许在别的命令跑完之后偷偷补跑喵。"""
+    # 打开官方通道喵
+    config = dataclasses.replace(
+        app_config,
+        qqbot=QQBotSection(enabled=True, app_id="app-id", app_secret="app-secret"),
+        acl=dataclasses.replace(app_config.acl, whitelist_group_openids=("GROUP_OPENID_A",)),
+    )
+    # 建机器人并换上慢通道喵
+    runner = BotRunner(config)
+    slow = _SlowChannel()
+    runner._channels = {"qqbot": slow}  # noqa: SLF001
+    # 记下命令体被调用的次数喵
+    calls: list[tuple[Any, ...]] = []
+    original_run = runner._run_command  # noqa: SLF001
+
+    async def counting_run(*args: Any, **kwargs: Any) -> None:
+        """记一笔再交给原实现喵。"""
+        calls.append(args)
+        await asyncio.sleep(0.05)
+        await original_run(*args, **kwargs)
+
+    runner._run_command = counting_run  # type: ignore[assignment]  # noqa: SLF001
+    # 第一条占住忙位，第二条立刻撞上来喵
+    first = NormalizedMessage(
+        channel="qqbot",
+        group_key="GROUP_OPENID_A",
+        user_key="MEMBER_OPENID_X",
+        text="/happy帮助",
+        mentioned=True,
+    )
+    second = NormalizedMessage(
+        channel="qqbot",
+        group_key="GROUP_OPENID_A",
+        user_key="MEMBER_OPENID_Y",
+        text="/happy设备",
+        mentioned=True,
+    )
+    await asyncio.gather(
+        runner._handle_message(first),  # noqa: SLF001
+        runner._handle_message(second),  # noqa: SLF001
+    )
+    # 喵~注意：命令体只该被调用一次——第二条是丢弃，不是排队喵
+    assert len(calls) == 1, f"命令体被调用了 {len(calls)} 次，说明有排队补跑"
+    # 再等一会儿，确认没有延迟补跑的尾巴喵
+    await asyncio.sleep(0.2)
+    assert len(calls) == 1, "被丢弃的命令在稍后被补跑了"
+
+
+@pytest.mark.asyncio
+async def test_runner_lock_released_after_command(app_config: AppConfig) -> None:
+    """命令跑完之后锁要释放，下一条能正常执行喵。"""
+    # 打开官方通道喵
+    config = dataclasses.replace(
+        app_config,
+        qqbot=QQBotSection(enabled=True, app_id="app-id", app_secret="app-secret"),
+        acl=dataclasses.replace(app_config.acl, whitelist_group_openids=("GROUP_OPENID_A",)),
+    )
+    # 建机器人并换上慢通道喵
+    runner = BotRunner(config)
+    slow = _SlowChannel()
+    runner._channels = {"qqbot": slow}  # noqa: SLF001
+    # 造一条消息喵
+    message = NormalizedMessage(
+        channel="qqbot",
+        group_key="GROUP_OPENID_A",
+        user_key="MEMBER_OPENID_X",
+        text="/happy帮助",
+        mentioned=True,
+    )
+    # 串行跑两次，第二次不该被当成忙喵
+    await runner._handle_message(message)  # noqa: SLF001
+    await runner._handle_message(message)  # noqa: SLF001
+    # 两次都应该是真正的命令回复喵
+    assert len([text for _group, text in slow.texts if "/happy帮助" in text]) == 2
+    # 忙位必须已经让出来喵
+    assert runner._busy is False  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_runner_releases_lock_even_when_command_fails(app_config: AppConfig) -> None:
+    """命令抛异常时锁也要释放，否则机器人会永远卡在忙喵。"""
+    # 打开官方通道喵
+    config = dataclasses.replace(
+        app_config,
+        qqbot=QQBotSection(enabled=True, app_id="app-id", app_secret="app-secret"),
+        acl=dataclasses.replace(app_config.acl, whitelist_group_openids=("GROUP_OPENID_A",)),
+    )
+    # 建机器人喵
+    runner = BotRunner(config)
+    slow = _SlowChannel()
+    runner._channels = {"qqbot": slow}  # noqa: SLF001
+    message = NormalizedMessage(
+        channel="qqbot",
+        group_key="GROUP_OPENID_A",
+        user_key="MEMBER_OPENID_X",
+        text="/happy帮助",
+        mentioned=True,
+    )
+    # 喵~防御：把执行体换成一抛就炸的函数喵
+    async def boom(*_args: Any) -> None:
+        raise RuntimeError("模拟命令炸了")
+
+    runner._run_command = boom  # type: ignore[assignment]  # noqa: SLF001
+    # 异常应该往外冒喵
+    with pytest.raises(RuntimeError):
+        await runner._handle_message(message)  # noqa: SLF001
+    # 喵~注意：忙位没让出来的话后面所有命令都会被丢弃喵
+    assert runner._busy is False  # noqa: SLF001
+
+
 @pytest.mark.asyncio
 async def test_runner_dispatches_to_matching_channel(app_config: AppConfig) -> None:
     """官方通道的消息必须走官方通道回复，不能串到 NapCat 喵。"""

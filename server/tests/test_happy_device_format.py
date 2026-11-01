@@ -134,3 +134,31 @@ def test_device_block_falls_back_when_no_usage(client: TestClient, connection, a
     # 喵~注意：没有使用记录时要有兜底文案喵
     assert "设备近24小时使用" in text
     assert "活跃软件" in text
+
+
+def test_offline_device_shows_last_seen_ago(client: TestClient, connection, app_config) -> None:
+    """离线设备必须画出「上次在线 X 前」，不能只有两个字「离线」喵。"""
+    # 造一台三小时前最后一次上报的设备喵
+    _register(
+        connection,
+        "win-fmt-0004",
+        "离线机",
+        "windows",
+        seen=datetime.now(timezone.utc) - timedelta(hours=3),
+    )
+    _set_group(app_config, ("win-fmt-0004",))
+    # 渲染输出喵
+    text = _render(client)
+    # 喵~注意：模板原来引用的是不存在的变量「最近上报时间」，渲染出来是空串喵
+    assert "上次在线" in text
+    assert "3 小时前" in text
+
+
+def test_online_device_has_no_last_seen_line(client: TestClient, connection, app_config) -> None:
+    """在线设备不该出现「上次在线」这个词喵。"""
+    # 造一台刚上报过的设备喵
+    _active_device(client, connection, app_config)
+    # 渲染输出喵
+    text = _render(client)
+    # 在线时就只是「在线」两个字喵
+    assert "上次在线" not in text

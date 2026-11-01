@@ -31,11 +31,34 @@ def test_no_heartbeat_means_all_offline() -> None:
     assert intervals[0].seconds == 600
 
 
-def test_regular_heartbeat_is_online() -> None:
-    """每分钟都有心跳且不在 AFK 时既不算离线也不算空档喵。"""
+def test_online_minute_without_usage_is_gap() -> None:
+    """在线但没有使用记录的分钟必须算空档，不许留白喵。
+
+    喵~注意：主人定的口径是「无使用记录就是空档」。
+    这里刻意不传 usage_spans——设备一直有心跳、也没报 AFK，
+    但它这一整段时间没有任何使用记录，时间轴上就该是斜纹而不是白色喵。
+    """
     # 每分钟一条心跳喵
     beats = [_beat(minute) for minute in range(10)]
     intervals, offline, afk = build_presence(beats, BASE, BASE + timedelta(minutes=10))
+    # 没心跳才算离线，这里全程在线，所以离线为 0 喵
+    assert offline == 0
+    # 喵~注意：十分钟全都没有使用记录，必须全部判成空档喵
+    assert afk == 600
+    assert [item.kind for item in intervals] == [KIND_AFK]
+
+
+def test_online_minute_with_usage_is_active() -> None:
+    """在线且有使用记录的分钟既不算空档也不算离线喵。"""
+    # 每分钟一条心跳喵
+    beats = [_beat(minute) for minute in range(10)]
+    intervals, offline, afk = build_presence(
+        beats,
+        BASE,
+        BASE + timedelta(minutes=10),
+        # 整段窗口都有使用记录喵
+        usage_spans=[(BASE, BASE + timedelta(minutes=10))],
+    )
     # 两者都为 0，没有区间喵
     assert offline == 0
     assert afk == 0
@@ -43,7 +66,7 @@ def test_regular_heartbeat_is_online() -> None:
 
 
 def test_afk_heartbeat_counts_as_gap() -> None:
-    """在线但 AFK 的分钟应算成空档喵。"""
+    """全程 AFK、没有任何使用记录的分钟应算成空档喵。"""
     # 每分钟一条 AFK 心跳喵
     beats = [_beat(minute, afk=True) for minute in range(10)]
     intervals, offline, afk = build_presence(beats, BASE, BASE + timedelta(minutes=10))
@@ -59,11 +82,17 @@ def test_heartbeat_gap_becomes_offline() -> None:
     # 前两分钟有心跳，第 8 分钟才回来，超时 180 秒喵
     beats = [_beat(0), _beat(1), _beat(8)]
     intervals, offline, afk = build_presence(
-        beats, BASE, BASE + timedelta(minutes=10), timeout_seconds=180
+        beats,
+        BASE,
+        BASE + timedelta(minutes=10),
+        timeout_seconds=180,
+        # 整段窗口都没有使用记录，这样剩下的分钟只会落在空档与离线两类里喵
+        usage_spans=[],
     )
-    # 第 2-4 分钟仍被最后一条心跳覆盖，第 5-7 分钟离线喵
+    # 前 2 分钟在线但没使用 → 空档；第 2-4 分钟仍被最后一条心跳覆盖，第 5-7 分钟离线喵
     assert offline == 180
-    assert afk == 0
+    # 喵~注意：在线但没使用的那几分钟按新口径算空档，一共 10-3=7 分钟喵
+    assert afk == 420
     # 离线区间从第 5 分钟开始喵
     offline_intervals = [item for item in intervals if item.kind == KIND_OFFLINE]
     assert len(offline_intervals) == 1
@@ -145,21 +174,30 @@ def test_usage_beats_afk_and_offline() -> None:
     ]
     intervals, offline, afk = build_presence(beats, BASE, BASE + timedelta(minutes=10))
     assert offline > 0, "全部失联时必须判离线"
-    assert afk == 0, "全部失联时不该判空档"
+    # 喵~注意：前 3 分钟还有心跳（超时前），这几分钟在线且没使用记录，
+    # 按新口径算空档；失联之后的分钟必须全是离线，不能有一秒空档喵
+    afk_intervals = [item for item in intervals if item.kind == KIND_AFK]
+    for item in afk_intervals:
+        assert item.start < BASE + timedelta(minutes=3), "心跳断了之后还判出空档"
 
 
-def test_group_with_one_active_device_is_not_gap() -> None:
-    """组里只要有一台设备在正常用，这一分钟就不算空档喵。"""
+def test_group_with_one_active_device_is_not_offline() -> None:
+    """组里只要有一台设备在线，这一分钟就不算离线喵。
+
+    喵~注意：这条原来叫 is_not_gap，断言空档为 0；改成「无使用记录就是空档」
+    之后，两台设备都没使用记录时整分钟就是空档，所以验收点改成"不算离线"喵。
+    """
     # 两台设备：A 一直 AFK，B 一直活跃喵
     beats: list[Heartbeat] = []
     for minute in range(10):
         beats.append(Heartbeat(reported_at=BASE + timedelta(minutes=minute, seconds=10), afk=True, device_id="dev-a"))
         beats.append(Heartbeat(reported_at=BASE + timedelta(minutes=minute, seconds=20), afk=False, device_id="dev-b"))
     intervals, offline, afk = build_presence(beats, BASE, BASE + timedelta(minutes=10))
-    # 有 B 在活跃，既不算离线也不算空档喵
+    # 有 B 在线，绝不能判离线喵
     assert offline == 0
-    assert afk == 0
-    assert intervals == []
+    # 喵~注意：两台都没有使用记录，按新口径整段算空档喵
+    assert afk == 600
+    assert [item.kind for item in intervals] == [KIND_AFK]
 
 
 def test_group_all_afk_counts_as_gap() -> None:
@@ -305,7 +343,14 @@ def test_afk_since_snaps_interval_start() -> None:
         Heartbeat(reported_at=BASE + timedelta(minutes=minute, seconds=30), afk=True, afk_since=since)
         for minute in range(4, 10)
     ]
-    intervals, offline, afk = build_presence(beats, BASE, BASE + timedelta(minutes=10))
+    intervals, offline, afk = build_presence(
+        beats,
+        BASE,
+        BASE + timedelta(minutes=10),
+        # 喵~注意：前 4 分钟必须显式给使用段，否则按"无使用记录就是空档"
+        # 的新口径会被判成空档，起点就不再是从第 4 分钟开始了喵
+        usage_spans=[(BASE, BASE + timedelta(minutes=4))],
+    )
     # 空档从精确时刻开始喵
     afk_intervals = [item for item in intervals if item.kind == KIND_AFK]
     assert len(afk_intervals) == 1
@@ -326,7 +371,14 @@ def test_active_since_snaps_interval_end() -> None:
     ]
     beats.append(Heartbeat(reported_at=BASE + timedelta(minutes=5, seconds=30), afk=False, active_since=resumed))
     beats += [_beat(minute) for minute in range(6, 10)]
-    intervals, offline, afk = build_presence(beats, BASE, BASE + timedelta(minutes=10))
+    intervals, offline, afk = build_presence(
+        beats,
+        BASE,
+        BASE + timedelta(minutes=10),
+        # 喵~注意：恢复之后那几分钟也必须显式给使用段，否则它们会因为没有
+        # 使用记录被判成空档，空档终点就被拉到窗口末尾了喵
+        usage_spans=[(resumed, BASE + timedelta(minutes=10))],
+    )
     # 终点精确，起点没有精确时刻所以保持整分钟喵
     afk_intervals = [item for item in intervals if item.kind == KIND_AFK]
     assert len(afk_intervals) == 1
@@ -349,7 +401,14 @@ def test_afk_since_ignored_when_too_far() -> None:
         )
         for minute in range(5, 10)
     ]
-    intervals, _, afk = build_presence(beats, BASE, BASE + timedelta(minutes=10))
+    intervals, _, afk = build_presence(
+        beats,
+        BASE,
+        BASE + timedelta(minutes=10),
+        # 喵~注意：前 5 分钟要有使用段，否则它们会按新口径算成空档，
+        # 空档起点就不再是第 5 分钟了喵
+        usage_spans=[(BASE, BASE + timedelta(minutes=5))],
+    )
     # 边界保持整分钟喵
     afk_intervals = [item for item in intervals if item.kind == KIND_AFK]
     assert afk_intervals[0].start == BASE + timedelta(minutes=5)
@@ -377,7 +436,13 @@ def test_old_client_without_boundaries_keeps_minutes() -> None:
     """旧客户端不带边界时刻时，结果必须和以前完全一致喵。"""
     # 只有 afk 标记，没有任何边界字段喵
     beats = [_beat(minute, afk=minute >= 4) for minute in range(10)]
-    intervals, offline, afk = build_presence(beats, BASE, BASE + timedelta(minutes=10))
+    intervals, offline, afk = build_presence(
+        beats,
+        BASE,
+        BASE + timedelta(minutes=10),
+        # 喵~注意：前 4 分钟要显式给使用段，否则按"无使用记录就是空档"会被判成空档喵
+        usage_spans=[(BASE, BASE + timedelta(minutes=4))],
+    )
     afk_intervals = [item for item in intervals if item.kind == KIND_AFK]
     assert afk_intervals[0].start == BASE + timedelta(minutes=4)
     assert afk == 360
@@ -426,14 +491,23 @@ def test_usage_minute_stays_active_even_if_heartbeat_says_afk() -> None:
         beats,
         BASE,
         BASE + timedelta(minutes=10),
-        usage_spans=[(BASE + timedelta(minutes=4, seconds=10), BASE + timedelta(minutes=4, seconds=50))],
+        # 喵~注意：前 4 分钟要显式给使用段，否则按新口径会先算出一段空档喵
+        usage_spans=[
+            (BASE, BASE + timedelta(minutes=4)),
+            (BASE + timedelta(minutes=4, seconds=10), BASE + timedelta(minutes=4, seconds=50)),
+        ],
     )
     # 第 4 分钟有使用，那 40 秒仍是色块；空档从使用结束那一刻开始，不留空白喵
     afk_intervals = [item for item in intervals if item.kind == KIND_AFK]
-    assert len(afk_intervals) == 1
-    assert afk_intervals[0].start == BASE + timedelta(minutes=4, seconds=50)
-    # 从第 4 分 50 秒到第 10 分钟共 310 秒、离线 0 秒喵
-    assert afk == 310
+    # 喵~注意：新口径下 4:00-4:10 那 10 秒（在线但没使用记录）也算空档，
+    # 它被 4:10-4:50 的使用帧和后面那段隔开，所以这里断言的是"从使用结束开始的那一段"喵
+    tail = [item for item in afk_intervals if item.start == BASE + timedelta(minutes=4, seconds=50)]
+    assert len(tail) == 1, "使用帧结束之后没收尾成空档"
+    # 收尾这一段必须一直到窗口末尾喵
+    assert tail[0].end == BASE + timedelta(minutes=10)
+    # 从第 4 分 50 秒到第 10 分钟共 310 秒，加上 4:00-4:10 那 10 秒
+    # 新判出的短空档（在线但无使用记录）共 320 秒、离线 0 秒喵
+    assert afk == 320
     assert offline == 0
 
 def test_short_afk_between_reports_draws_hatch() -> None:
@@ -457,9 +531,10 @@ def test_short_afk_between_reports_draws_hatch() -> None:
         BASE,
         BASE + timedelta(minutes=10),
         # 离开前记到第 2 分 20 秒，回来后又记了 5 秒（3 分 45 到 3 分 50）喵
+        # 喵~注意：开头那段也要有使用记录，否则按新口径会先算出一段空档喵
         usage_spans=[
-            (BASE + timedelta(minutes=1, seconds=30), afk_start),
-            (resume - timedelta(seconds=5), resume),
+            (BASE, afk_start),
+            (resume - timedelta(seconds=5), BASE + timedelta(minutes=10)),
         ],
     )
     # 空档必须真的存在，否则色块之间就是一条空白喵
@@ -499,10 +574,12 @@ def test_short_afk_survives_tail_usage_deduction() -> None:
         beats,
         BASE,
         BASE + timedelta(minutes=10),
-        # 喵~注意：关键在最后这一段——恢复那一刻带 1 秒使用，会从空档尾部扣掉 1 秒喵
+        # 喵~注意：关键在第二段——恢复那一刻带 1 秒使用，会从空档尾部扣掉 1 秒喵
+        # 喵~注意：第三段必须补上，否则恢复之后的 8 分钟没有使用记录，
+        # 按新口径会整段算成空档，和这段 9 秒短空档粘在一起就分不清了喵
         usage_spans=[
             (BASE, afk_start),
-            (resume - timedelta(seconds=1), resume),
+            (resume - timedelta(seconds=1), BASE + timedelta(minutes=10)),
         ],
     )
     # 空档必须还在，否则时间轴上就是一条空白喵
@@ -629,10 +706,17 @@ def test_gap_before_offline_is_filled() -> None:
         holes.append((cursor, BASE + timedelta(minutes=10)))
     # 喵~注意：这是本条的验收点——一处空隙都不许有喵
     assert not holes, f"最后使用与离线判定之间漏了 {len(holes)} 处空隙"
-    # 离线段要紧接最后一段使用开始喵
+    # 离线段必须存在喵
     offline_intervals = [item for item in intervals if item.kind == KIND_OFFLINE]
     assert offline_intervals, "没有判出离线"
-    assert min(item.start for item in offline_intervals) <= usage_end + timedelta(minutes=1)
+    # 喵~注意：原来这里断言"离线段紧贴最后一段使用"，前提是"有心跳=在用"。
+    # 改成「无使用记录就是空档」之后，使用段与离线之间那截在线但没使用的分钟
+    # 应当算空档，所以验收点改成"离线段紧接在空档之后"，同样要求不留白喵
+    afk_intervals = [item for item in intervals if item.kind == KIND_AFK]
+    assert afk_intervals, "在线但没使用的那一截没有判成空档"
+    assert min(item.start for item in offline_intervals) == max(item.end for item in afk_intervals), (
+        "空档与离线之间有断口"
+    )
 
 
 def test_no_blank_between_usage_and_offline() -> None:
@@ -724,3 +808,84 @@ def test_residual_fill_skips_gap_beyond_limit() -> None:
     # 喵~注意：这里只验证不抛异常且不误判离线，缝隙归属由整分钟规则决定喵
     assert offline == 0
     assert afk >= 0
+
+
+def test_online_without_usage_never_leaves_blank() -> None:
+    """实测缺陷回归：手机亮屏、afk=false、却没有任何使用记录时不许留白喵。
+
+    喵~注意：这是主人报的真实场景——手机越过了投屏门控（服务端判定
+    mirror_rdp_disconnected，使用时长整批丢弃），但它自己 afk=false、
+    心跳一直有。老逻辑要求"这一分钟里 AFK 覆盖够 30 秒"或"所有设备都报 AFK"
+    才算空档，两者都不满足就把 kind 留成 None，时间轴上 14:00-16:28
+    整整 148 分钟全白。现在改成「在线且没使用记录就是空档」喵。
+    """
+    # 相对窗口起点造一个"被门控的手机"：全程有条心跳，但 afk 一直是 False 喵
+    beats = [_beat(minute, second=second) for minute in range(150) for second in (3, 33)]
+    # 只有开头 50 秒有使用记录，之后被门控掐断，两个半小时零使用喵
+    usage_end = BASE + timedelta(seconds=50)
+    intervals, offline, afk = build_presence(
+        beats,
+        BASE,
+        BASE + timedelta(minutes=148),
+        usage_spans=[(BASE, usage_end)],
+    )
+    # 全程有心跳，一秒离线都不许有喵
+    assert offline == 0, "有心跳却判出了离线"
+    # 从使用结束到窗口末尾必须全是空档喵
+    assert afk == 148 * 60 - 50, "被门控掐断后的空白没有判成空档"
+    afk_intervals = [item for item in intervals if item.kind == KIND_AFK]
+    # 喵~注意：相邻的空档区间在内部可能被切成两段（整分钟边界切了一刀），
+    # 这里断言的是"首尾相接、中间不留缝"，而不是死抠段数喵
+    assert min(item.start for item in afk_intervals) == usage_end
+    assert max(item.end for item in afk_intervals) == BASE + timedelta(minutes=148)
+    cursor = usage_end
+    for item in sorted(afk_intervals, key=lambda piece: piece.start):
+        # 喵~防御：中间只要断开就说明还留着白缝喵
+        assert item.start <= cursor, "空档区间之间断了，时间轴会留白"
+        cursor = max(cursor, item.end)
+
+
+def test_no_blank_anywhere_when_online_all_day() -> None:
+    """全天在线时，使用段与状态区间必须严丝合缝地盖满整个窗口喵。
+
+    喵~注意：这是主人要求的最终形态——时间轴上不允许出现任何无覆盖的白缝，
+    无论它是 AFK、被门控暂停，还是"在线但没开任何应用"喵。
+    """
+    # 全天在线，每 30 秒一条心跳，afk 随机夹杂喵
+    beats = [
+        _beat(minute, second=second, afk=(minute % 7 == 0))
+        for minute in range(120)
+        for second in (10, 40)
+    ]
+    # 使用段故意留出很多大小不一的空洞喵
+    usage_spans = [
+        (BASE, BASE + timedelta(minutes=3)),
+        (BASE + timedelta(minutes=5), BASE + timedelta(minutes=6, seconds=20)),
+        (BASE + timedelta(minutes=30), BASE + timedelta(minutes=31)),
+        (BASE + timedelta(minutes=90), BASE + timedelta(minutes=120)),
+    ]
+    intervals, offline, afk = build_presence(
+        beats, BASE, BASE + timedelta(minutes=120), usage_spans=usage_spans
+    )
+    # 全程有心跳，离线必须是 0 喵
+    assert offline == 0
+    # 把状态区间与使用段并起来，逐秒检查有没有漏白喵
+    covered = sorted(
+        [(item.start, item.end) for item in intervals] + list(usage_spans),
+        key=lambda pair: pair[0],
+    )
+    cursor = BASE
+    holes: list[tuple[datetime, datetime]] = []
+    for left, right in covered:
+        # 喵~防御：完全被覆盖的段直接跳过喵
+        if right <= cursor:
+            continue
+        # 喵~注意：这里抓到缝就记下来，最后统一断言，便于看清漏在哪喵
+        if left > cursor:
+            holes.append((cursor, left))
+        cursor = max(cursor, right)
+    # 窗口末尾也要检查喵
+    if cursor < BASE + timedelta(minutes=120):
+        holes.append((cursor, BASE + timedelta(minutes=120)))
+    # 喵~注意：这是本条的验收点——一处白缝都不许有喵
+    assert not holes, f"时间轴上漏了 {len(holes)} 处白缝：{holes[:3]}"

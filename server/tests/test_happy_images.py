@@ -495,6 +495,8 @@ def test_happy_device_scope_offline_phone(connection: sqlite3.Connection, app_co
     assert row["battery_label"] == "最后电量"
     assert row["is_offline"] is True
     assert row["status"] == "离线"
+    # 喵~注意：离线设备必须带上「上次在线」的时刻，否则模板那一行画不出来喵
+    assert row["last_seen"] is not None
 
 
 def test_happy_device_scope_windows_without_battery(connection: sqlite3.Connection, app_config) -> None:

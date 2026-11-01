@@ -124,6 +124,79 @@ async function waitForReady(cdp, timeoutMs) {
 }
 
 /**
+ * 等看板把数据取回来并画完，最多等 timeoutMs 喵。
+ *
+ * 输入：cdp 客户端、页签名（rankings / timeline）、超时毫秒。
+ * 输出：true 表示等到了就绪标记；false 表示超时没等到（由调用方退回兜底等待）。
+ *
+ * 喵~注意：readyState 变成 complete 只说明 HTML/CSS/JS 这几个静态资源到齐了，
+ * 而看板的取数全部发生在 load 之后——bootstrap() 里 refreshAll() 要串行拉
+ * /time、/dashboard、/people，然后才拉时间轴或排行榜，时间轴一次还要跑四组查询。
+ * 所以「等 load + 盲等 3.5 秒」是有竞态的：数据慢一点就会拍到空白页或
+ * 只写着「加载中…」的空轨道。前端为此在渲染完成后置了 body.dataset.shotReady，
+ * 这里就该等这个标记，而不是猜时间喵。
+ */
+async function waitForShotReady(cdp, tab, timeoutMs) {
+  // 没指定页签时无从校验，直接让调用方走兜底喵
+  if (!tab) return false;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const probe = await cdp.send("Runtime.evaluate", {
+      // 标记值可能带 :error 后缀，所以用 startsWith 判断喵
+      expression: `(() => {
+        const value = document.body && document.body.dataset ? document.body.dataset.shotReady : "";
+        const tab = ${JSON.stringify(tab)};
+        return typeof value === "string" && (value === tab || value.startsWith(tab + ":")) ? value : "";
+      })()`,
+      returnByValue: true,
+    });
+    if (probe.result && probe.result.value) return true;
+    await sleep(150);
+  }
+  // 喵~防御：超时不算失败，前端万一没置上标记也不能让机器人彻底不出图喵
+  return false;
+}
+
+/**
+ * 检查这一页到底有没有画出内容，没画出来就抛错喵。
+ *
+ * 输入：cdp 客户端、页签名。
+ * 输出：无；内容缺失时抛错。
+ *
+ * 喵~注意：必须区分两种「没有色块」——
+ *   合法：这一天/这个窗口真的没有使用记录，看板会画出空态文案，这种图该发；
+ *   非法：数据还没到，页面是空白或写着「加载中…」，这种图发出去就是错的。
+ * 所以这里认的是「空态文案出现了」而不是「一定有色块」喵。
+ */
+async function assertRendered(cdp, tab) {
+  // 只校验出图的两个页签，其它页签不管喵
+  if (tab !== "rankings" && tab !== "timeline") return;
+  const probe = await cdp.send("Runtime.evaluate", {
+    expression: `(() => {
+      const tab = ${JSON.stringify(tab)};
+      if (tab === "timeline") {
+        const summary = document.querySelector("#tl-summary");
+        const text = summary ? summary.textContent.trim() : "";
+        // 喵~注意：「加载中…」是渲染前的占位，说明数据还没回来喵
+        if (!text) return "时间轴摘要还是空的";
+        if (text.includes("加载中")) return "时间轴还停在「加载中…」";
+        return "";
+      }
+      // 排行榜：要么有行，要么有「没有数据」的空态文案喵
+      const body = document.querySelector("#ranking-body");
+      if (!body) return "找不到排行榜容器";
+      if (body.querySelector(".rank-row")) return "";
+      const empty = body.querySelector(".empty");
+      if (empty && empty.textContent.trim()) return "";
+      return "排行榜既没有排行行也没有空态文案";
+    })()`,
+    returnByValue: true,
+  });
+  const problem = probe.result && probe.result.value;
+  if (problem) throw new Error(`页面还没画出内容：${problem}`);
+}
+
+/**
  * 截图主流程。
  *
  * 参数通过环境变量传，避免命令行转义问题喵。
@@ -135,6 +208,10 @@ async function main() {
   const width = Number(process.env.SHOT_WIDTH || 1100);
   const height = Number(process.env.SHOT_HEIGHT || 900);
   const waitMs = Number(process.env.SHOT_WAIT || 2500);
+  // 等就绪标记的总超时，外层 subprocess 超时是 60 秒，这里留足余量喵
+  const SHOT_READY_TIMEOUT_MS = Number(process.env.SHOT_READY_TIMEOUT || 12000);
+  // 就绪后再等一小会儿，让图标取色的二次重绘收敛喵
+  const SHOT_READY_SETTLE_MS = Number(process.env.SHOT_READY_SETTLE || 400);
   const selector = process.env.SHOT_SELECTOR || "";
   // 默认只截内容区，不带顶部的功能栏喵
   const defaultClip = process.env.SHOT_CLIP || "main.page";
@@ -206,8 +283,6 @@ async function main() {
       await cdp.send("Page.reload", { ignoreCache: true });
       await waitForReady(cdp, 15000);
     }
-    await sleep(waitMs);
-
     // 喵~注意：固定等一会儿有时不够（刚重启时首个请求要建连接池），
     // 这里再等口令遮罩消失，最多多等 6 秒，等不到就交给下面的自检报错喵
     {
@@ -223,6 +298,21 @@ async function main() {
         if (probe.result && probe.result.value) break;
         await sleep(250);
       }
+    }
+
+    // 等看板把数据取回来并画完喵
+    // 喵~注意：这一步必须放在口令遮罩之后，否则遮罩还在时代码根本走不到渲染喵
+    const tabName = hash.replace(/^#?\/?/, "").split("?")[0];
+    const ready = await waitForShotReady(cdp, tabName, SHOT_READY_TIMEOUT_MS);
+    if (ready) {
+      // 喵~注意：就绪之后再让图标取色的二次重绘有机会收敛——
+      // 时间轴每个应用图标都要单独取色，取到之后会排队重画一次，
+      // 早一步截图就会拍到默认配色喵
+      await sleep(SHOT_READY_SETTLE_MS);
+    } else {
+      // 喵~防御：没等到标记就退回固定等待，宁可慢一点也不要出一张空白图喵
+      console.error(`[shot] 等就绪标记超时（tab=${tabName || "未指定"}），退回固定等待 ${waitMs}ms`);
+      await sleep(waitMs);
     }
 
     // 等指定元素出现，超时不算失败喵
@@ -274,6 +364,9 @@ async function main() {
     });
     const blocked = guard.result && guard.result.value;
     if (blocked) throw new Error(`口令没有生效，页面停在「${blocked}」遮罩上`);
+
+    // 喵~防御：口令过了不代表数据到了，这里再确认页面真的画出了内容喵
+    await assertRendered(cdp, tabName);
 
     // 要截某个元素时用它的完整文档包围盒裁剪喵
     let clip;
