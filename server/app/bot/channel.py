@@ -99,6 +99,9 @@ class NormalizedMessage:
     scope: str = SCOPE_GROUP
     # 群内角色：member / admin / owner，napcat 恒为 member 喵
     role: str = "member"
+    # 发送者昵称，拿不到时为空串喵
+    # 喵~注意：NapCat 能给 sender.nickname / card，官方通道完全拿不到，只能靠 openid 认人喵
+    display_name: str = ""
     # 被动回复凭据：官方填事件 d.id，napcat 填 None 喵
     reply_token: str | None = None
     # 原始事件，排查问题用喵
@@ -292,6 +295,9 @@ def from_onebot_event(event: dict[str, Any], self_qq: str = "") -> NormalizedEve
     bot_qq = self_qq or str(event.get("self_id", ""))
     # 提取文本与 @ 状态喵
     message_text, mentioned_self = extract_onebot_text(event.get("message"), bot_qq)
+    # 喵~注意：群名片 card 优先于昵称 nickname，群里大家更认得名片喵
+    sender = event.get("sender") or {}
+    sender_name = str(sender.get("card") or sender.get("nickname") or "").strip()
     # 组装归一化消息喵
     message = NormalizedMessage(
         channel=CHANNEL_NAPCAT,
@@ -303,9 +309,28 @@ def from_onebot_event(event: dict[str, Any], self_qq: str = "") -> NormalizedEve
         role="member",
         reply_token=None,
         raw=event,
+        # 喵~注意：OneBot 会带 sender.nickname，能拿到就顺手记下来喵
+        display_name=sender_name,
     )
     # 返回成功结果喵
     return NormalizedEvent(message, "")
+
+
+def _qqbot_author_name(author: dict[str, Any]) -> str:
+    """尽力从官方事件的 author 里取一个可读名字喵。
+
+    输入：官方事件里的 author 字典。
+    输出：昵称；取不到时返回空串。
+    边界：官方平台目前不下发昵称，这个函数多数情况下返回空串，
+          留着是为了将来平台补字段时能自动生效喵。
+    """
+    # 按可能性从高到低试几个字段喵
+    for key in ("username", "nickname", "nick", "name"):
+        value = str(author.get(key) or "").strip()
+        if value:
+            return value
+    # 喵~防御：一个都没有就是拿不到，交给上层按 openid 显示喵
+    return ""
 
 
 def from_qqbot_event(event: dict[str, Any], bot_id: str | None = None) -> NormalizedEvent:
@@ -349,6 +374,8 @@ def from_qqbot_event(event: dict[str, Any], bot_id: str | None = None) -> Normal
             role=str(author.get("member_role") or "member"),
             reply_token=str(payload.get("id") or "") or None,
             raw=event,
+            # 喵~注意：官方通道的 author 通常只有 openid 与 role，昵称恒为空喵
+            display_name=_qqbot_author_name(author),
         )
         # 返回成功结果喵
         return NormalizedEvent(message, "")
@@ -370,6 +397,8 @@ def from_qqbot_event(event: dict[str, Any], bot_id: str | None = None) -> Normal
             role="member",
             reply_token=str(payload.get("id") or "") or None,
             raw=event,
+            # 单聊同样只能尽力取，取不到就空着喵
+            display_name=_qqbot_author_name(author),
         )
         # 返回成功结果喵
         return NormalizedEvent(message, "")

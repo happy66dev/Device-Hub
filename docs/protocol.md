@@ -439,6 +439,7 @@ Android 端的判定口径与 Windows 对齐，但信号源不同：**息屏（`
 | GET | `/api/v1/acl/blocklist` | 读取名单，`source` 标出 `runtime`（可删）或 `config`（只能改配置文件） |
 | POST | `/api/v1/acl/blocklist` | 拉黑，body 为 `{"channel":"napcat\|qqbot","target":"...","note":"可选"}` |
 | DELETE | `/api/v1/acl/blocklist/{channel}/{target}` | 解除拉黑 |
+| GET | `/api/v1/acl/seen-users` | 最近成功执行过命令的人，用来反查 openid |
 
 ```json
 {
@@ -453,6 +454,29 @@ Android 端的判定口径与 Windows 对齐，但信号源不同：**息屏（`
 - `channel` 决定标识的命名空间：`napcat` 填 QQ 号，`qqbot` 填 member_openid，两者互不干扰。
 - 重复拉黑同一个人返回 `added: false`，不会产生多条记录。
 - 拉黑只影响机器人响应，设备上报接口不受影响。
+
+### 最近发言（反查 openid）
+
+想在 WebUI 里一键拉黑，得先知道对方的 openid，但它不是能背下来的东西，
+所以服务端会记下「成功执行过命令的人」：
+
+```json
+{
+  "ok": true,
+  "users": [
+    { "channel": "napcat", "user_key": "222333", "display_name": "小黑本黑",
+      "label": "小黑本黑", "group_key": "111", "role": "member",
+      "command_count": 3,
+      "first_seen_at": "2026-11-01T05:49:20Z", "last_seen_at": "2026-11-01T06:12:03Z" }
+  ]
+}
+```
+
+- 存在 `bot_seen_users` 表，每人一行，按 `(channel, user_key)` 唯一，用 upsert 维护计数。
+- **只记 ACL 通过、真正执行了命令的人**；闲聊与被拦截的消息都不记。
+- 昵称来源：NapCat 读 `sender.card` 优先、其次 `sender.nickname`；
+  **官方通道平台只给 openid，拿不到昵称**，此时 `display_name` 为空，`label` 退化成标识前 8 位。
+- 保留期跟随 `retention.detail_days`，由机器人原有的清理循环一并删除。
 
 ## 设备组（人）接口
 

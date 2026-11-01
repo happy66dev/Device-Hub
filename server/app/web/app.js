@@ -132,6 +132,8 @@ const el = {
   blocklistAdd: document.getElementById("blocklist-add"),
   blocklistStatus: document.getElementById("blocklist-status"),
   blocklistList: document.getElementById("blocklist-list"),
+  // 最近发言元素喵
+  seenUsersList: document.getElementById("seen-users-list"),
   modal: document.getElementById("token-modal"),
   modalInput: document.getElementById("modal-token"),
   modalSave: document.getElementById("modal-save"),
@@ -2750,6 +2752,76 @@ async function removeBlocklistEntry(channel, target) {
   }
 }
 
+/** 拉取最近发言的人并渲染喵。 */
+async function loadSeenUsers() {
+  if (!el.seenUsersList) return;
+  try {
+    const body = await api("/api/v1/acl/seen-users");
+    renderSeenUsers(body.users || []);
+  } catch (error) {
+    if (error.unauthorized) {
+      handleUnauthorized();
+      return;
+    }
+    el.seenUsersList.innerHTML = `<p class="empty">加载失败：${escapeHtml(error.message)}</p>`;
+  }
+}
+
+/** 把最近发言的人渲染成表格，每行带一键拉黑喵。 */
+function renderSeenUsers(users) {
+  if (!el.seenUsersList) return;
+  if (!users.length) {
+    el.seenUsersList.innerHTML =
+      '<p class="empty">还没有人执行过命令。等群里有人 @ 机器人发一条命令就会出现。</p>';
+    return;
+  }
+  const rows = users.map((user) => {
+    const channelText = user.channel === "qqbot" ? "官方通道" : "NapCat";
+    // 喵~注意：没有昵称时明确标出来，提醒主人只能靠 openid 前 8 位认人喵
+    const nameCell = user.display_name
+      ? escapeHtml(user.display_name)
+      : `<span class="muted">无昵称</span> <code>${escapeHtml(user.label)}</code>`;
+    return `<tr>
+      <td>${escapeHtml(channelText)}</td>
+      <td>${nameCell}</td>
+      <td><code title="${escapeHtml(user.user_key)}">${escapeHtml(user.user_key)}</code></td>
+      <td>${escapeHtml(user.command_count)}</td>
+      <td>${escapeHtml(formatClock(user.last_seen_at))}</td>
+      <td><button class="btn ghost small" type="button" data-action="block-seen"
+            data-channel="${escapeHtml(user.channel)}"
+            data-target="${escapeHtml(user.user_key)}">拉黑</button></td>
+    </tr>`;
+  }).join("");
+  el.seenUsersList.innerHTML = `<table class="rules seen-users-table">
+    <thead><tr><th>通道</th><th>昵称</th><th>openid / QQ</th><th>命令数</th><th>最近活跃</th><th>操作</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+/** 从最近发言列表里直接拉黑一个人喵。 */
+async function blockSeenUser(channel, target) {
+  try {
+    const body = await api("/api/v1/acl/blocklist", {
+      method: "POST",
+      body: JSON.stringify({ channel, target }),
+    });
+    if (body.added) {
+      showToast("已拉黑，立刻生效", "ok");
+      if (el.blocklistStatus) el.blocklistStatus.textContent = `已拉黑 ${target}`;
+    } else {
+      showToast("已经在黑名单里", "warn");
+    }
+    // 两边都刷新，让状态保持同步喵
+    await Promise.all([loadBlocklist(), loadSeenUsers()]);
+  } catch (error) {
+    if (error.unauthorized) {
+      handleUnauthorized();
+      return;
+    }
+    showToast(`拉黑失败：${error.message}`, "error");
+  }
+}
+
 /** 测试某个机器人通道能不能连上喵。 */
 async function testBotChannel(channel) {
   if (!el.configStatus) return;
@@ -2850,6 +2922,7 @@ function switchTab(tab) {
   if (tab === "config") {
     loadConfig();
     loadBlocklist();
+    loadSeenUsers();
   }
   // 时间轴的增量刷新跟着标签页走喵
   syncTimelineTicker();
@@ -3206,6 +3279,13 @@ el.blocklistList.addEventListener("click", (event) => {
 // 输入框里回车等于点「拉黑」喵
 el.blocklistTarget.addEventListener("keydown", (event) => {
   if (event.key === "Enter") addBlocklistEntry();
+});
+
+// 最近发言列表里的一键拉黑，同样是动态渲染所以用委托喵
+el.seenUsersList.addEventListener("click", (event) => {
+  const button = event.target.closest('[data-action="block-seen"]');
+  if (!button) return;
+  blockSeenUser(button.dataset.channel, button.dataset.target);
 });
 
 el.autoRefresh.addEventListener("change", () => {

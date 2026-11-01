@@ -15,7 +15,7 @@ import sqlite3
 
 from .. import db, queries
 from ..config import AppConfig
-from . import router
+from . import router, users
 from .channel import (
     CHANNEL_NAPCAT,
     CHANNEL_QQBOT,
@@ -140,6 +140,9 @@ class BotRunner:
         # 喵~防御：通道被关掉后残留的消息直接丢弃喵
         if channel is None:
             return
+        # 喵~注意：只记真正执行了命令的人，方便在看板里反查 openid 拉黑喵
+        # 这一步放在 ACL 之后，被拦下的消息不会占存储喵
+        await asyncio.to_thread(self._record_seen, message)
         # 先尝试生成图片，命令里带"图"字才会真的渲染喵
         image_bytes = await asyncio.to_thread(self._build_image, command_text)
         # 有图片就发图片，发送成功即可结束喵
@@ -200,6 +203,33 @@ class BotRunner:
             # 关闭连接喵
             connection.close()
 
+    def _record_seen(self, message: NormalizedMessage) -> None:
+        """在线程里记下这个发言人，供看板反查 openid 喵。
+
+        输入：归一化消息。
+        输出：无。
+        边界：数据库异常只记日志，绝不能因为记账失败而不回复命令喵。
+        """
+        # 每条消息独立开连接，和 _build_reply 保持一致喵
+        connection = db.connect(self._config.server.db_path)
+        try:
+            # 喵~注意：记的是「谁执行了命令」，昵称能拿到就存，拿不到留空喵
+            users.record_seen(
+                connection,
+                message.channel,
+                message.user_key,
+                display_name=message.display_name,
+                group_key=message.group_key,
+                role=message.role,
+                now=db.utc_now(),
+            )
+        except sqlite3.Error as database_error:
+            # 喵~防御：记账失败不影响业务，打条日志就够喵
+            LOGGER.warning("记录发言人失败：%s", database_error)
+        finally:
+            # 关闭连接喵
+            connection.close()
+
     def _build_reply(self, command_text: str) -> str:
         """在线程里打开数据库并生成回复文本喵。"""
         # 每次命令独立开连接，SQLite 本地开销很小且天然线程安全喵
@@ -240,11 +270,15 @@ class BotRunner:
         connection = db.connect(self._config.server.db_path)
         try:
             # 复用查询层的清理函数喵
-            return queries.prune_expired(
+            counts = queries.prune_expired(
                 connection,
                 detail_days=self._config.retention.detail_days,
                 aggregate_days=self._config.retention.aggregate_days,
             )
+            # 喵~注意：发言人名单也按明细保留期清理，不然会无限长喵
+            stale_cutoff = db.days_ago_text(self._config.retention.detail_days)
+            counts["bot_seen_users"] = users.prune_seen_users(connection, stale_cutoff)
+            return counts
         finally:
             # 关闭连接喵
             connection.close()

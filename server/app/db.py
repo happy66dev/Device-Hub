@@ -95,6 +95,21 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         png        BLOB NOT NULL,
         updated_at TEXT NOT NULL
     )
+    """,
+    # 机器人见过的发言人：只记成功执行了命令的人，供「最近发言」列表反查 openid 喵
+    # 喵~注意：按 (通道, 标识) 唯一，每人一行，用 upsert 更新，不会随消息条数膨胀喵
+    """
+    CREATE TABLE IF NOT EXISTS bot_seen_users (
+        channel     TEXT NOT NULL,
+        user_key    TEXT NOT NULL,
+        display_name TEXT NOT NULL DEFAULT '',
+        group_key   TEXT NOT NULL DEFAULT '',
+        role        TEXT NOT NULL DEFAULT 'member',
+        command_count INTEGER NOT NULL DEFAULT 0,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at  TEXT NOT NULL,
+        PRIMARY KEY (channel, user_key)
+    )
     """,    # 按设备+时间建索引，近 24 小时聚合查询全靠它喵
 )
 
@@ -105,6 +120,8 @@ INDEX_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_usage_device_time ON usage_samples (device_id, sampled_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_package ON usage_samples (device_id, package)",
     "CREATE INDEX IF NOT EXISTS idx_window_device_time ON window_samples (device_id, reported_at)",
+    # 最近发言列表按最后活跃时间倒序取，走这个索引喵
+    "CREATE INDEX IF NOT EXISTS idx_bot_seen_last ON bot_seen_users (last_seen_at)",
 )
 
 # 老版本数据库缺的列，启动时按需补齐喵

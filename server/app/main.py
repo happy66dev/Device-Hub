@@ -35,6 +35,7 @@ from .clock import DEFAULT_SERVERS, TrustedClock, get_clock, set_clock
 
 from . import acl, botcheck, db, icons, ingest, people, presence, queries, settings, storage
 from .bot import simulate
+from .bot import users as bot_users
 from .bot.runner import BotRunner
 from .config import AppConfig, ConfigError, load_config, resolve_config_path
 from .gating import reason_text
@@ -985,6 +986,19 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         # 返回结果喵
         return JSONResponse(content={"ok": True, "entries": runtime + from_config})
 
+    @application.get("/api/v1/acl/seen-users")
+    async def list_seen_users(request: Request) -> JSONResponse:
+        """最近执行过命令的人：用来反查 openid，好拉黑喵。"""
+        # 取当前配置喵
+        active_config: AppConfig = request.app.state.config
+        # 喵~防御：名单属于管理数据，必须带口令喵
+        if not _verify_token(request, active_config):
+            return _error_response(401, "invalid_token", "X-Ingest-Token 缺失或不匹配")
+        # 线程池里查库喵
+        rows = await run_in_threadpool(_load_seen_users, active_config)
+        # 返回结果喵
+        return JSONResponse(content={"ok": True, "users": rows})
+
     @application.post("/api/v1/acl/blocklist")
     async def add_blocklist(request: Request) -> JSONResponse:
         """拉黑一个人，立刻生效（不需要重启）喵。"""
@@ -1224,6 +1238,20 @@ def _serialize_usage(entry: queries.UsageEntry, icon_keys: dict[tuple[str, str],
         # 喵~注意：键现在含图标内容哈希，只能从库里查；没有图标时给空串，前端退回色块喵
         "icon_key": _icon_key_of(icon_keys, entry.app, entry.package),
     }
+
+
+def _load_seen_users(config: AppConfig) -> list[dict[str, object]]:
+    """线程内读出最近发言的人喵。"""
+    # 打开连接喵
+    connection = db.connect(config.server.db_path)
+    try:
+        # 查最近活跃的发言人喵
+        rows = bot_users.list_seen_users(connection)
+        # 转成前端要的字典喵
+        return [bot_users.to_payload(row) for row in rows]
+    finally:
+        # 关闭连接喵
+        connection.close()
 
 
 def _load_dashboard(config: AppConfig) -> list[dict[str, object]]:

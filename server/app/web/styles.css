@@ -468,6 +468,10 @@ input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-
 /* 黑名单表格顶部留点距离喵 */
 .blocklist-table { margin-top: 12px; }
 
+/* 最近发言表格，openid 一列可能很长，允许换行喵 */
+.seen-users-table { margin-top: 12px; }
+.seen-users-table td code { word-break: break-all; font-size: 11px; }
+
 /* 多行列表输入框喵 */
 .config-item textarea {
   padding: 8px 10px;
