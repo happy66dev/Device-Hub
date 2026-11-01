@@ -177,6 +177,103 @@ def test_android_mirrored_without_foreground_is_paused(connection) -> None:
     assert decision.reason == REASON_MIRROR_BACKGROUND
 
 
+def test_android_mirrored_host_rdp_disconnected_is_paused(connection) -> None:
+    """宿主 RDP 没连时，即使投屏窗口在前台也要暂停手机统计喵。"""
+    # 喵~注意：RDP 断开后键鼠摸不到这台服务器，前台那个 scrcpy 窗口只是残留画面喵
+    _insert_device(
+        connection,
+        "win-srv-0001",
+        role="server",
+        rdp_connected=0,
+        rdp_updated_at="2026-10-29T11:59:30Z",
+        mirrored_tags=["我的手机"],
+        mirror_foreground=1,
+    )
+    # 判定喵
+    decision = decide_stats_enabled(connection, "and-phone-0001", "workstation", "我的手机", False, GatingSettings(), now=NOW)
+    # 应暂停，且原因要区别于"投屏窗口在后台"喵
+    assert decision.stats_enabled is False
+    assert decision.reason == REASON_MIRROR_RDP_DISCONNECTED
+
+
+def test_android_mirrored_host_rdp_disconnected_without_foreground_is_paused(connection) -> None:
+    """宿主 RDP 没连且投屏窗口在后台时，也按 RDP 断开报，不报投屏在后台喵。"""
+    # 两种情况同时成立，优先级更高的"RDP 未连接"应该胜出喵
+    _insert_device(
+        connection,
+        "win-srv-0001",
+        role="server",
+        rdp_connected=0,
+        rdp_updated_at="2026-10-29T11:59:30Z",
+        mirrored_tags=["我的手机"],
+        mirror_foreground=0,
+    )
+    # 判定喵
+    decision = decide_stats_enabled(connection, "and-phone-0001", "workstation", "我的手机", False, GatingSettings(), now=NOW)
+    # 应暂停并给 RDP 断开的文案喵
+    assert decision.stats_enabled is False
+    assert decision.reason == REASON_MIRROR_RDP_DISCONNECTED
+
+
+def test_android_mirrored_one_host_disconnected_other_connected_foreground(connection) -> None:
+    """一台宿主掉线、另一台连着且投屏在前台时，仍照常统计喵。"""
+    # 第一台 RDP 已断，投屏窗口摆在前台（残留画面，不算数）喵
+    _insert_device(
+        connection,
+        "win-srv-0001",
+        role="server",
+        rdp_connected=0,
+        rdp_updated_at="2026-10-29T11:59:30Z",
+        mirrored_tags=["我的手机"],
+        mirror_foreground=1,
+    )
+    # 第二台 RDP 连着且投屏窗口在前台，人是通过它在看手机喵
+    _insert_device(
+        connection,
+        "win-srv-0002",
+        role="server",
+        rdp_connected=1,
+        rdp_updated_at="2026-10-29T11:59:30Z",
+        mirrored_tags=["我的手机"],
+        mirror_foreground=1,
+    )
+    # 判定喵
+    decision = decide_stats_enabled(connection, "and-phone-0001", "workstation", "我的手机", False, GatingSettings(), now=NOW)
+    # 应允许统计喵
+    assert decision.stats_enabled is True
+    assert decision.reason == ""
+
+
+def test_android_mirrored_disconnected_host_foreground_does_not_count(connection) -> None:
+    """掉线宿主的投屏窗口在前台，不能把"连着但窗口在后台"那台救回来喵。"""
+    # 第一台 RDP 已断，窗口在前台（不该采信）喵
+    _insert_device(
+        connection,
+        "win-srv-0001",
+        role="server",
+        rdp_connected=0,
+        rdp_updated_at="2026-10-29T11:59:30Z",
+        mirrored_tags=["我的手机"],
+        mirror_foreground=1,
+    )
+    # 第二台 RDP 连着但投屏窗口在后台喵
+    _insert_device(
+        connection,
+        "win-srv-0002",
+        role="server",
+        rdp_connected=1,
+        rdp_updated_at="2026-10-29T11:59:30Z",
+        mirrored_tags=["我的手机"],
+        mirror_foreground=0,
+    )
+    # 判定喵
+    decision = decide_stats_enabled(connection, "and-phone-0001", "workstation", "我的手机", False, GatingSettings(), now=NOW)
+    # 只看连着的第二台 → 窗口在后台，暂停喵
+    assert decision.stats_enabled is False
+    assert decision.reason == REASON_MIRROR_BACKGROUND
+
+
+
 def test_android_with_stale_host_keeps_stats(connection) -> None:
     """宿主服务器状态过期说明投屏早结束了，手机应照常统计喵。"""
     # 状态是 10 分钟前的，超过 180 秒有效期喵
@@ -477,6 +574,15 @@ def test_mirrored_android_paused_when_host_afk(connection) -> None:
 def test_reason_text_for_afk() -> None:
     """AFK 原因要有中文文案喵。"""
     assert reason_text(REASON_AFK) == "键鼠空闲，统计已暂停"
+
+
+def test_reason_text_for_mirror_rdp_disconnected() -> None:
+    """宿主 RDP 断开这条原因要有中文文案，且不能和"投屏窗口在后台"混用喵。"""
+    # 文案里要同时点出"投屏"与"RDP"喵
+    assert "投屏" in reason_text(REASON_MIRROR_RDP_DISCONNECTED)
+    assert "RDP" in reason_text(REASON_MIRROR_RDP_DISCONNECTED)
+    # 两条原因的文案必须不同，否则看板上分不清是哪种情况喵
+    assert reason_text(REASON_MIRROR_RDP_DISCONNECTED) != reason_text(REASON_MIRROR_BACKGROUND)
 
 
 def test_server_counts_even_with_unknown_rdp_client(connection) -> None:

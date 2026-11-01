@@ -277,8 +277,6 @@ def test_mirrored_android_paused_when_mirror_in_background(connection: sqlite3.C
     assert android_result.stats_paused is True
     assert android_result.stats_paused_reason == "mirror_background"
     assert android_result.usage_rows_written == 0
-    assert android_result.stats_paused_reason == "mirror_background"
-    assert android_result.usage_rows_written == 0
 
 
 def test_mirrored_android_enabled_when_mirror_foreground(connection: sqlite3.Connection) -> None:
@@ -320,6 +318,48 @@ def test_mirrored_android_enabled_when_mirror_foreground(connection: sqlite3.Con
     # 应正常写入喵
     assert android_result.stats_paused is False
     assert android_result.usage_rows_written == 1
+
+
+def test_mirrored_android_paused_when_mirror_foreground_but_host_rdp_off(connection: sqlite3.Connection) -> None:
+    """宿主 RDP 没连时，投屏窗口在前台也要暂停手机统计喵。"""
+    # 固定两个时间点，避免同一秒内两次上报被判定为重复喵
+    first_time = datetime.now(timezone.utc).replace(microsecond=0)
+    second_time = first_time + timedelta(seconds=30)
+    # 安卓设备先上报标签喵
+    ingest.save_report(
+        connection,
+        _payload(device_id="and-phone-0001", platform="android", tag="23113RKC6C", reported_at=first_time.isoformat()),
+        datetime.now(timezone.utc),
+    )
+    # 喵~注意：服务器投屏窗口在前台，但 RDP 已经断开，人其实操作不了手机喵
+    ingest.save_report(
+        connection,
+        _payload(
+            device_id="win-srv-0001",
+            role="server",
+            rdp_connected=False,
+            mirror_windows=["23113RKC6C"],
+            mirror_foreground=True,
+            usage_delta=[],
+        ),
+        datetime.now(timezone.utc),
+    )
+    # 安卓上报使用时长喵
+    android_result = ingest.save_report(
+        connection,
+        _payload(
+            device_id="and-phone-0001",
+            platform="android",
+            tag="23113RKC6C",
+            reported_at=second_time.isoformat(),
+            usage_delta=[{"app": "微信", "package": "com.tencent.mm", "seconds": 30}],
+        ),
+        datetime.now(timezone.utc),
+    )
+    # 应暂停且不写使用时长，原因是 RDP 断开而不是投屏在后台喵
+    assert android_result.stats_paused is True
+    assert android_result.stats_paused_reason == "mirror_rdp_disconnected"
+    assert android_result.usage_rows_written == 0
 
 
 def test_android_not_mirrored_keeps_usage(connection: sqlite3.Connection) -> None:

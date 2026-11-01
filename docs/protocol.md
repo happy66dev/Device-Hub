@@ -147,8 +147,9 @@ android:  and-<型号小写去空格>-<4 位十六进制随机>
 | --- | --- | --- |
 | 服务器角色，RDP 已连接（WTSActive） | 统计 | — |
 | 服务器角色，RDP 未连接或状态过期 | 暂停 | `rdp_disconnected` |
-| 安卓设备标签命中某台服务器的 `mirror_windows`，且该服务器 RDP 已连接 | 统计 | — |
-| 安卓设备标签命中某台服务器的 `mirror_windows`，但所有宿主 RDP 都未连接 | 暂停 | `mirror_rdp_disconnected` |
+| 安卓设备标签命中某台服务器的 `mirror_windows`，该服务器 RDP 已连接，且投屏窗口在前台 | 统计 | — |
+| 安卓设备标签命中某台服务器的 `mirror_windows`，该服务器 RDP 已连接，但投屏窗口在后台 | 暂停 | `mirror_background` |
+| 安卓设备标签命中某台服务器的 `mirror_windows`，但所有宿主 RDP 都未连接 | 暂停（窗口在前台也暂停） | `mirror_rdp_disconnected` |
 | 安卓设备标签命中的宿主服务器**状态全都过期**（掉线超过 `rdp_stale_seconds`） | 统计（等于没连着） | — |
 | 安卓设备标签没有命中任何服务器（说明是直接拿着手机用） | 统计 | — |
 | 服务器角色，RDP 客户端是陌生机器 | 统计（照常计时） | — |
@@ -159,6 +160,11 @@ android:  and-<型号小写去空格>-<4 位十六进制随机>
 
 - 暂停只影响使用时长，**心跳、电量、当前应用照常上报**，群里会显示「RDP 未连接，统计暂停」。
 - `rdp_connected` 超过 `gating.rdp_stale_seconds`（默认 180 秒）没更新即视为过期，按未连接处理。
+- **宿主 RDP 断开时投屏窗口在前台也照样暂停**：RDP 一断就摸不到那台服务器的键鼠，前台残留的 scrcpy 窗口
+  只是一张静态画面，不代表有人在操作手机。此时原因码报 `mirror_rdp_disconnected` 而不是 `mirror_background`，
+  方便在看板上区分「人没盯着」和「根本连不上」。
+- 多台宿主同时投屏时逐台判断：只要存在一台 **RDP 已连接** 且投屏窗口在前台的服务器就统计；掉线那台的
+  前台状态不参与判定，不会把另一台「连着但窗口在后台」的情况救回来。
 - 过期状态对投屏门控同样生效：命中的宿主服务器全部过期时，说明投屏早就结束，手机按"直接使用"照常统计，
   不会因为一条几天前的残留投屏记录被一直挂着「投屏窗口不在前台」。
 - 角色以服务端配置 `roles.servers` / `roles.workstations` 为准，其次才看客户端上报的 `role`；
@@ -190,7 +196,7 @@ android:  and-<型号小写去空格>-<4 位十六进制随机>
 }
 ```
 
-- `stats_paused` / `stats_paused_reason`：本次是否被门控、原因码（`rdp_disconnected`、`mirror_rdp_disconnected`）。
+- `stats_paused` / `stats_paused_reason`：本次是否被门控、原因码（`rdp_disconnected`、`mirror_rdp_disconnected`、`mirror_background`、`mirror_foreground`、`rdp_target_monitored`、`afk`）。
 - `mirrored_tags`：服务端从本次 `mirror_windows` 里识别出的安卓标签，便于客户端自查匹配是否生效。
 
 ## 查询与管理接口

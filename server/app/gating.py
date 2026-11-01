@@ -288,8 +288,9 @@ def decide_stats_enabled(
       - 门控关闭时一律允许统计；
       - 键鼠空闲（AFK）时一律暂停，本机与投屏手机都停喵；
       - 服务器角色：RDP 未连接 → 暂停；投屏窗口在前台 → 也暂停（人其实在看手机）喵；
-      - 安卓设备：被某台服务器投屏时，只有那台服务器的投屏窗口在前台才统计；
-        投屏窗口缩到后台说明人没在看手机，暂停统计；
+      - 安卓设备：被某台服务器投屏时，只有那台服务器 RDP 连着、且投屏窗口在前台才统计；
+        宿主 RDP 没连（人摸不到键鼠，操作不了手机）→ 暂停，即使投屏窗口在前台；
+        RDP 连着但投屏窗口缩到后台说明人没在看手机，暂停统计；
         没有任何服务器连着它，说明人在直接用手機，照常统计喵。
     """
     # 基准时间缺省取当前时间喵
@@ -349,15 +350,22 @@ def decide_stats_enabled(
     if not fresh_hosts:
         return GateDecision(stats_enabled=True, reason="")
 
-    # 只要有一台宿主服务器的投屏窗口在前台，就认为"人正盯着手机用"喵
-    for host in fresh_hosts:
+    # 喵~注意：宿主服务器 RDP 没连时，人摸不到键盘鼠标，根本操作不了这台手机；
+    # 此时投屏窗口哪怕摆在前台，也只是走之前留下的画面，不能算在用手机喵
+    connected_hosts = [host for host in fresh_hosts if bool(host["rdp_connected"])]
+    # 喵~防御：所有宿主都没连 RDP → 一律暂停，原因要和"投屏窗口在后台"分开，便于主人核对喵
+    if not connected_hosts:
+        return GateDecision(stats_enabled=False, reason=REASON_MIRROR_RDP_DISCONNECTED)
+
+    # 只要有一台连着 RDP 的宿主服务器把投屏窗口摆在前台，就认为"人正盯着手机用"喵
+    for host in connected_hosts:
         # 喵~防御：宿主机器上人已经离开了，手机也不该继续计时喵
         if bool(host["afk"]):
             continue
         # 投屏窗口在前台才统计手机喵
         if bool(host["mirror_foreground"]):
             return GateDecision(stats_enabled=True, reason="")
-    # 活着的服务器都连着但投屏窗口在后台，暂停统计喵
+    # 连着的服务器投屏窗口都在后台，暂停统计喵
     return GateDecision(stats_enabled=False, reason=REASON_MIRROR_BACKGROUND)
 
 
