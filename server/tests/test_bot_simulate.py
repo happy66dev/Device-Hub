@@ -80,7 +80,7 @@ def test_simulate_device_list(connection: sqlite3.Connection, app_config: AppCon
 
 
 def test_simulate_look_happy_reports_wait_text(connection: sqlite3.Connection, app_config: AppConfig) -> None:
-    """出图命令在模拟器里应给出「正在生成」的文本回复喵。"""
+    """出图失败时给一句实话，不能谎称图片正在生成喵。"""
     # 塞一台设备并归入主人组喵
     _seed_device(connection, "win-sim-0002")
     _set_group(app_config, ("win-sim-0002",))
@@ -90,9 +90,13 @@ def test_simulate_look_happy_reports_wait_text(connection: sqlite3.Connection, a
     result = simulate.simulate_command(connection, image_config, "/看看happy 全部 排行榜")
     # 应正常回复喵
     assert result.replied is True
-    # 喵~注意：模拟器不出图时退回文本，提示正在生成排行榜图片喵
+    # 喵~注意：这段文案只在出图失败时才会被看到，所以必须说实话喵
     if result.image is None:
-        assert "正在生成排行榜图片" in result.text
+        assert "没能生成" in result.text
+        # 图片没出来时不能再说「正在生成」喵
+        assert "正在生成" not in result.text
+        # 喵~注意：产品文案里不许出现喵喵
+        assert "喵" not in result.text
     else:
         # 真出了图时不应再发文本，和真实机器人一致喵
         assert result.image[:8] == PNG_SIGNATURE

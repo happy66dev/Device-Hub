@@ -387,6 +387,9 @@ def _look_timeline_scope(context: CommandContext) -> Mapping[str, Any]:
             "moment_start": moment_start,
             "moment_end": moment_end,
             "has_window": bool(start_text),
+            # 喵~注意：模板里「时间窗口」取的是 window_text，时间轴这边把起止时刻
+            # 填进去，出错文案才能把「09:00-12:00」这段说出来喵
+            "window_text": f"{moment_start}-{moment_end}" if start_text else "",
             # 标记走时间轴分支的文案喵
             "is_timeline": True,
         }
@@ -612,15 +615,15 @@ COMMANDS: tuple[Command, ...] = (
     时间轴 [起止时刻]：今天（默认，到此刻）/ 2026-11-01 / 2026-11-01 09:00 12:00
     例：/看看happy 全部 排行榜 6小时
         /看看happy 手机 时间轴 09:00 12:00""",
-        template="""看看happy · {范围说明} · 最近 {时间窗口}
+        template="""查看 happy 最近 {时间窗口} 的应用排行
 
-正在生成排行榜图片，请稍候喵""",
+这次排行图片没能生成出来，稍后再发一次试试吧。""",
         handler=_look_happy_scope,
         # 时间轴分支换一份文案，靠 kind 标记切换喵
         alternate_flag="is_timeline",
-        alternate_template="""看看happy · {范围说明} · {起始日期}{若 时间窗口} {时间窗口}{/若}
+        alternate_template="""查看 happy {起始日期}{若 时间窗口} {时间窗口}{/若} 的时间轴
 
-正在生成时间轴图片，请稍候喵""",
+这次时间轴图片没能生成出来，稍后再发一次试试吧。""",
     ),
 )
 
