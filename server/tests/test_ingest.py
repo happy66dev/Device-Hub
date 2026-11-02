@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app import db, ingest
+from app import db, ingest, queries
+from app.db import to_utc_text
 from app.models import ReportPayload
+from app.payload_codec import decode_payload
 from conftest import make_payload
 
 
@@ -442,3 +445,71 @@ def test_foreground_missing_seconds_accepted(connection: sqlite3.Connection) -> 
     result = ingest.save_report(connection, payload, datetime.now(timezone.utc))
     # 使用时长照常写入喵
     assert result.usage_rows_written == 1
+
+def test_report_payload_is_compressed_and_drops_open_windows(connection: sqlite3.Connection) -> None:
+    """原始上报要压缩存储，且不再重复存 open_windows 喵。"""
+    # 造一条带三个窗口的上报喵
+    payload = _payload(
+        device_id="win-zip-0001",
+        open_windows=[
+            {"app": "cmd", "package": "cmd.exe", "title": "命令行", "minimized": False, "foreground": True},
+            {"app": "Code", "package": "code.exe", "title": "app.js", "minimized": False, "foreground": False},
+            {"app": "微信", "package": "wechat.exe", "title": "微信", "minimized": True, "foreground": False},
+        ],
+    )
+    # 落库喵
+    ingest.save_report(connection, payload, datetime.now(timezone.utc))
+    # 取原始列喵
+    row = connection.execute(
+        "SELECT payload_json, typeof(payload_json) AS kind FROM reports WHERE device_id = ?",
+        ("win-zip-0001",),
+    ).fetchone()
+    # 喵~注意：必须是 BLOB，说明真的压缩了，不是明文 JSON 喵
+    assert row["kind"] == "blob"
+    # 解出来看字段喵
+    body = decode_payload(row["payload_json"])
+    # open_windows 不该出现喵
+    assert "open_windows" not in body
+    # 其它字段要保留喵
+    assert body["device_id"] == "win-zip-0001"
+    assert body["platform"] == "windows"
+    # 心跳字段必须还在，day_heartbeats 靠它判断在线状态喵
+    assert "afk" in body or body.get("afk_since") is not None or "active_since" in body
+    # 三个窗口仍应逐行写进 window_samples 喵
+    windows = connection.execute(
+        "SELECT COUNT(*) AS c FROM window_samples WHERE device_id = ?", ("win-zip-0001",)
+    ).fetchone()["c"]
+    assert windows == 3
+
+
+def test_heartbeats_read_compressed_and_plain_reports(connection: sqlite3.Connection) -> None:
+    """新旧两种存储格式混在一个库里也要能读出心跳喵。"""
+    # 新格式：走正常落库（压缩）喵
+    now = datetime.now(timezone.utc)
+    ingest.save_report(
+        connection,
+        _payload(device_id="win-mix-0001", afk=True, afk_since=now.isoformat()),
+        now,
+    )
+    # 老格式：手工插一条明文 JSON 喵
+    # 喵~注意：day_heartbeats 按 received_at 排序，所以这里必须让 received_at
+    # 真的有先后，否则两条并列、顺序由 rowid 决定，断言就不稳定了喵
+    connection.execute(
+        "INSERT INTO reports (device_id, reported_at, received_at, payload_json) VALUES (?, ?, ?, ?)",
+        (
+            "win-mix-0001",
+            to_utc_text(now - timedelta(minutes=5)),
+            to_utc_text(now - timedelta(minutes=5)),
+            json.dumps({"afk": False, "active_since": (now - timedelta(minutes=5)).isoformat()}),
+        ),
+    )
+    connection.commit()
+    # 查当天心跳喵
+    heartbeats = queries.day_heartbeats(
+        connection, "win-mix-0001", now - timedelta(hours=1), now + timedelta(minutes=1)
+    )
+    # 两条都要读到喵
+    assert len(heartbeats) == 2
+    # 按时间升序：早的那条是老格式（非 AFK）喵
+    assert heartbeats[0].afk is False
+    assert heartbeats[1].afk is True

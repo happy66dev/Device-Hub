@@ -32,6 +32,7 @@ from .channel import (
     REASON_NOT_MESSAGE,
     REASON_OK,
     REASON_ROLE_TOO_LOW,
+    REASON_UNKNOWN_COMMAND,
     REASON_USER_BLACKLISTED,
     ROLE_ORDER,
     normalize_command_text,
@@ -213,35 +214,63 @@ def _strip_optional_prefix(command_text: str) -> str:
     return stripped if hit else normalize_command_text(command_text)
 
 
+def resolve_command(command_text: str) -> tuple[ParsedCommand | None, commands.Command | None]:
+    """把命令文本解析成「命令名 + 参数」并查命令表喵。
+
+    输入：命令文本，允许带 "/" 前缀，也容忍零宽字符与全角空白。
+    输出：(解析结果, 命中的命令)；纯空白文本返回 (None, None)，
+          命令名查不到时返回 (解析结果, None)。
+    边界：前缀剥除、清洗、查表三条入口共用这一份实现，保证口径不漂移喵。
+    """
+    # 喵~注意：允许调用方带前缀，这里统一剥掉再解析喵
+    cleaned = _strip_optional_prefix(command_text)
+    # 解析命令喵
+    parsed = parse_command(cleaned)
+    # 喵~防御：没有命令可解析时两条都空，由调用方决定要不要回帮助喵
+    if parsed is None:
+        return None, None
+    # 查命令表喵
+    return parsed, commands.command_by_name(parsed.name)
+
+
+def is_silent_command(command_text: str) -> bool:
+    """判断这条命令是否应当完全静默（一个字都不回）喵。
+
+    输入：命令文本，允许带 "/" 前缀。
+    输出：命令名不在命令表里时返回 True；解析不出命令（纯空白）时返回 False，
+          因为「只 @ 机器人不说话」仍走帮助，那是原有行为。
+
+    喵~注意：这是「未知命令静默」的唯一判定点，runner 与 simulate 都调它，
+    免得真实机器人与看板「命令测试」对同一条消息给出两种结论喵。
+    """
+    # 解析并查表喵
+    parsed, command = resolve_command(command_text)
+    # 喵~防御：连命令名都没有，交回原有逻辑（空命令 → 帮助）喵
+    if parsed is None:
+        return False
+    # 命令名对不上任何已注册命令：静默喵
+    return command is None
+
+
 def build_reply(connection: sqlite3.Connection, config: AppConfig, command_text: str) -> str:
     """根据命令文本生成回复文本喵。
 
     输入：数据库连接、配置、已去掉前缀的命令文本。
-    输出：要发到群里的文本，任何异常情况都会返回可读的中文提示喵。
-    边界：模板渲染失败时退回一句通用提示，绝不让机器人静默不回复喵。
+    输出：要发到群里的文本；未知命令返回空串表示「什么都不发」。
+    边界：模板渲染失败、设备找不到、参数写错都会退回可读的中文提示，
+          只有「命令名不在命令表里」这一种情况返回空串静默喵。
     """
-    # 喵~注意：允许调用方带前缀，这里统一剥掉再解析喵
-    command_text = _strip_optional_prefix(command_text)
-    # 解析命令喵
-    parsed = parse_command(command_text)
+    # 解析并查表喵
+    parsed, command = resolve_command(command_text)
     # 喵~防御：只 @ 了机器人却没写命令时返回帮助，避免主人以为机器人没反应喵
     if parsed is None:
         return _render_command(connection, config, commands.command_by_name("happy帮助"), (), "")
-    # 查命令表喵
-    command = commands.command_by_name(parsed.name)
-    # 喵~防御：未知命令给出帮助而不是静默失败喵
+    # 喵~防御：未知命令完全静默，不回文本也不回图片，避免在群里刷屏喵
     if command is None:
-        return _unknown_command_reply(connection, config, parsed.name)
+        LOGGER.debug("未知命令 %r，静默忽略", parsed.name)
+        return ""
     # 渲染命令喵
-    return _render_command(connection, config, command, parsed.args, command_text)
-
-
-def _unknown_command_reply(connection: sqlite3.Connection, config: AppConfig, name: str) -> str:
-    """未知命令的提示：先说明没这个命令，再附上帮助喵。"""
-    # 帮助内容走同一个渲染链路，保证措辞只在一处维护喵
-    help_text = _render_command(connection, config, commands.command_by_name("happy帮助"), (), "")
-    # 拼接提示喵
-    return f"未知命令：{name}\n\n{help_text}"
+    return _render_command(connection, config, command, parsed.args, _strip_optional_prefix(command_text))
 
 
 def _render_command(

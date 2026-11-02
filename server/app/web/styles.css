@@ -949,3 +949,124 @@ code {
 
 /* 保留天数的输入框不该占满整行喵 */
 #storage-days { width: 90px; flex: 0 0 90px; }
+
+/* ============ 使用热力图 ============ */
+
+/* 外层可横向滚动，一年 53 列在窄屏上放不下喵 */
+.heatmap { overflow-x: auto; padding-bottom: 4px; }
+
+/* 主体：左侧星期标签 + 右侧格子矩阵喵 */
+.heatmap-grid { display: flex; gap: 6px; align-items: flex-start; min-width: max-content; }
+
+/* 星期标签列，只显示一三五喵 */
+.heatmap-weekdays {
+  display: grid;
+  grid-template-rows: repeat(7, 13px);
+  gap: 3px;
+  font-size: 10px;
+  color: var(--text-3);
+  line-height: 13px;
+  padding-top: 18px;
+}
+
+/* 月份标签行与格子矩阵上下对齐喵 */
+.heatmap-main { display: flex; flex-direction: column; gap: 3px; }
+
+/* 月份标签，按列位置摆，避免每格都写一次喵 */
+.heatmap-months { position: relative; height: 15px; font-size: 10px; color: var(--text-3); }
+.heatmap-month { position: absolute; top: 0; white-space: nowrap; }
+
+/* 格子矩阵：7 行（星期）× N 列（周）喵 */
+.heatmap-cells {
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: repeat(7, 13px);
+  gap: 3px;
+}
+
+/* 单个格子喵 */
+.heatmap-cell {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  background: #ebedf0;
+  /* 喵~注意：格子很小，指针要能准确停上去，这里不加过渡避免拖影喵 */
+  cursor: default;
+}
+
+/* 未来日期留空，不参与任何统计喵 */
+.heatmap-cell.blank { background: transparent; }
+
+/* 图例：由浅到深五个色阶喵 */
+.heatmap-legend {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 12px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.heatmap-legend .heatmap-cell { cursor: default; }
+
+/* 统计页的设备分布行喵 */
+.stats-device-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+
+.stats-device-row:first-child { border-top: none; }
+
+.stats-device-name { flex: 0 0 140px; font-weight: 600; font-size: 13px; }
+
+.stats-device-bar { flex: 1 1 auto; height: 8px; border-radius: 4px; background: #f2f3f5; overflow: hidden; }
+
+.stats-device-bar span { display: block; height: 100%; border-radius: 4px; background: var(--primary); }
+
+.stats-device-seconds { flex: 0 0 auto; font-size: 12px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+
+/* 段内小标题，比 section-head 紧凑喵 */
+.section-head.compact { margin: 0 0 8px; }
+
+
+/* ============ 30 天使用折线图 ============ */
+
+/* 图表容器：给 SVG 一个稳定的高度，避免加载时跳动喵 */
+.trend-chart { width: 100%; min-height: 200px; }
+
+/* 喵~注意：SVG 用 viewBox 缩放，宽度 100% 时高度靠 preserveAspectRatio 撑开喵 */
+.trend-chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+
+/* 网格线：极浅，只做参考不抢视线喵 */
+.trend-grid-line { stroke: #eef0f3; stroke-width: 1; }
+
+/* 刻度文字喵 */
+.trend-axis-text { fill: var(--text-3); font-size: 10px; }
+
+/* 折线本体，圆角端点让观感柔和一点喵 */
+.trend-line {
+  fill: none;
+  stroke: var(--primary);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+/* 折线下的浅色填充，表示「这段是使用量」喵 */
+.trend-area { fill: var(--primary); opacity: 0.08; }
+
+/* 数据点：平时不显眼，悬浮时才清楚喵 */
+.trend-dot { fill: var(--primary); stroke: #fff; stroke-width: 1.5; }
+
+/* 每个数据点的透明热区，比圆点大得多，鼠标容易停上去喵 */
+.trend-hit { fill: transparent; cursor: default; }
+
+/* 悬浮竖线，指示当前看的是哪一天喵 */
+.trend-cursor { stroke: var(--border-strong); stroke-width: 1; stroke-dasharray: 3 3; }
+
+/* 空态喵 */
+.trend-chart .empty { padding: 40px 0; text-align: center; }
+

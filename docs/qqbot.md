@@ -127,6 +127,15 @@ POST /v2/groups/{group_openid}/messages
 任一不满足就静默忽略，原因码可以在 `/api/v1/bot/command` 的响应里看到
 （`group_not_whitelisted` / `user_blacklisted` / `not_mentioned` / `not_command` / `role_too_low`）。
 
+**通过上面五道闸门之后还有一道命令闸门**：命令名不在 `commands.COMMANDS` 里
+（例如 `/不存在的命令`、`/happy`）时同样**完全静默**——不回文本、不回图片、
+连「稍等」都不发，原因码是 `unknown_command`。判定点是
+`app/bot/router.py: is_silent_command`，runner 在占忙位与记账之前就返回，
+所以一条打错的命令不会挤掉后面真正的命令，也不会把发言人写进名单。
+
+注意区分：**命令名对、参数错**（`/看看happy 全部 乱写`）仍然要回错误提示——
+用户已经明确在用这条命令，不告诉他参数错在哪，他会以为机器人坏了。
+
 ## 7. 与 NapCat 的行为差异
 
 | 项目 | NapCat | 官方通道 |
@@ -147,6 +156,7 @@ POST /v2/groups/{group_openid}/messages
 | 连上但一条消息都收不到 | `intents` 没开 `1 << 25` | 改 `qqbot.intents`，重启 |
 | 收到消息但不回复 | openid 白名单为空/不匹配 | 开 `log_openids`，抄日志里 `QQ Bot 事件：group_openid=…` 那一行 |
 | 某个命令就是没反应 | 命令前的零宽字符把 `/` 挡住了 | 开 `debug_events`，看 `QQ Bot 归一化：text=…` 里还有没有脏字符 |
+| 打错命令名后机器人一个字都不回 | 这是有意为之：未知命令静默 | 发 `/happy帮助` 看正确写法，日志里有 `未知命令 … 静默忽略` |
 | 回复被平台丢弃 | `msg_seq` 重复或超过 5 条 | 检查 `ReplyCounter`，避免对同一条消息连发 |
 | 发图报错 | 没上传或 `file_info` 过期 | 图片走 `send_image`，它内部会先上传 |
 | 频繁断线 | 心跳间隔不合法 | 保留 `heartbeat_slack_seconds`，别把间隔设得比 `heartbeat_interval` 大 |

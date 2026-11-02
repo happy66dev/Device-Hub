@@ -357,13 +357,14 @@ def test_build_reply_empty_text_returns_help(connection: sqlite3.Connection, app
 
 
 def test_build_reply_unknown_command(connection: sqlite3.Connection, app_config: AppConfig) -> None:
-    """未知命令应提示并附帮助喵。"""
+    """未知命令应完全静默：不返回任何文本喵。"""
     # 未知命令喵
     text = router.build_reply(connection, app_config, "重启")
-    # 应提示未知命令喵
-    assert "未知命令" in text
-    # 附带帮助内容，主人一眼知道该发什么喵
-    assert "/happy帮助" in text
+    # 喵~注意：未知命令一个字都不回，避免在群里刷屏喵
+    assert text == ""
+    # 更不许把帮助塞回去，那样和静默就自相矛盾了喵
+    assert "未知命令" not in text
+    assert "/happy帮助" not in text
 
 
 def test_build_reply_device_list(connection: sqlite3.Connection, app_config: AppConfig) -> None:
@@ -388,10 +389,11 @@ def test_build_reply_device_detail(connection: sqlite3.Connection, app_config: A
     _seed_own_group(app_config, ("win-alpha-1111", "and-beta-2222"))
     # 点名手机看排行榜喵
     text = router.build_reply(connection, app_config, "看看happy and-beta 排行榜")
-    # 范围说明里应只有手机喵
-    assert "看看happy · 手机" in text
+    # 喵~注意：标题在 2d492d5 里改成了「查看 happy 最近 X 的应用排行」，
+    # 这里跟着改成新标题，别让断言继续对着已经不存在的旧文案喵
+    assert "查看 happy 最近" in text
     # 应说明要出排行榜图喵
-    assert "排行榜" in text
+    assert "应用排行" in text
 
 
 def test_build_reply_usage_requires_device(connection: sqlite3.Connection, app_config: AppConfig) -> None:

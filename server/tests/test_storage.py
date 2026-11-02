@@ -112,3 +112,49 @@ def test_format_bytes_scales_units() -> None:
     assert storage.format_bytes(0) == "0 B"
     assert storage.format_bytes(1536) == "1.5 KB"
     assert storage.format_bytes(1024 * 1024 * 3) == "3.0 MB"
+
+
+def test_indexes_drop_redundant_duplicates(connection) -> None:
+    """建库后不该再有与 UNIQUE 自动索引重复的手工索引喵。"""
+    # 列出所有显式建的索引喵
+    names = {
+        row["name"]
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type='index'")
+    }
+    # 喵~注意：这两张表本身就有 UNIQUE(device_id, 时间)，自动索引已经覆盖，
+    # 手工再建一份纯属浪费空间还拖慢插入喵
+    assert "idx_reports_device_time" not in names
+    assert "idx_battery_device_time" not in names
+    # 原有的其它索引不能误删喵
+    assert "idx_usage_device_time" in names
+    assert "idx_window_device_time" in names
+
+
+def test_redundant_indexes_are_dropped_on_upgrade(tmp_path: Path) -> None:
+    """老库升级时已存在的冗余索引要被删掉喵。"""
+    # 造一个库喵
+    db_path = tmp_path / "upgrade.db"
+    db.init_db(db_path)
+    conn = db.connect(db_path)
+    try:
+        # 手工把旧索引建回去，模拟老版本遗留喵
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_device_time ON reports (device_id, reported_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_battery_device_time ON battery_samples (device_id, sampled_at)")
+        conn.commit()
+        # 确认建上了喵
+        before = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+        }
+        assert "idx_reports_device_time" in before
+        # 再跑一次初始化，模拟启动时的迁移喵
+        db.init_db(db_path)
+        # 喵~防御：老库不能一直留着冗余索引喵
+        after = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+        }
+        assert "idx_reports_device_time" not in after
+        assert "idx_battery_device_time" not in after
+    finally:
+        conn.close()

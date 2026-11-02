@@ -111,17 +111,40 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         PRIMARY KEY (channel, user_key)
     )
     """,    # 按设备+时间建索引，近 24 小时聚合查询全靠它喵
+    # 喵~注意：归档表存「压缩后的历史数据块」，按设备+自然月分块。
+    # 超过保留窗口的原始行会被压进这里再删掉原行，数据本身一条不少，
+    # 只是从「可 SQL 直查」变成「必须经归档层解压」喵
+    """
+    CREATE TABLE IF NOT EXISTS archives (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id   TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+        kind        TEXT NOT NULL,
+        month       TEXT NOT NULL,
+        row_count   INTEGER NOT NULL,
+        codec       TEXT NOT NULL DEFAULT 'zlib',
+        body        BLOB NOT NULL,
+        created_at  TEXT NOT NULL,
+        UNIQUE (device_id, kind, month)
+    )
+    """,
 )
 
 # 索引语句单独放一组，必须等老库补列之后再执行，否则会报 no such column 喵
+# 喵~注意：reports 与 battery_samples 不再建 (device_id, 时间) 索引——
+# 这两张表本身就有 UNIQUE(device_id, 时间)，SQLite 会自动建一份同列的索引，
+# 再手工建一份完全重复，除了白占空间还让每次插入多维护一棵树喵
 INDEX_STATEMENTS: tuple[str, ...] = (
-    "CREATE INDEX IF NOT EXISTS idx_reports_device_time ON reports (device_id, reported_at)",
-    "CREATE INDEX IF NOT EXISTS idx_battery_device_time ON battery_samples (device_id, sampled_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_device_time ON usage_samples (device_id, sampled_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_package ON usage_samples (device_id, package)",
     "CREATE INDEX IF NOT EXISTS idx_window_device_time ON window_samples (device_id, reported_at)",
     # 最近发言列表按最后活跃时间倒序取，走这个索引喵
     "CREATE INDEX IF NOT EXISTS idx_bot_seen_last ON bot_seen_users (last_seen_at)",
+)
+
+# 喵~注意：早期版本建过的冗余索引，启动时要删掉，否则老库会一直留着喵
+DROPPED_INDEXES: tuple[str, ...] = (
+    "DROP INDEX IF EXISTS idx_reports_device_time",
+    "DROP INDEX IF EXISTS idx_battery_device_time",
 )
 
 # 老版本数据库缺的列，启动时按需补齐喵
@@ -277,6 +300,9 @@ def init_db(db_path: Path) -> None:
         # 补列之后再建索引，顺序不能反喵
         for index_statement in INDEX_STATEMENTS:
             connection.execute(index_statement)
+        # 喵~注意：删掉早期版本留下的冗余索引，老库升级后也能瘦下来喵
+        for drop_statement in DROPPED_INDEXES:
+            connection.execute(drop_statement)
         # 一次性提交所有建表动作喵
         connection.commit()
     finally:

@@ -25,6 +25,18 @@ def _insert_device(connection: sqlite3.Connection, device_id: str, last_seen: da
     connection.commit()
 
 
+def _insert_archive(connection: sqlite3.Connection, device_id: str, kind: str, month: str) -> None:
+    """插一个空的归档块占位，用来测「已归档」的判定喵。"""
+    # 喵~注意：body 给个能解压出来的空串就行，这些测试只看块存不存在喵
+    import zlib
+
+    connection.execute(
+        "INSERT INTO archives (device_id, kind, month, row_count, codec, body, created_at)"
+        " VALUES (?, ?, ?, 0, 'zlib', ?, ?)",
+        (device_id, kind, month, zlib.compress(b""), to_utc_text(datetime.now(timezone.utc))),
+    )
+
+
 def _insert_usage(
     connection: sqlite3.Connection,
     device_id: str,
@@ -166,8 +178,55 @@ def test_latest_battery_none_when_missing(connection: sqlite3.Connection) -> Non
     assert queries.latest_battery(connection, "win-1") is None
 
 
-def test_prune_expired_removes_old_rows(connection: sqlite3.Connection) -> None:
-    """过期数据应被清理，新数据应保留喵。"""
+def test_prune_expired_keeps_unarchived_reports(connection: sqlite3.Connection) -> None:
+    """没归档的原始上报再老也不能删，否则归档就捡不到东西了喵。
+
+    喵~注意：这是「两条保留期打架」的防回归。以前这里按 7 天硬删，
+    而归档只在每月 8 号做，结果到了归档窗口数据早被删光喵。
+    """
+    # 基准时间喵
+    now = datetime.now(timezone.utc)
+    # 插入一台设备喵
+    _insert_device(connection, "win-1", now)
+    # 一条 40 天前的原始上报，没有任何归档块喵
+    connection.execute(
+        "INSERT INTO reports (device_id, reported_at, received_at, payload_json) VALUES (?, ?, ?, '{}')",
+        ("win-1", to_utc_text(now - timedelta(days=40)), to_utc_text(now - timedelta(days=40))),
+    )
+    # 提交喵
+    connection.commit()
+    # 执行清理喵
+    deleted = queries.prune_expired(connection, detail_days=7, aggregate_days=30, now=now)
+    # 喵~注意：没有归档块就一行都不许删喵
+    assert deleted["reports"] == 0
+    # 行还在喵
+    assert connection.execute("SELECT COUNT(*) AS c FROM reports").fetchone()["c"] == 1
+
+
+def test_prune_expired_removes_archived_reports(connection: sqlite3.Connection) -> None:
+    """已经归档的原始上报才该被清理喵。"""
+    # 基准时间喵
+    now = datetime.now(timezone.utc)
+    # 插入一台设备喵
+    _insert_device(connection, "win-1", now)
+    # 一条上个月的原始上报喵
+    old = datetime(now.year, now.month, 1, tzinfo=timezone.utc) - timedelta(days=20)
+    connection.execute(
+        "INSERT INTO reports (device_id, reported_at, received_at, payload_json) VALUES (?, ?, ?, '{}')",
+        ("win-1", to_utc_text(old), to_utc_text(old)),
+    )
+    # 造一个对应的归档块喵
+    _insert_archive(connection, "win-1", "heartbeats", old.strftime("%Y-%m"))
+    connection.commit()
+    # 执行清理喵
+    deleted = queries.prune_expired(connection, detail_days=7, aggregate_days=30, now=now)
+    # 该删掉那一条喵
+    assert deleted["reports"] == 1
+    assert connection.execute("SELECT COUNT(*) AS c FROM reports").fetchone()["c"] == 0
+
+
+def test_prune_expired_keeps_usage_samples_on_day_basis(connection: sqlite3.Connection) -> None:
+    """使用时长不进归档，仍按聚合天数清理喵。"""
     # 基准时间喵
     now = datetime.now(timezone.utc)
     # 插入一台设备喵
@@ -175,26 +234,70 @@ def test_prune_expired_removes_old_rows(connection: sqlite3.Connection) -> None:
     # 一条新数据、一条 40 天前的旧数据喵
     _insert_usage(connection, "win-1", "New.exe", 10, now - timedelta(days=1))
     _insert_usage(connection, "win-1", "Old.exe", 10, now - timedelta(days=40))
-    # 插入新旧原始上报喵
-    connection.execute(
-        "INSERT INTO reports (device_id, reported_at, received_at, payload_json) VALUES (?, ?, ?, '{}')",
-        ("win-1", to_utc_text(now), to_utc_text(now)),
-    )
-    connection.execute(
-        "INSERT INTO reports (device_id, reported_at, received_at, payload_json) VALUES (?, ?, ?, '{}')",
-        ("win-1", to_utc_text(now - timedelta(days=10)), to_utc_text(now)),
-    )
     # 提交喵
     connection.commit()
-    # 执行清理，明细保留 7 天、聚合保留 30 天喵
+    # 执行清理，聚合保留 30 天喵
     deleted = queries.prune_expired(connection, detail_days=7, aggregate_days=30, now=now)
-    # 原始上报应删掉 1 条喵
-    assert deleted["reports"] == 1
     # 使用时长应删掉 1 条喵
     assert deleted["usage_samples"] == 1
     # 剩下的应用应是 New.exe 喵
     remaining_apps = [row["app_name"] for row in connection.execute("SELECT app_name FROM usage_samples")]
     assert remaining_apps == ["New.exe"]
+
+
+def test_prune_expired_keeps_unarchived_window_samples(connection: sqlite3.Connection) -> None:
+    """没归档的窗口快照也不许删，理由同原始上报喵。"""
+    # 基准时间喵
+    now = datetime.now(timezone.utc)
+    # 插入设备喵
+    _insert_device(connection, "win-1", now)
+    # 一条 10 天前的窗口快照，没有归档块喵
+    connection.execute(
+        "INSERT INTO window_samples (device_id, app_name, package, title, minimized, foreground, reported_at)"
+        " VALUES (?, 'cmd', 'cmd.exe', '旧窗口', 0, 1, ?)",
+        ("win-1", to_utc_text(now - timedelta(days=10))),
+    )
+    # 提交喵
+    connection.commit()
+    # 执行清理喵
+    deleted = queries.prune_expired(connection, detail_days=7, aggregate_days=30, now=now)
+    # 没有归档块就不删喵
+    assert deleted["window_samples"] == 0
+    assert connection.execute("SELECT COUNT(*) AS c FROM window_samples").fetchone()["c"] == 1
+
+
+def test_prune_expired_removes_archived_window_samples(connection: sqlite3.Connection) -> None:
+    """已经归档的窗口快照才该被清理喵。"""
+    # 基准时间喵
+    now = datetime.now(timezone.utc)
+    # 插入设备喵
+    _insert_device(connection, "win-1", now)
+    # 一条上个月的窗口快照喵
+    old = datetime(now.year, now.month, 1, tzinfo=timezone.utc) - timedelta(days=20)
+    connection.execute(
+        "INSERT INTO window_samples (device_id, app_name, package, title, minimized, foreground, reported_at)"
+        " VALUES (?, 'cmd', 'cmd.exe', '旧窗口', 0, 1, ?)",
+        ("win-1", to_utc_text(old)),
+    )
+    # 造一个对应的窗口归档块喵
+    _insert_archive(connection, "win-1", "windows", old.strftime("%Y-%m"))
+    connection.commit()
+    # 执行清理喵
+    deleted = queries.prune_expired(connection, detail_days=7, aggregate_days=30, now=now)
+    # 该删掉那一条喵
+    assert deleted["window_samples"] == 1
+    assert connection.execute("SELECT COUNT(*) AS c FROM window_samples").fetchone()["c"] == 0
+
+
+def test_prune_expired_reports_every_table(connection: sqlite3.Connection) -> None:
+    """返回的字典要覆盖所有被清理的表，日志才不会漏报喵。"""
+    # 基准时间喵
+    now = datetime.now(timezone.utc)
+    # 插设备喵
+    _insert_device(connection, "win-1", now)
+    # 空库也要有完整键，日志才稳定喵
+    deleted = queries.prune_expired(connection, detail_days=7, aggregate_days=30, now=now)
+    assert set(deleted) == {"reports", "window_samples", "usage_samples", "battery_samples"}
 
 
 def test_prune_expired_keeps_zero_day_safe(connection: sqlite3.Connection) -> None:

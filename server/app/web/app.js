@@ -50,6 +50,12 @@ const state = {
   // 时间轴用的时区偏移（分钟），跟服务端保持一致喵
   tzOffsetMinutes: 480,
   timeline: null,
+  // 统计页：热力图回溯天数、设备筛选（空串表示全部）与数据喵
+  statsDays: 90,
+  statsDeviceId: "",
+  stats: null,
+  // 统计页的全量设备清单，切到单台设备后按钮仍要靠它喵
+  statsDeviceList: [],
   people: [],
   peopleDraft: [],
   // 配置页：可编辑字段与它们的初始值喵
@@ -78,6 +84,15 @@ const el = {
   rankingSummary: document.getElementById("ranking-summary"),
   rangeSwitch: document.getElementById("range-switch"),
   rankScopeSwitch: document.getElementById("rank-scope-switch"),
+  statsKpi: document.getElementById("stats-kpi"),
+  statsSummary: document.getElementById("stats-summary"),
+  statsRangeSwitch: document.getElementById("stats-range-switch"),
+  statsDeviceSwitch: document.getElementById("stats-device-switch"),
+  statsDevices: document.getElementById("stats-devices"),
+  heatmapBody: document.getElementById("heatmap-body"),
+  heatmapLegend: document.getElementById("heatmap-legend"),
+  trendBody: document.getElementById("trend-body"),
+  trendSummary: document.getElementById("trend-summary"),
   tlDevice: document.getElementById("tl-device"),
   tlDate: document.getElementById("tl-date"),
   tlPrev: document.getElementById("tl-prev"),
@@ -2223,9 +2238,13 @@ function mergeRankingEntries(entries) {
     // 第一次见到这个应用就建一行喵
     let row = merged.get(key);
     if (!row) {
-      row = { app: name, seconds: 0, devices: [], packages: [], deviceSeconds: new Map() };
+      row = { app: name, seconds: 0, devices: [], packages: [], deviceSeconds: new Map(), icon_key: "" };
       merged.set(key, row);
     }
+    // 喵~注意：图标键要跟着合并带走，否则排行榜永远只画彩色圆点、
+    // 明明库里有图标也显示不出来（服务端每行都给了 icon_key）喵
+    const iconKey = String((entry && entry.icon_key) || "").trim();
+    if (iconKey && !row.icon_key) row.icon_key = iconKey;
     // 秒数累加，合并后的条形长度就是所有设备加起来的总时长喵
     const seconds = Math.max(0, Number(entry.seconds) || 0);
     row.seconds += seconds;
@@ -2353,6 +2372,503 @@ function renderRankings() {
     .join("");
   // 排行行都插进 DOM 了，这一页就算画完喵
   markShotReady("rankings");
+}
+
+/* ==================== 统计 ==================== */
+
+/** 热力图的五个色阶，由浅到深喵。
+ *
+ * 喵~注意：用绿色而不是主题蓝——主人要的是 GitHub 那种观感，
+ * 蓝色深浅在白底上分档不明显，绿色四档一眼就能看出差别喵。
+ */
+const HEATMAP_LEVELS = ["#ebedf0", "#9be9a8", "#40c463", "#30a14e", "#216e39"];
+
+/** 把秒数换算成热力图的色阶下标喵。 */
+function heatmapLevel(seconds, peak) {
+  // 没有记录就是最浅的那格喵
+  if (!seconds || seconds <= 0) return 0;
+  // 喵~防御：峰值缺失时按「有数据就算一级」处理，避免除零喵
+  if (!peak || peak <= 0) return 1;
+  // 按相对峰值的比例分四档，和 GitHub 的观感接近喵
+  const ratio = seconds / peak;
+  if (ratio >= 0.75) return 4;
+  if (ratio >= 0.5) return 3;
+  if (ratio >= 0.25) return 2;
+  return 1;
+}
+
+/** 把日期补成两位喵。 */
+function pad2(value) {
+  return String(value).padStart(2, "0");
+}
+
+/** 把 Date 转成本地 YYYY-MM-DD 文本喵。 */
+function dateText(moment) {
+  // 喵~注意：日期一律按服务端时区取，不能读浏览器本地字段——
+  // 浏览器时区不是东八区时，热力图与折线图的日期轴会整体偏一天喵
+  const shifted = inServerZone(moment);
+  return `${shifted.getUTCFullYear()}-${pad2(shifted.getUTCMonth() + 1)}-${pad2(shifted.getUTCDate())}`;
+}
+
+/**
+ * 造出热力图要画的所有格子（含未来留白）喵。
+ *
+ * 输入：天数。
+ * 输出：从「起始周周日」到「本周周六」的 {date, text, blank} 数组。
+ * 边界：起点对齐到周日、终点补到周六，保证 7 行网格整齐喵。
+ */
+function heatmapCells(days) {
+  // 喵~注意：起点与终点都按服务端时区的「今天」推，不用浏览器本地日期喵
+  const todayText = localDateText(serverNow());
+  // 把「今天」换成服务端时区的零点，后续加减天数都在这个口径里喵
+  const today = new Date(`${todayText}T00:00:00Z`);
+  // 起点：往前推 days 天，再对齐到所在周的周日喵
+  const start = new Date(today);
+  start.setUTCDate(start.getUTCDate() - Math.max(1, Number(days) || 90) + 1);
+  start.setUTCDate(start.getUTCDate() - start.getUTCDay());
+  // 终点：补到本周周六喵
+  const end = new Date(today);
+  end.setUTCDate(end.getUTCDate() + (6 - end.getUTCDay()));
+  // 逐天铺格子喵
+  const cells = [];
+  const cursor = new Date(start);
+  while (cursor <= end) {
+    // 喵~注意：今天之后的格子留白，不然会画出一片「零使用」的假平地喵
+    cells.push({
+      // 这个时刻本身就是「服务端零点」的表示，取 UTC 字段即为该日喵
+      date: `${cursor.getUTCFullYear()}-${pad2(cursor.getUTCMonth() + 1)}-${pad2(cursor.getUTCDate())}`,
+      blank: cursor > today,
+    });
+    // 喵~注意：必须用 setUTCDate，用 setDate 会把浏览器时区混进来喵
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return cells;
+}
+
+/** 渲染热力图本体喵。 */
+function renderHeatmap(payload) {
+  // 没有容器时直接返回（截图以外的老页面可能没有这块）喵
+  if (!el.heatmapBody) return;
+  // 天数与今天的格子喵
+  const cells = heatmapCells(state.statsDays);
+  // 秒数索引，日期查不到就是 0 喵
+  const secondsByDate = new Map();
+  for (const item of (payload && payload.days) || []) {
+    secondsByDate.set(String(item.date), Number(item.seconds) || 0);
+  }
+  // 峰值用来定色阶喵
+  let peak = 0;
+  for (const value of secondsByDate.values()) peak = Math.max(peak, value);
+  // 格子矩阵，按周分列喵
+  const cellHtml = cells
+    .map((cell) => {
+      // 未来日期画成透明占位喵
+      if (cell.blank) return '<i class="heatmap-cell blank"></i>';
+      const seconds = secondsByDate.get(cell.date) || 0;
+      const level = heatmapLevel(seconds, peak);
+      // 悬浮提示写清日期与时长，没记录就明说喵
+      const tip = seconds > 0 ? `${cell.date} · ${formatDuration(seconds)}` : `${cell.date} · 没有记录`;
+      return `<i class="heatmap-cell" style="background:${HEATMAP_LEVELS[level]}" title="${escapeHtml(tip)}"></i>`;
+    })
+    .join("");
+  // 月份标签：在每月第一次出现的那一列上写月份喵
+  const monthLabels = [];
+  let lastMonth = -1;
+  let weekIndex = 0;
+  for (let index = 0; index < cells.length; index += 7) {
+    // 取这一周第一天的月份喵
+    const first = cells[index];
+    if (first && !first.blank) {
+      const month = Number(first.date.slice(5, 7));
+      // 月份变了才打标签，避免挤在一起喵
+      if (month !== lastMonth) {
+        monthLabels.push(`<span class="heatmap-month" style="left:${weekIndex * 16}px">${month} 月</span>`);
+        lastMonth = month;
+      }
+    }
+    weekIndex += 1;
+  }
+  // 星期标签只写一、三、五，位置和 7 行网格对齐喵
+  const weekdays = ["", "一", "", "三", "", "五", ""]
+    .map((text) => `<span>${text}</span>`)
+    .join("");
+  // 拼成完整结构喵
+  el.heatmapBody.innerHTML = `<div class="heatmap-grid">
+    <div class="heatmap-weekdays">${weekdays}</div>
+    <div class="heatmap-main">
+      <div class="heatmap-months">${monthLabels.join("")}</div>
+      <div class="heatmap-cells">${cellHtml}</div>
+    </div>
+  </div>`;
+  // 图例：少 → 多喵
+  if (el.heatmapLegend) {
+    el.heatmapLegend.innerHTML = `<span>少</span>${HEATMAP_LEVELS.map(
+      (color) => `<i class="heatmap-cell" style="background:${color}"></i>`,
+    ).join("")}<span>多</span>`;
+  }
+}
+
+/** 折线图要画的固定天数喵。 */
+const TREND_DAYS = 30;
+
+/**
+ * 生成最近 N 天的完整日期序列（含没有记录的日子）喵。
+ *
+ * 输入：天数。
+ * 输出：YYYY-MM-DD 文本数组，从最早到今天。
+ * 边界：天数小于 1 时按 1 处理喵。
+ *
+ * 喵~注意：折线图必须把「零使用的日子」也画成 0，
+ * 直接拿有数据的日期连起来会把空档抹平，看起来像连着一整段喵。
+ */
+function trendDates(days) {
+  // 喵~注意：今天按服务端时区算，和热力图保持同一口径喵
+  const todayText = localDateText(serverNow());
+  const today = new Date(`${todayText}T00:00:00Z`);
+  // 喵~防御：天数传 0、负数或非数字时按 1 天处理，
+  // 这里不能用 `|| TREND_DAYS`——0 也是 falsy，会被悄悄放大成 30 天喵
+  const requested = Number(days);
+  const total = Number.isFinite(requested) && requested >= 1 ? Math.floor(requested) : 1;
+  const dates = [];
+  for (let offset = total - 1; offset >= 0; offset -= 1) {
+    const day = new Date(today);
+    // 同样用 UTC 运算，避免浏览器时区参与喵
+    day.setUTCDate(day.getUTCDate() - offset);
+    dates.push(
+      `${day.getUTCFullYear()}-${pad2(day.getUTCMonth() + 1)}-${pad2(day.getUTCDate())}`,
+    );
+  }
+  return dates;
+}
+
+/**
+ * 把逐天秒数整理成折线图用的点喵。
+ *
+ * 输入：服务端的 days 列表、天数。
+ * 输出：{date, seconds} 数组，长度恰好等于天数，缺的日子补 0。
+ * 边界：没有数据时返回全 0 的点，图会画成一条贴底的线喵。
+ */
+function trendPoints(daysList, days) {
+  // 秒数索引喵
+  const secondsByDate = new Map();
+  for (const item of Array.isArray(daysList) ? daysList : []) {
+    const date = String((item && item.date) || "");
+    if (!date) continue;
+    secondsByDate.set(date, Math.max(0, Number(item.seconds) || 0));
+  }
+  // 按完整日期序列铺点，缺的补 0喵
+  return trendDates(days).map((date) => ({ date, seconds: secondsByDate.get(date) || 0 }));
+}
+
+/** 把秒数说成「X 小时 Y 分」这种紧凑刻度文本喵。 */
+function trendTickText(seconds) {
+  // 满一小时就说小时，否则说分钟喵
+  if (seconds >= 3600) {
+    const hours = seconds / 3600;
+    return Number.isInteger(hours) ? `${hours} 小时` : `${hours.toFixed(1)} 小时`;
+  }
+  return `${Math.round(seconds / 60)} 分`;
+}
+
+/**
+ * 把折线点转成单调三次贝塞尔路径（平滑但不会冲过头）喵。
+ *
+ * 输入：点的数组 [{x, y}]，已按 x 升序。
+ * 输出：SVG 路径字符串，形如 M... C... C...
+ * 边界：点数小于 2 时返回空串；点数为 2 时退化成一条直线。
+ *
+ * 喵~注意：这里用的是「单调三次插值」（Fritsch–Carlson），不是普通平滑。
+ * 普通 Catmull-Rom / 贝塞尔平滑会让曲线在数据拐点处冲过头——
+ * 比如连续两天都是 0、第三天有值，曲线会在 0 那段下方画出负值，
+ * 面积填充还会翻到基线以下，看着像「那天用了负的时间」喵。
+ * 单调插值给每个控制点加了斜率限制，保证曲线始终落在相邻数据点之间，
+ * 0 值那段就老老实实贴住基线喵。
+ */
+function monotoneCubicPath(nodeList) {
+  // 点数不够画曲线喵
+  if (!Array.isArray(nodeList) || nodeList.length < 2) return "";
+  // 只有两个点时直接连线，斜率约束没有意义喵
+  if (nodeList.length === 2) {
+    const [first, second] = nodeList;
+    return `M${first.x.toFixed(1)},${first.y.toFixed(1)} L${second.x.toFixed(1)},${second.y.toFixed(1)}`;
+  }
+  // 相邻段的横向差，横轴等距时都一样，但仍然按实际值算以防将来改成不等距喵
+  const deltas = [];
+  const slopes = [];
+  for (let index = 0; index < nodeList.length - 1; index += 1) {
+    const dx = nodeList[index + 1].x - nodeList[index].x;
+    const dy = nodeList[index + 1].y - nodeList[index].y;
+    // 喵~防御：横向差为 0 时无法算斜率，跳过这一段喵
+    deltas.push(dx);
+    slopes.push(dx === 0 ? 0 : dy / dx);
+  }
+  // 每个点上的切线斜率，起点和终点直接取相邻段的斜率喵
+  const tangents = new Array(nodeList.length);
+  tangents[0] = slopes[0];
+  tangents[nodeList.length - 1] = slopes[slopes.length - 1];
+  // 中间点用相邻两段斜率的加权平均喵
+  for (let index = 1; index < nodeList.length - 1; index += 1) {
+    const before = slopes[index - 1];
+    const after = slopes[index];
+    // 喵~注意：两段方向相反（一个上升一个下降）时把切线压成 0，
+    // 这样极值点会变成真正的圆滑峰顶，而不是斜着冲过去喵
+    if (before * after <= 0) {
+      tangents[index] = 0;
+    } else {
+      // 加权调和平均，权重取两段的长度喵
+      const dx1 = deltas[index - 1];
+      const dx2 = deltas[index];
+      const weight1 = 2 * dx2 + dx1;
+      const weight2 = dx2 + 2 * dx1;
+      tangents[index] = (weight1 + weight2) / (weight1 / before + weight2 / after);
+    }
+  }
+  // 喵~防御：Fritsch–Carlson 限制，保证曲线不越过相邻点喵
+  for (let index = 0; index < slopes.length; index += 1) {
+    const slope = slopes[index];
+    // 水平段要把两端切线都压平，否则曲线会鼓起来喵
+    if (slope === 0) {
+      tangents[index] = 0;
+      tangents[index + 1] = 0;
+      continue;
+    }
+    // 切线斜率与段斜率之比，超过 3 就会冲过头喵
+    const a = tangents[index] / slope;
+    const b = tangents[index + 1] / slope;
+    // 平方和超过 9 时需要按比例缩小喵
+    const magnitude = Math.hypot(a, b);
+    if (magnitude > 3) {
+      const scale = 3 / magnitude;
+      tangents[index] = scale * a * slope;
+      tangents[index + 1] = scale * b * slope;
+    }
+  }
+  // 逐段拼三次贝塞尔曲线喵
+  let path = `M${nodeList[0].x.toFixed(1)},${nodeList[0].y.toFixed(1)}`;
+  for (let index = 0; index < nodeList.length - 1; index += 1) {
+    const from = nodeList[index];
+    const to = nodeList[index + 1];
+    // 控制点取在三分之一与三分之二处，用切线斜率定高度喵
+    const third = deltas[index] / 3;
+    const control1x = from.x + third;
+    const control1y = from.y + tangents[index] * third;
+    const control2x = to.x - third;
+    const control2y = to.y - tangents[index + 1] * third;
+    path += ` C${control1x.toFixed(1)},${control1y.toFixed(1)} ${control2x.toFixed(1)},${control2y.toFixed(
+      1,
+    )} ${to.x.toFixed(1)},${to.y.toFixed(1)}`;
+  }
+  return path;
+}
+
+/** 渲染最近 30 天的每日使用时长折线图喵。 */
+function renderTrend(payload) {
+  // 没有容器时跳过喵
+  if (!el.trendBody) return;
+  // 整理成完整的 30 天点喵
+  const points = trendPoints(payload && payload.days, TREND_DAYS);
+  // 喵~防御：一条记录都没有时给空态，别画一条贴底的假线喵
+  const totalSeconds = points.reduce((sum, point) => sum + point.seconds, 0);
+  if (!totalSeconds) {
+    el.trendBody.innerHTML = '<p class="empty">最近 30 天还没有使用记录</p>';
+    if (el.trendSummary) el.trendSummary.textContent = "";
+    return;
+  }
+  // 画布尺寸：宽固定，高固定，靠 viewBox 缩放喵
+  const width = 720;
+  const height = 220;
+  // 四周留白，左边留给刻度、下边留给日期喵
+  const padLeft = 56;
+  const padRight = 12;
+  const padTop = 12;
+  const padBottom = 26;
+  const plotWidth = width - padLeft - padRight;
+  const plotHeight = height - padTop - padBottom;
+  // 纵轴上限取「最忙那天」向上取整到整小时，图顶不会顶到边框喵
+  const peak = Math.max(...points.map((point) => point.seconds));
+  const niceMax = Math.max(3600, Math.ceil(peak / 3600) * 3600);
+  // 横轴：每天一个位置喵
+  const stepX = plotWidth / Math.max(1, points.length - 1);
+  const pointX = (index) => padLeft + index * stepX;
+  const pointY = (seconds) => padTop + plotHeight - (seconds / niceMax) * plotHeight;
+  // 折线路径：平滑曲线，但保证不越过相邻数据点喵
+  const linePath = monotoneCubicPath(
+    points.map((point, index) => ({ x: pointX(index), y: pointY(point.seconds) })),
+  );
+  // 面积路径：曲线下方一直填到基线喵
+  const baseline = (padTop + plotHeight).toFixed(1);
+  const areaPath = `${linePath} L${pointX(points.length - 1).toFixed(1)},${baseline} L${pointX(0).toFixed(
+    1,
+  )},${baseline} Z`;
+  // 纵向刻度：0、1/2、满额三档就够读喵
+  const gridLines = [0, 0.5, 1]
+    .map((ratio) => {
+      const y = padTop + plotHeight - ratio * plotHeight;
+      const label = trendTickText(niceMax * ratio);
+      return `<line class="trend-grid-line" x1="${padLeft}" y1="${y.toFixed(1)}" x2="${width - padRight}" y2="${y.toFixed(1)}"/>
+        <text class="trend-axis-text" x="${padLeft - 8}" y="${(y + 3).toFixed(1)}" text-anchor="end">${label}</text>`;
+    })
+    .join("");
+  // 横轴日期：只标首、中、尾三个，标多了会糊成一团喵
+  const dateTicks = [0, Math.floor((points.length - 1) / 2), points.length - 1]
+    .filter((index, position, list) => list.indexOf(index) === position)
+    .map((index) => {
+      // 只写「月-日」，年份在标题里已经有了喵
+      const text = points[index].date.slice(5);
+      return `<text class="trend-axis-text" x="${pointX(index).toFixed(1)}" y="${height - 8}" text-anchor="middle">${text}</text>`;
+    })
+    .join("");
+  // 数据点与悬浮热区喵
+  const dots = points
+    .map((point, index) => {
+      const x = pointX(index);
+      const y = pointY(point.seconds);
+      const tip = `${point.date} · ${formatDuration(point.seconds)}`;
+      // 喵~注意：0 值不画圆点——连续 28 天都为 0 时圆点会在基线上挤成一条虚线，
+      // 看着像「有数据」的噪点，其实那天什么都没用喵
+      const dot = point.seconds > 0
+        ? `<circle class="trend-dot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.5"/>`
+        : "";
+      // 热区是整列，鼠标停在任意高度都能看到对应的那天的数值喵
+      return `${dot}
+        <rect class="trend-hit" x="${(x - stepX / 2).toFixed(1)}" y="${padTop}" width="${stepX.toFixed(
+        1,
+      )}" height="${plotHeight}"><title>${escapeHtml(tip)}</title></rect>`;
+    })
+    .join("");
+  // 拼成完整 SVG喵
+  el.trendBody.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="最近 30 天每日使用时长">
+    ${gridLines}
+    <path class="trend-area" d="${areaPath}"/>
+    <path class="trend-line" d="${linePath}"/>
+    ${dots}
+    ${dateTicks}
+  </svg>`;
+  // 摘要写清这段时间的总量与峰值喵
+  if (el.trendSummary) {
+    el.trendSummary.textContent = `合计 ${formatDuration(totalSeconds)} · 单日最高 ${formatDuration(peak)}`;
+  }
+}
+
+/** 渲染统计页顶部的四个数字喵。 */
+function renderStatsKpi(payload) {
+  // 没有容器时跳过喵
+  if (!el.statsKpi) return;
+  const totals = (payload && payload.totals) || {};
+  // 四项指标：总时长、有记录天数、日均、最忙的一天喵
+  const cards = [
+    { label: "累计使用", value: formatDuration(totals.seconds || 0), cls: "accent" },
+    { label: "有记录天数", value: `${totals.active_days || 0} 天` },
+    { label: "日均使用", value: formatDuration(totals.average_seconds || 0) },
+    {
+      label: "最忙的一天",
+      value: totals.busiest_date ? formatDuration(totals.busiest_seconds || 0) : "—",
+      hint: totals.busiest_date || "",
+    },
+  ];
+  // 逐张卡片拼出来喵
+  el.statsKpi.innerHTML = cards
+    .map(
+      (card) => `<div class="kpi">
+        <div class="kpi-label">${escapeHtml(card.label)}</div>
+        <div class="kpi-value${card.cls ? ` ${card.cls}` : ""}">${escapeHtml(String(card.value))}</div>
+        ${card.hint ? `<div class="kpi-hint">${escapeHtml(card.hint)}</div>` : ""}
+      </div>`,
+    )
+    .join("");
+}
+
+/** 渲染统计页的设备分布喵。 */
+function renderStatsDevices(payload) {
+  // 没有容器时跳过喵
+  if (!el.statsDevices) return;
+  const devices = (payload && payload.devices) || [];
+  // 喵~防御：一台设备都没有时给一句空态喵
+  if (!devices.length) {
+    el.statsDevices.innerHTML = '<p class="empty">这个时间窗口内还没有设备数据</p>';
+    return;
+  }
+  // 条形按第一名归一化喵
+  const maxSeconds = Math.max(1, Number(devices[0].seconds) || 1);
+  // 逐台设备一行喵
+  el.statsDevices.innerHTML = devices
+    .map((device) => {
+      const seconds = Number(device.seconds) || 0;
+      const width = Math.max(2, (seconds / maxSeconds) * 100);
+      return `<div class="stats-device-row">
+        <div class="stats-device-name">${escapeHtml(String(device.name || device.device_id || ""))}</div>
+        <div class="stats-device-bar"><span style="width:${width.toFixed(1)}%"></span></div>
+        <div class="stats-device-seconds">${formatDuration(seconds)}</div>
+      </div>`;
+    })
+    .join("");
+}
+
+/** 渲染整页统计喵。 */
+function renderStats() {
+  // 数据还没回来时给个占位喵
+  const payload = state.stats;
+  renderStatsKpi(payload);
+  renderHeatmap(payload);
+  renderTrend(payload);
+  renderStatsDevices(payload);
+  // 摘要写清当前口径喵
+  if (el.statsSummary) {
+    const current = state.statsDeviceId ? "当前设备" : "全部设备";
+    el.statsSummary.textContent = `${current} · 近 ${state.statsDays} 天`;
+  }
+  // 设备筛选按钮跟着数据重建喵
+  renderStatsDeviceSwitch(payload);
+  // 统计页也画完了，允许截图喵
+  markShotReady("stats");
+}
+
+/** 重建统计页的设备筛选按钮喵。 */
+function renderStatsDeviceSwitch(payload) {
+  // 没有容器时跳过喵
+  if (!el.statsDeviceSwitch) return;
+  // 喵~注意：按钮清单要用「全量设备」，不能用当前筛选后的明细，
+  // 否则选中一台之后按钮只剩那一台，再也换不回去了喵
+  const devices = state.statsDeviceList || (payload && payload.devices) || [];
+  const items = [{ id: "", label: "全部设备" }].concat(
+    devices.map((device) => ({ id: String(device.device_id || ""), label: String(device.name || "") })),
+  );
+  // 逐项渲染，选中态跟着 state 走喵
+  el.statsDeviceSwitch.innerHTML = items
+    .map(
+      (item) =>
+        `<button class="seg-item${item.id === state.statsDeviceId ? " active" : ""}" data-device="${escapeHtml(
+          item.id,
+        )}" type="button">${escapeHtml(item.label)}</button>`,
+    )
+    .join("");
+}
+
+/** 拉取热力图数据并渲染喵。 */
+async function loadStats() {
+  try {
+    // 设备筛选走服务端，热力图与汇总都只算那一台喵
+    let query = `days=${state.statsDays}&tz_offset_minutes=${state.tzOffsetMinutes}`;
+    if (state.statsDeviceId) query += `&devices=${encodeURIComponent(state.statsDeviceId)}`;
+    const body = await api(`/api/v1/stats/heatmap?${query}`);
+    // 喵~注意：筛了设备时服务端只返回那一台的明细，
+    // 但切换按钮需要完整清单，所以记下上一次的全量清单复用喵
+    if (!state.statsDeviceId) state.statsDeviceList = body.devices || [];
+    state.stats = body;
+    renderStats();
+  } catch (error) {
+    // 喵~防御：口令失效走统一处理喵
+    if (error.unauthorized) {
+      handleUnauthorized();
+      return;
+    }
+    // 出错时给一句可读提示喵
+    if (el.heatmapBody) {
+      el.heatmapBody.innerHTML = `<p class="empty">加载失败：${escapeHtml(error.message)}</p>`;
+    }
+    // 喵~注意：失败也要置就绪标记，否则截图会一直等到超时喵
+    markShotReady("stats");
+  }
 }
 
 /* ==================== 命令测试 ==================== */
@@ -2706,7 +3222,8 @@ function renderBlocklist(entries) {
     const sourceTag = fromConfig
       ? '<span class="tag warn">配置</span>'
       : '<span class="tag ok">运行中</span>';
-    const created = entry.created_at ? formatClock(entry.created_at) : "—";
+    // 喵~注意：拉黑时间同样要带日期，否则「昨天拉的」和「今天拉的」看起来一样喵
+    const created = entry.created_at ? formatRecentTime(entry.created_at) : "—";
     return `<tr>
       <td>${escapeHtml(channelText)}</td>
       <td><code>${escapeHtml(entry.target)}</code></td>
@@ -2796,7 +3313,8 @@ async function loadSeenUsers() {
   if (!el.seenUsersList) return;
   try {
     const body = await api("/api/v1/acl/seen-users");
-    renderSeenUsers(body.users || []);
+    // 喵~注意：基准时刻在这里取一次，整张表的「今天」口径就统一了喵
+    renderSeenUsers(body.users || [], serverNow());
   } catch (error) {
     if (error.unauthorized) {
       handleUnauthorized();
@@ -2806,8 +3324,50 @@ async function loadSeenUsers() {
   }
 }
 
+/**
+ * 把一个「最近时刻」格式化成带跨天提示的文本喵。
+ *
+ * 输入：时间（ISO 文本或 Date）、可选的基准时刻（默认取服务端现在）。
+ * 输出：今天「22:30」、昨天「昨天 22:30」、同年「10-30 22:30」、跨年「2025-12-31 22:30」。
+ * 边界：空值或解析失败返回「—」；基准时刻可注入，测试才能把「今天」钉死喵。
+ *
+ * 喵~注意：这里必须带日期，不能只给时分。列表按最近活跃倒序排，
+ * 跨过零点以后「昨天 23:50」和「今天 23:50」只写时分是一模一样的，
+ * 而且昨天那条看起来像未来时间（比现在还晚），排在最上面最容易看错喵。
+ */
+function formatRecentTime(isoText, now) {
+  // 喵~防御：没有时间就给占位符，别渲染出 Invalid Date喵
+  if (!isoText) return "—";
+  // Date 直接用，字符串先解析喵
+  const moment = isoText instanceof Date ? isoText : new Date(isoText);
+  // 喵~防御：解析失败说明字段格式不对，退回占位符喵
+  if (Number.isNaN(moment.getTime())) return "—";
+  // 基准时刻默认用服务端现在，测试可以传进来钉死喵
+  const base = now instanceof Date ? now : serverNow();
+  // 时分按服务端时区取，浏览器时区改了也不影响喵
+  const shifted = inServerZone(moment);
+  // 拼出 HH:mm喵
+  const clock = `${pad2(shifted.getUTCHours())}:${pad2(shifted.getUTCMinutes())}`;
+  // 这一条落在哪一天（服务端口径）喵
+  const dayText = localDateText(moment);
+  // 「今天」也按服务端口径算喵
+  const todayText = localDateText(base);
+  // 今天之内只写时分就够，不啰嗦喵
+  if (dayText === todayText) return clock;
+  // 喵~注意：服务端时区是固定偏移（东八区），减 24 小时就是昨天，不用管夏令时喵
+  const yesterdayText = localDateText(new Date(base.getTime() - 86400000));
+  // 昨天单独写成「昨天」，比写日期好认喵
+  if (dayText === yesterdayText) return `昨天 ${clock}`;
+  // 同一年里写「月-日 时分」喵
+  const monthDay = dayText.slice(5);
+  // 同年就不用重复写年份喵
+  if (dayText.slice(0, 4) === todayText.slice(0, 4)) return `${monthDay} ${clock}`;
+  // 跨年了才写完整日期，避免和今年的同月同日混淆喵
+  return `${dayText} ${clock}`;
+}
+
 /** 把最近发言的人渲染成表格，每行带一键拉黑喵。 */
-function renderSeenUsers(users) {
+function renderSeenUsers(users, now) {
   if (!el.seenUsersList) return;
   if (!users.length) {
     el.seenUsersList.innerHTML =
@@ -2825,7 +3385,7 @@ function renderSeenUsers(users) {
       <td>${nameCell}</td>
       <td><code title="${escapeHtml(user.user_key)}">${escapeHtml(user.user_key)}</code></td>
       <td>${escapeHtml(user.command_count)}</td>
-      <td>${escapeHtml(formatClock(user.last_seen_at))}</td>
+      <td>${escapeHtml(formatRecentTime(user.last_seen_at, now))}</td>
       <td><button class="btn ghost small" type="button" data-action="block-seen"
             data-channel="${escapeHtml(user.channel)}"
             data-target="${escapeHtml(user.user_key)}">拉黑</button></td>
@@ -2980,6 +3540,7 @@ function switchTab(tab) {
     if (state.selectedId) selectDevice(state.selectedId);
   }
   if (tab === "rankings") loadRankings();
+  if (tab === "stats") loadStats();
   if (tab === "timeline") loadTimeline();
   if (tab === "bot") {
     renderBotChips();
@@ -3009,7 +3570,7 @@ function updateHash() {  const suffix = state.tab === "devices" && state.selecte
 function readHash() {
   const raw = (location.hash || "").replace(/^#\/?/, "");
   const [tab, deviceId] = raw.split("/");
-  const allowed = ["overview", "devices", "timeline", "rankings", "bot", "config", "settings"];
+  const allowed = ["overview", "devices", "timeline", "rankings", "stats", "bot", "config", "settings"];
   return {
     tab: allowed.includes(tab) ? tab : "overview",
     deviceId: deviceId ? decodeURIComponent(deviceId) : null,
@@ -3402,6 +3963,37 @@ el.rangeSwitch.addEventListener("click", (event) => {
 });
 
 el.tlPeople.addEventListener("click", openPeopleEditor);
+
+// 统计页：切换回溯天数喵
+if (el.statsRangeSwitch) {
+  el.statsRangeSwitch.addEventListener("click", (event) => {
+    const button = event.target.closest(".seg-item");
+    if (!button) return;
+    state.statsDays = Number(button.dataset.days) || 90;
+    el.statsRangeSwitch.querySelectorAll(".seg-item").forEach((item) => {
+      item.classList.toggle("active", item === button);
+    });
+    // 喵~注意：换窗口等于换画面，先清掉就绪标记再重新拉数据喵
+    clearShotReady();
+    loadStats();
+  });
+}
+
+// 统计页：切换设备筛选喵
+if (el.statsDeviceSwitch) {
+  el.statsDeviceSwitch.addEventListener("click", (event) => {
+    const button = event.target.closest(".seg-item");
+    if (!button) return;
+    state.statsDeviceId = button.dataset.device || "";
+    el.statsDeviceSwitch.querySelectorAll(".seg-item").forEach((item) => {
+      item.classList.toggle("active", item === button);
+    });
+    // 换了设备要重新拉数据，热力图与汇总都跟着那台走喵
+    clearShotReady();
+    loadStats();
+  });
+}
+
 // 设置页的清理按钮喵
 const storageCleanupButton = document.getElementById("storage-cleanup");
 if (storageCleanupButton) storageCleanupButton.addEventListener("click", cleanupStorage);

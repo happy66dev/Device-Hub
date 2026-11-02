@@ -74,6 +74,9 @@ REASON_NOT_MENTIONED = "not_mentioned"
 # @ 了但没有命令前缀喵
 REASON_NOT_COMMAND = "not_command"
 
+# 命令名不在命令表里，按静默处理（群里一个字都不回）喵
+REASON_UNKNOWN_COMMAND = "unknown_command"
+
 # 免 @ 模式下角色不够喵
 REASON_ROLE_TOO_LOW = "role_too_low"
 

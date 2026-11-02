@@ -13,7 +13,7 @@ import asyncio
 import logging
 import sqlite3
 
-from .. import db, queries
+from .. import db
 from ..config import AppConfig
 from . import router, users
 from .channel import (
@@ -29,9 +29,6 @@ from .qqbot import QQBotChannel
 
 # 模块日志器喵
 LOGGER = logging.getLogger("device_hub.bot")
-
-# 清理过期数据的间隔秒数，一小时一次喵
-PRUNE_INTERVAL_SECONDS = 3600
 
 # 发送失败时可以退回文本的异常集合喵
 SEND_ERRORS = (ConnectionError, asyncio.TimeoutError, ChannelError, OSError)
@@ -84,10 +81,11 @@ class BotRunner:
 
     async def run(self) -> None:
         """启动机器人主循环，直到被取消喵。"""
-        # 喵~防御：一个通道都没启用时只跑清理任务，避免留下悬挂协程喵
+        # 喵~注意：一个通道都没启用时直接返回，不要再在这儿跑清理任务。
+        # 归档与清理已经搬到 app/maintenance.py，由 main 的生命周期无条件启动，
+        # 挂在机器人上的话「纯服务端部署」就永远不清理了喵
         if not self._channels:
             LOGGER.warning("没有启用任何机器人通道（napcat.enabled 与 qqbot.enabled 都是 false）")
-            await self._prune_loop()
             return
         # 把生效的白名单写进日志，方便主人核对喵
         self._log_access_control()
@@ -96,17 +94,15 @@ class BotRunner:
             asyncio.create_task(channel.run(), name=f"bot-channel-{name}")
             for name, channel in self._channels.items()
         ]
-        # 清理任务喵
-        prune_task = asyncio.create_task(self._prune_loop(), name="prune-loop")
         try:
-            # 任一任务异常都会在这里抛出喵
-            await asyncio.gather(*channel_tasks, prune_task)
+            # 任一通道异常都会在这里抛出喵
+            await asyncio.gather(*channel_tasks)
         finally:
             # 退出时取消所有子任务，避免留下悬挂协程喵
-            for task in (*channel_tasks, prune_task):
+            for task in channel_tasks:
                 task.cancel()
             # 等待取消真正生效喵
-            await asyncio.gather(*channel_tasks, prune_task, return_exceptions=True)
+            await asyncio.gather(*channel_tasks, return_exceptions=True)
 
     def _log_access_control(self) -> None:
         """把每个通道的白名单打进日志喵。"""
@@ -146,6 +142,11 @@ class BotRunner:
         # 喵~防御：不该响应的消息直接返回，保持安静喵
         if not should_reply:
             LOGGER.debug("忽略 %s 消息（%s）", message.channel, reason)
+            return
+        # 喵~防御：未知命令完全静默——不起忙、不记账、不查库、不发任何消息喵
+        # 喵~注意：判定点放在占忙位之前，否则一条闲聊命令会白白挤掉真正的命令喵
+        if router.is_silent_command(command_text):
+            LOGGER.info("未知命令 %r，静默忽略：%s", command_text, message.channel)
             return
         # 找到消息所属通道喵
         channel = self._channels.get(message.channel)
@@ -336,40 +337,3 @@ class BotRunner:
             # 关闭连接喵
             connection.close()
 
-    async def _prune_loop(self) -> None:
-        """定期清理过期数据喵。"""
-        while True:
-            # 先等待一个周期再清理，避免刚启动就占用数据库喵
-            await asyncio.sleep(PRUNE_INTERVAL_SECONDS)
-            try:
-                # 清理动作放到线程里执行喵
-                deleted_counts = await asyncio.to_thread(self._prune_once)
-                # 记录本次清理结果喵
-                LOGGER.info(
-                    "清理过期数据：原始上报 %s 条，使用时长 %s 条，电量 %s 条",
-                    deleted_counts.get("reports", 0),
-                    deleted_counts.get("usage_samples", 0),
-                    deleted_counts.get("battery_samples", 0),
-                )
-            except sqlite3.Error as prune_error:
-                # 喵~防御：清理失败不影响主流程，下一个周期继续尝试喵
-                LOGGER.warning("清理过期数据失败：%s", prune_error)
-
-    def _prune_once(self) -> dict[str, int]:
-        """执行一次清理并返回删除行数喵。"""
-        # 打开连接喵
-        connection = db.connect(self._config.server.db_path)
-        try:
-            # 复用查询层的清理函数喵
-            counts = queries.prune_expired(
-                connection,
-                detail_days=self._config.retention.detail_days,
-                aggregate_days=self._config.retention.aggregate_days,
-            )
-            # 喵~注意：发言人名单也按明细保留期清理，不然会无限长喵
-            stale_cutoff = db.days_ago_text(self._config.retention.detail_days)
-            counts["bot_seen_users"] = users.prune_seen_users(connection, stale_cutoff)
-            return counts
-        finally:
-            # 关闭连接喵
-            connection.close()

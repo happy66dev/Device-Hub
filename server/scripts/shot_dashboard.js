@@ -169,8 +169,8 @@ async function waitForShotReady(cdp, tab, timeoutMs) {
  * 所以这里认的是「空态文案出现了」而不是「一定有色块」喵。
  */
 async function assertRendered(cdp, tab) {
-  // 只校验出图的两个页签，其它页签不管喵
-  if (tab !== "rankings" && tab !== "timeline") return;
+  // 只校验出图的几个页签，其它页签不管喵
+  if (tab !== "rankings" && tab !== "timeline" && tab !== "stats") return;
   const probe = await cdp.send("Runtime.evaluate", {
     expression: `(() => {
       const tab = ${JSON.stringify(tab)};
@@ -181,6 +181,16 @@ async function assertRendered(cdp, tab) {
         if (!text) return "时间轴摘要还是空的";
         if (text.includes("加载中")) return "时间轴还停在「加载中…」";
         return "";
+      }
+      if (tab === "stats") {
+        // 统计页：热力图的格子必须已经铺出来喵
+        const body = document.querySelector("#heatmap-body");
+        if (!body) return "找不到热力图容器";
+        if (body.querySelector(".heatmap-cell")) return "";
+        // 截图为空时至少要给出空态文案喵
+        const empty = body.querySelector(".empty");
+        if (empty && empty.textContent.trim()) return "";
+        return "热力图既没有格子也没有空态文案";
       }
       // 排行榜：要么有行，要么有「没有数据」的空态文案喵
       const body = document.querySelector("#ranking-body");

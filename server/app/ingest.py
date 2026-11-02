@@ -22,6 +22,7 @@ from .gating import (
     match_mirrored_tags,
 )
 from .models import ReportPayload
+from .payload_codec import encode_payload
 
 # 使用段落位时刻允许比上报时刻早多少秒，超了就认为客户端时钟不可信、退回上报时刻喵
 MAX_USAGE_ANCHOR_SECONDS = 3600
@@ -138,6 +139,20 @@ def _collect_android_tags(connection: sqlite3.Connection) -> list[str]:
     ).fetchall()
     # 收集成字符串列表喵
     return [str(row["tag"]) for row in rows]
+
+
+def _report_payload_body(payload: ReportPayload) -> dict[str, object]:
+    """拼出要存进 reports 的上报体，去掉已有别处存放的字段喵。
+
+    输入：校验过的上报对象。
+    输出：可以直接压缩存储的字典。
+    边界：只去掉 open_windows，其它字段一律保留，保证以后还能回溯解析喵。
+    """
+    # 先按模型序列化，日期时间等类型会被转成字符串喵
+    body = payload.model_dump(mode="json")
+    # 喵~注意：open_windows 逐行存在 window_samples 里，这里再存一份就是重复喵
+    body.pop("open_windows", None)
+    return body
 
 
 def save_report(
@@ -327,9 +342,17 @@ def save_report(
             ("" if decision.stats_enabled else decision.reason, payload.device_id),
         )
         # 再写原始上报表，并检查是否为重复上报喵
+        # 喵~注意：这里存的是压缩后的 BLOB，而且刻意丢掉了 open_windows——
+        # 那份列表已经逐行拆进 window_samples 了（实测内容完全一致），
+        # 留着等于同一份数据存两遍，它一项就占了 payload 的 45%喵
         report_cursor = connection.execute(
             insert_report_sql,
-            (payload.device_id, reported_text, received_text, payload.model_dump_json()),
+            (
+                payload.device_id,
+                reported_text,
+                received_text,
+                encode_payload(_report_payload_body(payload)),
+            ),
         )
         # 喵~防御：rowcount 为 0 说明这条上报已经处理过，后续采样必须跳过，否则统计翻倍喵
         is_duplicate = report_cursor.rowcount == 0

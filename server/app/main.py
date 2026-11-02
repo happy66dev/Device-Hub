@@ -33,7 +33,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .clock import DEFAULT_SERVERS, TrustedClock, get_clock, set_clock
 
-from . import acl, botcheck, db, icons, ingest, people, presence, queries, settings, storage
+from . import acl, botcheck, db, icons, ingest, maintenance, people, presence, queries, settings, storage
 from .bot import simulate
 from .bot import users as bot_users
 from .bot.runner import BotRunner
@@ -344,6 +344,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         db.init_db(active_config.server.db_path)
         # 图标键规则升级后把历史行重算一遍，避免「图标存在但显示不出来」喵
         _rekey_icon_keys(active_config)
+        # 喵~注意：归档与清理必须无条件启动，不能挂在机器人上。
+        # 以前这段长在 BotRunner 里，纯服务端部署（两个通道都关）时
+        # main 压根不创建 BotRunner，归档和清理就永远不跑，
+        # 数据一直涨而日志里一个字都不打——这种静默失效最难发现喵
+        maintenance_task = asyncio.create_task(
+            maintenance.maintenance_loop(active_config),
+            name="device-hub-maintenance",
+        )
         # 机器人任务句柄，未启用时为 None 喵
         bot_task: asyncio.Task[None] | None = None
         # 机器人实例，供状态接口读取连接情况喵
@@ -375,6 +383,9 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             if clock_task is not None:
                 clock_task.cancel()
                 await asyncio.gather(clock_task, return_exceptions=True)
+            # 喵~防御：停掉维护任务，避免退出过程中还在写库喵
+            maintenance_task.cancel()
+            await asyncio.gather(maintenance_task, return_exceptions=True)
             # 喵~防御：关闭时先取消机器人任务，避免退出过程中还在发消息喵
             if bot_task is not None:
                 # 请求取消喵
@@ -524,6 +535,30 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         return JSONResponse(
             content={"ok": True, "hours": hours, "scope": scope, "entries": entries, "groups": groups}
         )
+
+    @application.get("/api/v1/stats/heatmap")
+    async def usage_heatmap(request: Request) -> JSONResponse:
+        """按天汇总的使用热力图数据，看板「统计」页用喵。"""
+        # 取当前配置喵
+        active_config: AppConfig = request.app.state.config
+        # 喵~防御：统计会暴露使用强度，同样要求口令喵
+        if not _verify_token(request, active_config):
+            return _error_response(401, "invalid_token", "X-Ingest-Token 缺失或不匹配")
+        # 回溯天数，最多两年，够热力图铺满一屏喵
+        days = _parse_positive_int(request.query_params.get("days"), default=365, minimum=7, maximum=740)
+        # 时区偏移决定「本地日历天」的切分线喵
+        tz_offset = _parse_bounded_int(
+            request.query_params.get("tz_offset_minutes"), default=480, minimum=-720, maximum=840
+        )
+        # 设备范围：逗号分隔的设备 ID，空表示全部设备喵
+        raw_devices = (request.query_params.get("devices") or "").strip()
+        device_ids = [item.strip() for item in raw_devices.split(",") if item.strip()]
+        # 线程池里查按天汇总喵
+        payload = await run_in_threadpool(
+            _load_heatmap, active_config, days, tz_offset, device_ids or None
+        )
+        # 返回热力图数据喵
+        return JSONResponse(content={"ok": True, **payload})
 
     @application.get("/api/v1/bot/status")
     async def bot_status(request: Request) -> JSONResponse:
@@ -1361,6 +1396,66 @@ def _serialize_global_usage(
         # 喵~注意：查不到图标时给空串，不能现算假键喵
         "icon_key": _icon_key_of(icon_keys, entry.app, entry.package),
     }
+
+
+def _load_heatmap(
+    config: AppConfig,
+    days: int,
+    tz_offset_minutes: int,
+    device_ids: list[str] | None,
+) -> dict[str, object]:
+    """读热力图数据：每天的总时长、活跃设备数与明细喵。
+
+    输入：配置、回溯天数、时区偏移、设备 ID 列表（None 表示全部）。
+    输出：含 days（日期与秒数）、totals（汇总数字）的字典。
+    边界：库里没有数据时 days 为空列表，totals 全是 0喵。
+    """
+    # 打开连接喵
+    connection = db.connect(config.server.db_path)
+    try:
+        # 基准时间取一次，保证几个数字口径一致喵
+        now = db.utc_now()
+        # 按天汇总喵
+        daily = queries.daily_usage_totals(
+            connection,
+            device_ids=device_ids,
+            days=days,
+            tz_offset_minutes=tz_offset_minutes,
+            now=now,
+        )
+        # 顺带把设备明细也查出来，统计页要显示「哪台设备用得多」喵
+        # 喵~注意：明细**不加**设备过滤，统计页的设备切换按钮就靠它，
+        # 过滤掉的话前端选中一台之后按钮就只剩那一台，换不回去了喵
+        device_totals = queries.device_usage_totals(connection, seconds=days * 86400, now=now)
+        # 设备名映射，明细里要写人话喵
+        names = queries.device_name_map(connection)
+        # 组装明细并按秒数倒序喵
+        devices = sorted(
+            (
+                {"device_id": device_id, "name": names.get(device_id, device_id), "seconds": seconds}
+                for device_id, seconds in device_totals.items()
+            ),
+            key=lambda item: (-int(item["seconds"]), str(item["name"])),
+        )
+        # 汇总数字喵
+        total_seconds = sum(seconds for _day, seconds in daily)
+        # 有记录的天数与最忙的一天喵
+        busiest = max(daily, key=lambda item: item[1]) if daily else ("", 0)
+        return {
+            "days": [{"date": day, "seconds": seconds} for day, seconds in daily],
+            "devices": devices,
+            "totals": {
+                "seconds": total_seconds,
+                "active_days": len(daily),
+                "busiest_date": busiest[0],
+                "busiest_seconds": busiest[1],
+                # 平均到「有记录的天」，没有记录的日子不摊薄喵
+                "average_seconds": int(total_seconds / len(daily)) if daily else 0,
+            },
+        }
+    finally:
+        # 关闭连接喵
+        connection.close()
 
 
 def _load_rankings(

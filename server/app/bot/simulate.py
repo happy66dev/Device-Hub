@@ -44,6 +44,7 @@ REASON_TEXTS: dict[str, str] = {
     router.REASON_NOT_MENTIONED: "没有 @ 机器人，机器人不会响应",
     router.REASON_NOT_COMMAND: "没有命令前缀，机器人当闲聊忽略",
     router.REASON_ROLE_TOO_LOW: "免 @ 模式下该用户角色不够，机器人不会响应",
+    router.REASON_UNKNOWN_COMMAND: "没有这个命令，机器人完全静默（一个字都不回）",
     REASON_EMPTY: "命令不能为空",
 }
 
@@ -164,7 +165,11 @@ def simulate_command(
     # 只有会回复时才真的去生成内容喵
     text_reply = ""
     image: bytes | None = None
-    if replied:
+    # 喵~防御：未知命令在真实机器人里是完全静默的，看板测试也必须给出同一个结论喵
+    if replied and router.is_silent_command(command_text):
+        replied = False
+        reason = router.REASON_UNKNOWN_COMMAND
+    elif replied:
         # 先试图片，和真实机器人一样优先发图喵
         image = router.build_image(connection, config, command_text)
         # 喵~防御：有图片就不再发文本，避免主人在群里收到一条报错喵

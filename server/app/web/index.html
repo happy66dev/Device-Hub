@@ -23,6 +23,7 @@
         <button class="nav-item" data-tab="devices" type="button">设备</button>
         <button class="nav-item" data-tab="timeline" type="button">时间轴</button>
         <button class="nav-item" data-tab="rankings" type="button">应用排行</button>
+        <button class="nav-item" data-tab="stats" type="button">统计</button>
         <button class="nav-item" data-tab="bot" type="button">命令测试</button>
         <button class="nav-item" data-tab="config" type="button">配置</button>
         <button class="nav-item" data-tab="settings" type="button">设置</button>
@@ -116,6 +117,41 @@
           <span class="muted" id="ranking-summary"></span>
         </div>
         <div id="ranking-body"></div>
+      </div>
+    </section>
+
+    <!-- 统计：使用强度热力图与设备分布 -->
+    <section class="tab-panel" id="panel-stats">
+      <div class="section-head">
+        <h2>统计</h2>
+        <p class="muted">每天的使用强度热力图，格子越深说明用得越多</p>
+      </div>
+      <div class="kpi-row" id="stats-kpi"></div>
+      <div class="panel">
+        <div class="toolbar">
+          <div class="segmented" id="stats-range-switch">
+            <button class="seg-item active" data-days="90" type="button">近 90 天</button>
+            <button class="seg-item" data-days="180" type="button">近 180 天</button>
+            <button class="seg-item" data-days="365" type="button">近 1 年</button>
+          </div>
+          <div class="segmented" id="stats-device-switch"></div>
+          <span class="muted" id="stats-summary"></span>
+        </div>
+        <div class="heatmap" id="heatmap-body"></div>
+        <div class="heatmap-legend" id="heatmap-legend"></div>
+      </div>
+      <div class="panel">
+        <div class="section-head compact">
+          <h3>最近 30 天每日使用</h3>
+          <span class="muted" id="trend-summary"></span>
+        </div>
+        <div class="trend-chart" id="trend-body"></div>
+      </div>
+      <div class="panel">
+        <div class="section-head compact">
+          <h3>设备使用分布</h3>
+        </div>
+        <div id="stats-devices"></div>
       </div>
     </section>
 

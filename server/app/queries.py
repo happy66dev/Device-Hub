@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from . import presence
+from . import archive, archive_codec, presence
 from .db import days_ago_text, hours_ago_text, parse_utc_text, to_utc_text, utc_now
+from .payload_codec import decode_payload
 from .people import PersonGroup
 
 # 判定设备在线的时长阈值：心跳 30 秒一次，超过 3 个周期没上报就算离线喵
@@ -460,6 +462,53 @@ def devices_with_usage(
     return {str(row["device_id"]) for row in rows}
 
 
+def daily_usage_totals(
+    connection: sqlite3.Connection,
+    device_ids: Sequence[str] | None = None,
+    days: int = 365,
+    tz_offset_minutes: int = 480,
+    now: datetime | None = None,
+) -> list[tuple[str, int]]:
+    """按本地日期汇总每天的使用总秒数，供热力图使用喵。
+
+    输入：连接、设备 ID 列表（None 表示全部设备）、回溯天数、时区偏移、可选基准时间。
+    输出：(YYYY-MM-DD, 秒数) 列表，只包含有数据的日子，按日期升序。
+    边界：没有数据时返回空列表喵。
+
+    喵~注意：采样时刻存的是 UTC，而热力图的行列是「本地日历天」，
+    所以必须先用 tz_offset_minutes 把采样时刻挪到本地再截日期，
+    否则跨零点的那几个小时会被算到前一天喵。
+    """
+    # 基准时间喵
+    moment = now or utc_now()
+    # 喵~防御：偏移量夹到合法范围，避免算出一个不存在的时区喵
+    offset_minutes = max(-720, min(840, int(tz_offset_minutes)))
+    # 喵~注意：这是「从此刻往前推 N 天」的滚动窗口，不是本地零点对齐的，
+    # 所以最早那一天可能只截到半天——热力图首格偏淡是正常的，不是丢数据喵
+    window_start = moment - timedelta(days=max(1, int(days)))
+    # 拼设备过滤条件喵
+    params: list[object] = [to_utc_text(window_start)]
+    device_clause = ""
+    if device_ids:
+        # 喵~防御：设备列表为空时不要拼出 IN () 这种非法 SQL 喵
+        device_clause = f" AND device_id IN ({','.join('?' for _ in device_ids)})"
+        params.extend(str(item) for item in device_ids)
+    # 按「采样时刻 + 偏移」截出本地日期再聚合喵
+    rows = connection.execute(
+        f"""
+        SELECT date(sampled_at, ?) AS local_day, SUM(seconds) AS total_seconds
+        FROM usage_samples
+        WHERE sampled_at >= ?{device_clause}
+        GROUP BY local_day
+        HAVING total_seconds > 0
+        ORDER BY local_day ASC
+        """,
+        [f"{offset_minutes:+d} minutes", *params],
+    ).fetchall()
+    # 转成 (日期, 秒数) 的列表喵
+    return [(str(row["local_day"]), int(row["total_seconds"])) for row in rows]
+
+
 def _build_device_segments(
     rows: Sequence[sqlite3.Row],
     merge_gap_seconds: int,
@@ -656,27 +705,40 @@ def day_heartbeats(
     # 拼占位符喵
     placeholders = ",".join("?" for _ in ids)
     # 只取时间和上报体，顺便带上设备角色喵
+    # 喵~注意：ORDER BY 必须带 r.id 兜底——同一时刻可能有多条上报，
+    # 不加次级键的话并列行先后由引擎定，归档前后结果会不一样喵
     rows = connection.execute(
         f"""
-        SELECT r.device_id, r.received_at AS reported_at, r.payload_json, COALESCE(d.role, '') AS role
+        SELECT r.id, r.device_id, r.received_at AS reported_at, r.payload_json, COALESCE(d.role, '') AS role
         FROM reports AS r
         LEFT JOIN devices AS d ON d.device_id = r.device_id
         WHERE r.device_id IN ({placeholders}) AND r.received_at >= ? AND r.received_at < ?
-        ORDER BY r.received_at ASC
+        ORDER BY r.received_at ASC, r.id ASC
         """,
         [*ids, to_utc_text(start), to_utc_text(end)],
     ).fetchall()
     # 逐条解析喵
-    heartbeats: list[presence.Heartbeat] = []
+    heartbeats: list[tuple[int, presence.Heartbeat]] = []
+    # 喵~注意：同一设备同一时刻可能有多条上报，用 (设备, 时刻, 原始 rowid) 做精确去重，
+    # 归档块里也存了 rowid，两边才能完全对上喵
+    seen_keys: set[tuple[str, str, int]] = set()
+    # 喵~防御：归档中途失败时原始行可能还留着，此时 rowid 会对不上（重插会换号），
+    # 所以再按内容做一层兜底去重。用计数而不是集合——
+    # 原始数据里本来就有完全重复的多行（同一时刻同一内容），集合会把它们误并成一条喵
+    seen_content: dict[tuple[str, str, bool, str, str], int] = {}
     for row in rows:
+        # 记下这条的身份，归档补充时跳过喵
+        seen_keys.add((str(row["device_id"]), str(row["reported_at"]), int(row["id"])))
         # 解析上报体拿 afk 标记喵
         afk = False
         # 空档边界时刻，旧客户端不带就是 None 喵
         afk_since: datetime | None = None
         active_since: datetime | None = None
         try:
-            payload = json.loads(row["payload_json"])
-        except (TypeError, ValueError):
+            # 喵~注意：新数据是 zlib 压缩的 BLOB，老数据是明文 JSON，
+            # decode_payload 两种都能读，所以历史记录不用迁移也能查喵
+            payload = decode_payload(row["payload_json"])
+        except (TypeError, ValueError, zlib.error):
             # 喵~防御：坏 JSON 不影响心跳本身喵
             payload = {}
         if isinstance(payload, dict):
@@ -685,17 +747,136 @@ def day_heartbeats(
             afk_since = _parse_optional_moment(payload.get("afk_since"))
             active_since = _parse_optional_moment(payload.get("active_since"))
         # 记一条心跳喵
+        # 喵~注意：连 rowid 一起收着，最后要和归档行按同一键排序，
+        # 否则同一时刻的并列行先后会不一样，AFK 标记就错位了喵
         heartbeats.append(
-            presence.Heartbeat(
-                reported_at=parse_utc_text(str(row["reported_at"])),
-                afk=afk,
-                device_id=str(row["device_id"]),
-                is_server=str(row["role"] or "") == "server",
-                afk_since=afk_since,
-                active_since=active_since,
+            (
+                int(row["id"]),
+                presence.Heartbeat(
+                    reported_at=parse_utc_text(str(row["reported_at"])),
+                    afk=afk,
+                    device_id=str(row["device_id"]),
+                    is_server=str(row["role"] or "") == "server",
+                    afk_since=afk_since,
+                    active_since=active_since,
+                ),
             )
         )
-    return heartbeats
+        # 内容指纹也要记一份，给不依赖 rowid 的去重兜底喵
+        # 用计数记录出现次数，重复行才能各算一次喵
+        content_fingerprint = (
+            str(row["device_id"]),
+            str(row["reported_at"]),
+            afk,
+            afk_since.isoformat() if afk_since else "",
+            active_since.isoformat() if active_since else "",
+        )
+        seen_content[content_fingerprint] = seen_content.get(content_fingerprint, 0) + 1
+    # 喵~注意：超过热保留期的数据已经被压进归档块，这里要补回来，
+    # 对调用方而言归档层完全透明——它看到的仍然是完整一天的心跳喵
+    heartbeats.extend(
+        _archived_heartbeats(connection, ids, start, end, seen_keys, seen_content)
+    )
+    # 按 (上报时刻, 原始 rowid) 排序，与 SQL 的 ORDER BY 口径完全一致喵
+    heartbeats.sort(key=lambda item: (item[1].reported_at, item[0]))
+    # 剥掉排序用的 rowid，只把领域对象交给调用方喵
+    return [item[1] for item in heartbeats]
+
+
+def _archived_heartbeats(
+    connection: sqlite3.Connection,
+    device_ids: Sequence[str],
+    start: datetime,
+    end: datetime,
+    seen_keys: set[tuple[str, str, int]],
+    seen_content: dict[tuple[str, str, bool, str, str], int],
+) -> list[tuple[int, presence.Heartbeat]]:
+    """从归档块里补出窗口内的心跳喵。
+
+    输入：连接、设备列表、窗口起止、原始行的 rowid 去重键、原始行的内容去重键。
+    输出：(原始 rowid, Heartbeat) 列表，已去掉与原始行重复的条目。
+          带 rowid 是为了让调用方能按与 SQL 完全一致的顺序排序喵。
+    边界：没有任何归档块时返回空列表；坏块跳过而不抛错喵。
+    """
+    # 结果列表喵
+    result: list[tuple[int, presence.Heartbeat]] = []
+    # 喵~防御：没有设备就不用找了喵
+    if not device_ids:
+        return result
+    # 先拿到设备角色，归档块里只存了 afk 相关字段喵
+    role_map: dict[str, str] = {}
+    try:
+        for row in connection.execute(
+            f"SELECT device_id, COALESCE(role, '') AS role FROM devices"
+            f" WHERE device_id IN ({','.join('?' for _ in device_ids)})",
+            list(device_ids),
+        ):
+            role_map[str(row["device_id"])] = str(row["role"] or "")
+    except sqlite3.Error:
+        # 喵~防御：设备表读不到就当作都是工作站喵
+        role_map = {}
+    # 算出窗口覆盖到哪些月份喵
+    start_text = to_utc_text(start)
+    end_text = to_utc_text(end)
+    for device_id in device_ids:
+        for month in archive.list_months_for_range(start, end):
+            # 取这个月的归档块喵
+            try:
+                block = archive.load_heartbeat_block(connection, str(device_id), month)
+            except sqlite3.Error:
+                # 喵~防御：归档表不存在或读失败时退化成"只有热数据"喵
+                block = None
+            # 没有块就跳过喵
+            if block is None:
+                continue
+            try:
+                # 只解出窗口内的行喵
+                records = archive_codec.decode_heartbeats(block)
+            except (zlib.error, ValueError):
+                # 喵~防御：坏块不能拖垮整次查询喵
+                continue
+            for moment_text, afk, afk_since_text, active_since_text, row_device, row_id in records:
+                # 时间要落在窗口内喵
+                if not (start_text <= moment_text < end_text):
+                    continue
+                # 归档行里的设备 ID 优先，没有就用循环里的喵
+                owner = row_device or str(device_id)
+                # 喵~注意：先按 rowid 精确去重（正常情况），
+                # 再按内容兜底（归档中断后原始行被重插、rowid 换号的情况）喵
+                if (owner, moment_text, row_id) in seen_keys:
+                    continue
+                # 喵~注意：内容键里的时刻要统一格式再比——
+                # 原始行用 datetime.isoformat()，归档块里是上报体里的原始字符串，
+                # 两者可能一个带微秒一个不带，不归一化就永远对不上喵
+                since_moment = _parse_optional_moment(afk_since_text)
+                active_moment = _parse_optional_moment(active_since_text)
+                content_key = (
+                    owner,
+                    moment_text,
+                    afk,
+                    since_moment.isoformat() if since_moment else "",
+                    active_moment.isoformat() if active_moment else "",
+                )
+                # 喵~注意：原始行里有几条相同内容就消耗几次，
+                # 多出来的才算归档独有的，这样原始数据里的重复行不会被误并喵
+                remaining = seen_content.get(content_key, 0)
+                if remaining > 0:
+                    seen_content[content_key] = remaining - 1
+                    continue
+                result.append(
+                    (
+                        row_id,
+                        presence.Heartbeat(
+                            reported_at=parse_utc_text(moment_text),
+                            afk=afk,
+                            device_id=owner,
+                            is_server=role_map.get(owner, "") == "server",
+                            afk_since=since_moment,
+                            active_since=active_moment,
+                        ),
+                    )
+                )
+    return result
 
 
 def day_usage_segments(
@@ -944,6 +1125,66 @@ class TitleSpan:
     end: datetime
 
 
+def _archived_window_rows(
+    connection: sqlite3.Connection,
+    device_ids: Sequence[str],
+    start: datetime,
+    end: datetime,
+    clamp_end: datetime | None,
+) -> list[dict[str, object]]:
+    """从归档块里补出窗口内的窗口采样喵。
+
+    输入：连接、设备列表、窗口起止、可选的右端上限。
+    输出：形如 {"app_name", "title", "reported_at"} 的字典列表，
+          与 day_title_spans 里直接查 SQL 得到的行同构喵。
+    边界：没有归档块时返回空列表；坏块跳过而不抛错喵。
+    """
+    # 结果列表喵
+    result: list[dict[str, object]] = []
+    # 喵~防御：没有设备就不用找了喵
+    if not device_ids:
+        return result
+    # 窗口的文本边界，用来过滤归档行喵
+    start_text = to_utc_text(start)
+    end_text = to_utc_text(end)
+    # 右端上限也换成文本，便于比较喵
+    clamp_text = to_utc_text(clamp_end) if clamp_end is not None else None
+    for device_id in device_ids:
+        for month in archive.list_months_for_range(start, end):
+            try:
+                # 取这个月的窗口归档块喵
+                block = archive.load_window_block(connection, str(device_id), month)
+            except sqlite3.Error:
+                # 喵~防御：归档表不可用时退化成只用热数据喵
+                block = None
+            if block is None:
+                continue
+            try:
+                # 整块解出来喵
+                records = archive_codec.decode_windows(block)
+            except (zlib.error, ValueError):
+                # 喵~防御：坏块不能拖垮整次查询喵
+                continue
+            for moment_text, app_name, _package, title, _minimized, _foreground, row_id in records:
+                # 时间要落在窗口内喵
+                if not (start_text <= moment_text <= end_text):
+                    continue
+                # 右端上限之外的行不要喵
+                if clamp_text is not None and moment_text > clamp_text:
+                    continue
+                result.append(
+                    {
+                        "app_name": app_name,
+                        "title": title,
+                        "reported_at": moment_text,
+                        # 喵~注意：带上原始 rowid，排序时用它兜底并列行，
+                        # 才能和 SQL 的 `ORDER BY app_name, reported_at` 完全一致喵
+                        "_row_id": row_id,
+                    }
+                )
+    return result
+
+
 def day_title_spans(
     connection: sqlite3.Connection,
     device_ids: str | Sequence[str],
@@ -976,12 +1217,14 @@ def day_title_spans(
     # 拼出 IN 子句的占位符喵
     placeholders = ",".join("?" for _ in id_list)
     # 按应用与时间排序取窗口采样喵
+    # 喵~注意：这里必须带上 id 并在 ORDER BY 里兜底，否则同一时刻并列行的
+    # 先后由引擎自由决定，归档前后可能给出不同的区间合并结果喵
     rows = connection.execute(
         f"""
-        SELECT app_name, title, reported_at
+        SELECT id, app_name, title, reported_at
         FROM window_samples
         WHERE device_id IN ({placeholders}) AND reported_at >= ? AND reported_at <= ?
-        ORDER BY app_name, reported_at
+        ORDER BY app_name, reported_at, id
         """,
         (*id_list, to_utc_text(start), to_utc_text(end)),
     ).fetchall()
@@ -989,7 +1232,30 @@ def day_title_spans(
     spans: list[TitleSpan] = []
     # 当前正在累积的区间：应用、标题、起点、上一次出现时间喵
     current: dict[str, object] | None = None
-    for row in rows:
+    # 喵~注意：已归档的历史月份在原始表里已经查不到了，
+    # 这里把归档块里的行合并进来，再走同一套区间合并逻辑，
+    # 对上层而言归档完全透明喵
+    archived_rows = _archived_window_rows(connection, id_list, start, end, clamp_end)
+    # 喵~注意：排序键必须和上面那条 SQL 的 ORDER BY 完全一致（应用 + 时间 + 原始行号），
+    # 绝不能加 title 当排序键——同一时刻可能有两行不同标题，
+    # 多了 tie-break 会改变区间合并的起点终点，归档前后就不一致了喵
+    all_rows = [
+        {
+            "app_name": row["app_name"],
+            "title": row["title"],
+            "reported_at": row["reported_at"],
+            "_row_id": int(row["id"]),
+        }
+        for row in rows
+    ] + archived_rows
+    all_rows.sort(
+        key=lambda item: (
+            str(item["app_name"] or ""),
+            str(item["reported_at"] or ""),
+            int(item.get("_row_id") or 0),
+        )
+    )
+    for row in all_rows:
         # 应用名与标题都去空白喵
         app_name = str(row["app_name"] or "").strip()
         title = str(row["title"] or "").strip()[:TITLE_MAX_CHARS]
@@ -1616,18 +1882,34 @@ def prune_expired(
     """删除过期数据，返回各表删除行数喵。
 
     输入：连接、明细保留天数、聚合保留天数。
-    输出：形如 {"reports": 3, "usage_samples": 10, "battery_samples": 2} 的字典。
+    输出：形如 {"reports": 3, "usage_samples": 10, ...} 的字典。
     边界：两个天数参数都会先做下限保护，避免传 0 时把当天数据全删喵。
+
+    喵~注意：`reports` 与 `window_samples` **不再按天数删**，只删已经归档的月份。
+    这两张表要等整月过完、由归档压成月块之后才该消失；
+    小时级按 7 天删的话，等每月 8 号归档窗口到来时数据早被删光了，
+    归档永远压不到东西——这是两条保留期打架，必须让归档先说了算喵。
+
+    喵~注意：聚合截止时间仍是 aggregate_days，因为 usage_samples 与
+    battery_samples 不进归档，它们只有 30 天的聚合口径喵。
+
+    喵~注意：`detail_days` 参数还留着，但它现在不决定删哪些行了。
+    留着是为了不改动调用方签名，也方便日后想恢复「硬性上限」时有据可依喵。
     """
-    # 明细截止时间：早于这个时间的原始上报会被删除喵
-    detail_cutoff = days_ago_text(detail_days, now)
     # 聚合截止时间喵
     aggregate_cutoff = days_ago_text(aggregate_days, now)
     # 记录各表删除行数喵
     deleted_counts: dict[str, int] = {}
-    # 删除过期原始上报喵
-    cursor = connection.execute("DELETE FROM reports WHERE reported_at < ?", (detail_cutoff,))
-    deleted_counts["reports"] = cursor.rowcount if cursor.rowcount > 0 else 0
+    # 喵~防御：老库可能还没有归档表，没有就直接跳过这两张表喵
+    has_archives = _has_archives_table(connection)
+    # 删除「已经有月块」的原始上报喵
+    deleted_counts["reports"] = _delete_archived_rows(
+        connection, "reports", "received_at", archive_codec.KIND_HEARTBEATS, has_archives
+    )
+    # 喵~注意：窗口快照同理，它增长最快，但按天删会让归档捡不到东西喵
+    deleted_counts["window_samples"] = _delete_archived_rows(
+        connection, "window_samples", "reported_at", archive_codec.KIND_WINDOWS, has_archives
+    )
     # 删除过期使用时长喵
     cursor = connection.execute("DELETE FROM usage_samples WHERE sampled_at < ?", (aggregate_cutoff,))
     deleted_counts["usage_samples"] = cursor.rowcount if cursor.rowcount > 0 else 0
@@ -1637,6 +1919,51 @@ def prune_expired(
     # 提交删除事务喵
     connection.commit()
     return deleted_counts
+
+
+def _has_archives_table(connection: sqlite3.Connection) -> bool:
+    """判断归档表是否存在喵。"""
+    # 查系统表，不依赖异常喵
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'archives'"
+    ).fetchone()
+    return row is not None
+
+
+def _delete_archived_rows(
+    connection: sqlite3.Connection,
+    table: str,
+    column: str,
+    kind: str,
+    has_archives: bool,
+) -> int:
+    """删掉「所属月份已经有归档块」的原始行喵。
+
+    输入：连接、表名、时间列名、归档类型、归档表是否存在。
+    输出：删除行数。
+    边界：归档表不存在时直接返回 0，一行都不删喵。
+
+    喵~注意：这不只是清理，还是归档的安全网。归档流程是「先写块再删行」，
+    如果进程正好在两步之间被杀，块在、原始行也在；而下次归档看到块已存在
+    就整月跳过了，那些行会永远留在表里。这里按「月份有块就删」兜住它喵。
+    """
+    # 喵~防御：没有归档表就什么都别删喵
+    if not has_archives:
+        return 0
+    # 表名列名都是代码里写死的常量，不是外部输入，可以拼进 SQL 喵
+    cursor = connection.execute(
+        f"""
+        DELETE FROM {table}
+        WHERE EXISTS (
+            SELECT 1 FROM archives
+            WHERE archives.device_id = {table}.device_id
+              AND archives.kind = ?
+              AND archives.month = substr({table}.{column}, 1, 7)
+        )
+        """,
+        (kind,),
+    )
+    return cursor.rowcount if cursor.rowcount > 0 else 0
 
 
 def touch_last_seen(connection: sqlite3.Connection, device_id: str, moment: datetime) -> None:

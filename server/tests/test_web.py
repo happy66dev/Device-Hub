@@ -39,10 +39,29 @@ PURE_FUNCTIONS = (
     "mergeRankingEntries",
     "rankBarHtml",
     "renderRankings",
+    # rankingListHtml 画图标时要用到的几个小函数喵
+    "appIconHtml",
+    "appColor",
+    "iconUrl",
+    "formatDuration",
+    # 统计页热力图的纯函数喵
+    "heatmapLevel",
+    "heatmapCells",
+    "pad2",
+    "dateText",
+    # 日期计算要按服务端时区走，这几个是依赖喵
+    "serverNow",
+    "inServerZone",
+    "localDateText",
+    # 30 天折线图的纯函数喵
+    "trendDates",
+    "trendPoints",
+    "trendTickText",
+    "monotoneCubicPath",
 )
 
 # 纯函数依赖的模块级常量，抽函数时要一起带上喵
-PURE_CONSTANTS = ("DEVICE_SHADE_STEPS",)
+PURE_CONSTANTS = ("DEVICE_SHADE_STEPS", "APP_COLORS", "TREND_DAYS")
 
 
 def extract_function(source: str, name: str) -> str:
@@ -111,7 +130,12 @@ def harness(tail: str) -> str:
     输出：可直接交给 node 的源码。
     """
     source = (WEB_DIR / "app.js").read_text(encoding="utf-8")
-    parts = ["function escapeHtml(value) { return String(value); }"]
+    parts = [
+        "function escapeHtml(value) { return String(value); }",
+        # 喵~注意：iconUrl 会读 state.token 拼查询串，这里给个最小桩喵
+        # 用 var 声明，测试脚本自己再写一个 state 时也不会撞车喵
+        'var state = globalThis.state || { token: "test-token", tzOffsetMinutes: 480, clockOffsetMs: 0 };',
+    ]
     for name in PURE_CONSTANTS:
         parts.append(extract_constant(source, name))
     for name in PURE_FUNCTIONS:
@@ -535,7 +559,10 @@ function formatDuration(seconds) { return `${seconds} 秒`; }
 // 桩：就绪标记不参与排行断言喵
 function markShotReady() {}
 // 桩：全局状态与元素喵
-const state = { rankings: [], rankingScope: "all", rankingGroups: [] };
+// 喵~注意：harness 已经声明了 var state，这里直接改它的字段而不是重新声明喵
+state.rankings = [];
+state.rankingScope = "all";
+state.rankingGroups = [];
 const el = { rankingBody: { innerHTML: "" }, rankingSummary: { textContent: "" } };
 const entry = (app, seconds) => ({ app, package: `${app}.exe`, seconds, device_count: 1, devices: ["本机 Windows"] });
 // 总排行：扁平列表，没有分组小节喵
@@ -608,6 +635,327 @@ console.log(JSON.stringify(rows));
     assert qq["devices"] == ["本机 Windows", "手机"]
     # 每台设备各自的秒数要能取到，条形才能切段喵
     assert qq["deviceSeconds"] == [["本机 Windows", 90], ["手机", 30]]
+
+
+def test_merge_ranking_entries_keeps_icon_key() -> None:
+    """合并排行时必须带走 icon_key，否则排行榜永远只画彩色圆点喵。"""
+    output = run_in_node(
+        harness(
+            """
+// 服务端每行都会给 icon_key，合并时不能丢喵
+const entries = [
+  { app: "QQ", package: "qq.exe", seconds: 90, device_count: 1, devices: ["本机 Windows"], icon_key: "abc123" },
+  { app: "QQ", package: "com.tencent.mobileqq", seconds: 30, device_count: 1, devices: ["手机"], icon_key: "def456" },
+  { app: "cmd", package: "cmd.exe", seconds: 10, device_count: 1, devices: ["本机 Windows"] },
+];
+const rows = mergeRankingEntries(entries).map((row) => ({ app: row.app, icon_key: row.icon_key }));
+console.log(JSON.stringify(rows));
+"""
+        )
+    )
+    rows = json.loads(output)
+    by_app = {row["app"]: row["icon_key"] for row in rows}
+    # 合并后的 QQ 要保留第一次见到的那个图标键喵
+    assert by_app["QQ"] == "abc123"
+    # 喵~注意：没有图标时给空串，前端靠它退回彩色圆点喵
+    assert by_app["cmd"] == ""
+
+
+def test_ranking_row_renders_icon_when_icon_key_present() -> None:
+    """有 icon_key 时排行榜必须渲染 <img>，不能再退回圆点喵。"""
+    output = run_in_node(
+        harness(
+            """
+// 造一条带图标的排行壳喵
+const row = { app: "QQ", seconds: 90, devices: ["本机 Windows"], packages: ["qq.exe"], icon_key: "abc123" };
+const withIcon = rankingListHtml([row]);
+const noIcon = rankingListHtml([{ ...row, icon_key: "" }]);
+console.log(JSON.stringify({ withIcon, noIcon }));
+"""
+        )
+    )
+    payload = json.loads(output)
+    # 有图标键要出 <img class="app-icon"喵
+    assert 'class="app-icon"' in payload["withIcon"]
+    assert "/api/v1/icons/abc123" in payload["withIcon"]
+    # 没有图标键时退回色块喵
+    assert "app-icon" not in payload["noIcon"]
+    assert "tl-dot" in payload["noIcon"]
+
+
+def test_heatmap_helpers_cover_edge_cases() -> None:
+    """热力图的色阶与格子生成要能处理空数据、未来日期与单日喵。"""
+    output = run_in_node(
+        harness(
+            """
+// 色阶：0 秒最浅，达到峰值最深，喵
+const levels = [
+  heatmapLevel(0, 1000),
+  heatmapLevel(100, 1000),
+  heatmapLevel(300, 1000),
+  heatmapLevel(600, 1000),
+  heatmapLevel(1000, 1000),
+  heatmapLevel(500, 0),
+];
+// 格子必须是 7 的整数倍，且最后一天是周六喵
+const cells = heatmapCells(30);
+console.log(JSON.stringify({
+  levels,
+  count: cells.length,
+  weeks: cells.length % 7,
+  blanks: cells.filter((cell) => cell.blank).length,
+  hasDate: /^\\d{4}-\\d{2}-\\d{2}$/.test(cells[0].date),
+}));
+"""
+        )
+    )
+    payload = json.loads(output)
+    # 色阶必须是 0→1→2→3→4 单调加深喵
+    assert payload["levels"][:5] == [0, 1, 2, 3, 4]
+    # 喵~防御：峰值缺失时不能除零，有数据就算一级喵
+    assert payload["levels"][5] == 1
+    # 网格要铺满整周，否则行列会错位喵
+    assert payload["weeks"] == 0
+    assert payload["count"] % 7 == 0
+    # 日期格式必须是 YYYY-MM-DD喵
+    assert payload["hasDate"] is True
+
+
+def test_web_assets_register_stats_tab() -> None:
+    """统计页要真的接线：导航、面板、加载与截图标记都得在喵。"""
+    web_dir = Path(__file__).resolve().parents[1] / "app" / "web"
+    # 导航与面板喵
+    html = (web_dir / "index.html").read_text(encoding="utf-8")
+    assert 'data-tab="stats"' in html
+    assert 'id="panel-stats"' in html
+    assert 'id="heatmap-body"' in html
+    # 前端逻辑喵
+    app_js = (web_dir / "app.js").read_text(encoding="utf-8")
+    assert "/api/v1/stats/heatmap" in app_js
+    assert 'if (tab === "stats") loadStats();' in app_js
+    assert '"stats"' in app_js
+    # 喵~注意：统计页也要置就绪标记，否则截图会一直等到超时喵
+    assert 'markShotReady("stats")' in app_js
+    # 样式喵
+    css = (web_dir / "styles.css").read_text(encoding="utf-8")
+    assert ".heatmap-cell" in css
+    assert ".heatmap-cells" in css
+
+
+def test_trend_points_fill_missing_days_with_zero() -> None:
+    """折线图必须把没有记录的日子补成 0，不能跳过喵。"""
+    output = run_in_node(
+        harness(
+            """
+// 30 天里只有两天有数据，中间的空档必须补 0喵
+const points = trendPoints(
+  [{ date: "2026-11-01", seconds: 3600 }, { date: "2026-11-02", seconds: 1800 }],
+  30
+);
+console.log(JSON.stringify({
+  count: points.length,
+  zeros: points.filter((point) => point.seconds === 0).length,
+  sums: points.reduce((sum, point) => sum + point.seconds, 0),
+  last: points[points.length - 1],
+  sorted: points.every((point, index) => index === 0 || points[index - 1].date < point.date),
+}));
+"""
+        )
+    )
+    payload = json.loads(output)
+    # 点数必须恰好等于天数喵
+    assert payload["count"] == 30
+    # 只有两天有数据，其余 28 天都是 0喵
+    assert payload["zeros"] == 28
+    # 总秒数不能被补齐操作改变喵
+    assert payload["sums"] == 5400
+    # 日期必须严格递增，否则横轴会回折喵
+    assert payload["sorted"] is True
+    # 最后一天是今天喵
+    assert re.match(r"^\d{4}-\d{2}-\d{2}$", payload["last"]["date"])
+
+
+def test_trend_dates_count_and_order() -> None:
+    """日期序列长度与顺序要稳定，折线图的横轴靠它喵。"""
+    output = run_in_node(
+        harness(
+            """
+const week = trendDates(7);
+const sameDay = trendDates(1);
+const zero = trendDates(0);
+console.log(JSON.stringify({ week, sameDay, zero }));
+"""
+        )
+    )
+    payload = json.loads(output)
+    assert len(payload["week"]) == 7
+    # 严格递增喵
+    dates = payload["week"]
+    assert all(dates[index] < dates[index + 1] for index in range(len(dates) - 1))
+    # 只要一天时就是今天喵
+    assert len(payload["sameDay"]) == 1
+    assert payload["sameDay"] == [dates[-1]]
+    # 喵~防御：天数传 0 或负数时按 1 天处理，不能返回空数组喵
+    assert len(payload["zero"]) == 1
+
+
+def test_trend_tick_text_uses_hours_and_minutes() -> None:
+    """刻度文本满一小时说小时，否则说分钟喵。"""
+    output = run_in_node(
+        harness(
+            """
+console.log(JSON.stringify([
+  trendTickText(0),
+  trendTickText(1800),
+  trendTickText(3600),
+  trendTickText(5400),
+  trendTickText(7200),
+]));
+"""
+        )
+    )
+    ticks = json.loads(output)
+    assert ticks[0] == "0 分"
+    assert ticks[1] == "30 分"
+    # 整小时不带小数喵
+    assert ticks[2] == "1 小时"
+    # 半点用一位小数喵
+    assert ticks[3] == "1.5 小时"
+    assert ticks[4] == "2 小时"
+
+
+def test_web_assets_register_trend_chart() -> None:
+    """30 天折线图要真的接线喵。"""
+    web_dir = Path(__file__).resolve().parents[1] / "app" / "web"
+    # 容器喵
+    html = (web_dir / "index.html").read_text(encoding="utf-8")
+    assert 'id="trend-body"' in html
+    assert 'id="trend-summary"' in html
+    # 渲染与接线喵
+    app_js = (web_dir / "app.js").read_text(encoding="utf-8")
+    assert "function renderTrend(" in app_js
+    assert "renderTrend(payload)" in app_js
+    # 喵~注意：Y 轴是使用时长，不是次数喵
+    assert "每日使用时长" in app_js or "使用时长" in html
+    # 样式喵
+    css = (web_dir / "styles.css").read_text(encoding="utf-8")
+    assert ".trend-line" in css
+    assert ".trend-area" in css
+
+
+def test_monotone_cubic_path_never_overshoots() -> None:
+    """平滑曲线不许冲过相邻数据点，否则 0 值那段会画出负值喵。"""
+    output = run_in_node(
+        harness(
+            """
+// 关键场景：长时间为 0，突然有一天很高，再掉回 0喵
+// 普通平滑会在 0 段下方冲成负值，单调插值必须贴住基线喵
+const nodes = [
+  { x: 0, y: 200 },
+  { x: 10, y: 200 },
+  { x: 20, y: 20 },
+  { x: 30, y: 200 },
+  { x: 40, y: 200 },
+];
+const path = monotoneCubicPath(nodes);
+// 取出路径里所有 y 坐标（M/C 后面的数字对里的第二个）喵
+const numbers = path.match(/-?\\d+\\.?\\d*/g).map(Number);
+const ys = [];
+// M x,y 与 C x1,y1 x2,y2 x,y 的 y 都在奇数位喵
+for (let index = 0; index < numbers.length; index += 2) ys.push(numbers[index + 1]);
+console.log(JSON.stringify({
+  path,
+  minY: Math.min(...ys),
+  maxY: Math.max(...ys),
+  hasCurve: path.includes("C"),
+}));
+"""
+        )
+    )
+    payload = json.loads(output)
+    # 必须有曲线段喵
+    assert payload["hasCurve"] is True
+    # 喵~防御：y 坐标不能小于数据最小值 20（也就是不能冲到更高处）喵
+    assert payload["minY"] >= 20 - 0.5, f"曲线冲过头了：minY={payload['minY']}"
+    # y 坐标不能大于基线 200（也就是不能在基线下画负值）喵
+    assert payload["maxY"] <= 200 + 0.5, f"曲线越过基线了：maxY={payload['maxY']}"
+
+
+def test_monotone_cubic_path_handles_short_input() -> None:
+    """点数不足时不能崩，要有可预测的退化行为喵。"""
+    output = run_in_node(
+        harness(
+            """
+console.log(JSON.stringify({
+  empty: monotoneCubicPath([]),
+  single: monotoneCubicPath([{ x: 0, y: 10 }]),
+  two: monotoneCubicPath([{ x: 0, y: 10 }, { x: 10, y: 20 }]),
+}));
+"""
+        )
+    )
+    payload = json.loads(output)
+    # 空与单点都返回空串喵
+    assert payload["empty"] == ""
+    assert payload["single"] == ""
+    # 两点退化成直线，但必须有 M 和 L喵
+    assert payload["two"].startswith("M")
+    assert "L" in payload["two"]
+
+
+def test_monotone_cubic_path_is_smooth() -> None:
+    """相邻控制点必须共线于切线，否则曲线会有折角喵。"""
+    output = run_in_node(
+        harness(
+            """
+const path = monotoneCubicPath([
+  { x: 0, y: 100 },
+  { x: 10, y: 50 },
+  { x: 20, y: 80 },
+]);
+console.log(JSON.stringify({ path, segments: (path.match(/C/g) || []).length }));
+"""
+        )
+    )
+    payload = json.loads(output)
+    # 三个点要出两段三次贝塞尔喵
+    assert payload["segments"] == 2
+
+
+def test_trend_dates_ignore_browser_timezone() -> None:
+    """日期轴按服务端时区算，浏览器时区改了不能偏移一天喵。
+
+    喵~注意：这个用例分别在 UTC 与东八区进程时区下跑同一段 JS，
+    结果必须完全一致——不一致就说明代码偷用了浏览器本地日期喵。
+    """
+    script = """
+// 时区偏移固定成东八区，模拟服务端口径喵
+state.tzOffsetMinutes = 480;
+state.clockOffsetMs = 0;
+console.log(JSON.stringify({
+  dates: trendDates(5),
+  cells: heatmapCells(7).slice(0, 3).map((cell) => cell.date),
+}));
+"""
+    outputs = []
+    for zone in ("UTC", "Asia/Shanghai"):
+        env = dict(**__import__("os").environ)
+        env["TZ"] = zone
+        completed = subprocess.run(
+            [shutil.which("node"), "-e", harness(script)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            check=False,
+            env=env,
+        )
+        # 喵~防御：没装 node 时跳过喵
+        assert completed.returncode == 0, completed.stderr
+        outputs.append(json.loads(completed.stdout))
+    # 两个时区下的结果必须一模一样喵
+    assert outputs[0]["dates"] == outputs[1]["dates"], "浏览器时区影响了日期轴"
+    assert outputs[0]["cells"] == outputs[1]["cells"], "浏览器时区影响了热力图起始日"
 
 
 def test_merge_ranking_entries_falls_back_without_breakdown() -> None:
