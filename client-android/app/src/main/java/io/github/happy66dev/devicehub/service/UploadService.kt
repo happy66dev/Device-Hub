@@ -28,6 +28,7 @@ import io.github.happy66dev.devicehub.core.SampleCredit
 import io.github.happy66dev.devicehub.core.SampleGapCap
 import io.github.happy66dev.devicehub.core.ReportStatusText
 import io.github.happy66dev.devicehub.core.SampleInterval
+import io.github.happy66dev.devicehub.core.UsageDelta
 import io.github.happy66dev.devicehub.core.UsageDeltaCalculator
 import io.github.happy66dev.devicehub.core.AgentLog
 import io.github.happy66dev.devicehub.core.UsageStateCodec
