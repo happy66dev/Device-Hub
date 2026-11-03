@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
+import logging
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
@@ -12,12 +14,57 @@ from fastapi.testclient import TestClient
 
 from conftest import TEST_INGEST_TOKEN, make_payload
 
-from app import presence
-from app.db import to_utc_text
-from app.main import _verify_token
+from app import archive, db, presence
+from app.config import AppConfig, QQBotSection
+from app.db import to_utc_text, utc_now
+from app.main import _SecretScrubbingFilter, _scrub_secrets, _verify_token, create_app
 
 # 统一的请求头喵
 AUTH_HEADERS = {"X-Ingest-Token": TEST_INGEST_TOKEN}
+
+# 喵~注意：时间轴接口的默认时区是东八区（tz_offset_minutes=480），
+# 而测试里用 now.astimezone() 拿的是**跑测试那台机器的系统时区**。
+# 两者只要不一致，「哪天」就算错了，测试会时红时绿；
+# 就算时区一致，凌晨跑测试时 now - 8 分钟会掉到前一天，同样会飘喵。
+# 所以这里统一按接口的时区口径算日期，并且把采样时刻钉在当天的固定位置喵。
+
+# 时间轴测试用的时区偏移，与接口默认值保持一致喵
+TIMELINE_TZ_MINUTES = 480
+
+
+def _timeline_tz() -> timezone:
+    """返回时间轴接口默认使用的时区喵。"""
+    return timezone(timedelta(minutes=TIMELINE_TZ_MINUTES))
+
+
+def _timeline_now() -> datetime:
+    """返回时间轴测试用的基准时刻（UTC）喵。
+
+    喵~注意：必须是**真实的现在**，不能钉死成某个时刻。
+    因为接口会用 clamp_end 把区间右端夹到「现在」：
+    钉成今天中午的话，只要真实时间还没到中午，中午那段就在未来，
+    会被整段裁掉，offline_seconds 会变成 0，测试反而更脆喵。
+
+    这里只保证「时区口径与接口一致」和「时间留有余量」两件事：
+    凌晨（本地 0 点刚过）时，往回 9 分钟的采样会掉到前一天，
+    所以这种情况**往前**挪到前一天 23 点——总之一定落在过去，
+    clamp_end 不会把测试数据裁掉喵。
+    """
+    # 现在这一刻喵
+    moment = datetime.now(timezone.utc)
+    # 换算成接口时区看当地时间喵
+    local = moment.astimezone(_timeline_tz())
+    # 喵~防御：凌晨时往回 9 分钟的采样会掉到前一天，往前挪到前一天 23 点喵
+    if local.hour == 0:
+        # 退到前一天 23 点：既在同一天内，又稳稳落在过去喵
+        local = local.replace(hour=23, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        return local.astimezone(timezone.utc)
+    return moment
+
+
+def _timeline_date(moment: datetime) -> str:
+    """把某个 UTC 时刻换算成接口口径下的日期文本喵。"""
+    return moment.astimezone(_timeline_tz()).strftime("%Y-%m-%d")
 
 
 def test_report_requires_token(client: TestClient) -> None:
@@ -200,6 +247,34 @@ def test_healthz(client: TestClient) -> None:
     assert response.status_code == 200
     # 响应应标记 ok 喵
     assert response.json()["ok"] is True
+
+
+def test_healthz_bot_enabled_counts_qqbot_channel(app_config: AppConfig) -> None:
+    """只开官方通道时 /healthz 也必须报机器人启用，不能只看 napcat 喵。"""
+    # 喵~注意：启动日志打的是「两个通道任一启用 = 启用」，
+    # 而 /healthz 以前只看 napcat.enabled，纯官方通道部署时会报 false，
+    # 运维照着 healthz 排查就会以为机器人没起来喵
+    config = dataclasses.replace(app_config, qqbot=QQBotSection(enabled=True, app_id="id", app_secret="secret"))
+    # 起一个只跑这条配置的临时应用喵
+    with TestClient(create_app(config)) as client:
+        body = client.get("/healthz").json()
+    # 合并口径必须是启用喵
+    assert body["bot_enabled"] is True
+    # 分通道口径要如实反映「官方开、napcat 关」喵
+    assert body["napcat_enabled"] is False
+    assert body["qqbot_enabled"] is True
+
+
+def test_healthz_bot_disabled_when_both_channels_off(app_config: AppConfig) -> None:
+    """两个通道都关时才是真的没启用机器人喵。"""
+    # 默认夹具就是两个通道都关喵
+    with TestClient(create_app(app_config)) as client:
+        body = client.get("/healthz").json()
+    # 合并口径为未启用喵
+    assert body["bot_enabled"] is False
+    # 分通道也都是关喵
+    assert body["napcat_enabled"] is False
+    assert body["qqbot_enabled"] is False
 
 
 def test_devices_endpoint_requires_token(client: TestClient) -> None:
@@ -676,7 +751,8 @@ def test_device_timeline_returns_empty_day(client: TestClient) -> None:
 def test_device_timeline_keeps_overlapping_segments(client: TestClient, connection) -> None:
     """单设备视图必须保留同一时刻的多条段，不能互相覆盖喵。"""
     # 造一台设备与两条时刻相同的采样喵
-    now = datetime.now(timezone.utc)
+    # 喵~注意：用接口时区口径的基准时刻，避免系统时区不一致与采样跨天喵
+    now = _timeline_now()
     connection.execute(
         """
         INSERT INTO devices (device_id, platform, display_name, os_version, hardware_json,
@@ -693,7 +769,7 @@ def test_device_timeline_keeps_overlapping_segments(client: TestClient, connecti
         )
     connection.commit()
     # 查这台设备的时间轴喵
-    today = now.astimezone().strftime("%Y-%m-%d")
+    today = _timeline_date(now)
     body = client.get(f"/api/v1/devices/win-overlap-solo/timeline?date={today}", headers=AUTH_HEADERS).json()
     # 两个应用都要有段，谁也不该被裁掉喵
     apps = {segment["app"] for segment in body["segments"]}
@@ -705,7 +781,8 @@ def test_device_timeline_keeps_overlapping_segments(client: TestClient, connecti
 def test_timeline_total_uses_union_not_sum(client: TestClient, connection) -> None:
     """总时长要按时间轴并集算，不能把重叠时段重复计入喵。"""
     # 造两台设备，采样时间与时长完全相同喵
-    now = datetime.now(timezone.utc)
+    # 喵~注意：用接口时区口径的基准时刻，避免系统时区不一致与采样跨天喵
+    now = _timeline_now()
     for index in range(2):
         device_id = f"win-union-{index}"
         connection.execute(
@@ -722,7 +799,7 @@ def test_timeline_total_uses_union_not_sum(client: TestClient, connection) -> No
         )
     connection.commit()
     # 合并两台设备查喵
-    today = now.astimezone().strftime("%Y-%m-%d")
+    today = _timeline_date(now)
     body = client.get(
         "/api/v1/timeline?devices=win-union-0,win-union-1&date=" + today, headers=AUTH_HEADERS
     ).json()
@@ -738,7 +815,8 @@ def test_timeline_lane_segments_keep_low_priority_usage(client: TestClient, conn
     修法是让后端额外下发 lane_segments（不裁剪），应用轴用它来画喵。
     """
     # 造两台设备，应用不同、采样时间完全重叠喵
-    now = datetime.now(timezone.utc)
+    # 喵~注意：用接口时区口径的基准时刻，避免系统时区不一致与采样跨天喵
+    now = _timeline_now()
     apps = [("High.exe", "high.exe"), ("Low.exe", "low.exe")]
     for index, (app, package) in enumerate(apps):
         device_id = f"win-lane-pri-{index}"
@@ -756,7 +834,7 @@ def test_timeline_lane_segments_keep_low_priority_usage(client: TestClient, conn
         )
     connection.commit()
     # 高优先级设备放前面喵
-    today = now.astimezone().strftime("%Y-%m-%d")
+    today = _timeline_date(now)
     body = client.get(
         "/api/v1/timeline?devices=win-lane-pri-0,win-lane-pri-1&date=" + today,
         headers=AUTH_HEADERS,
@@ -772,7 +850,8 @@ def test_timeline_lane_segments_keep_low_priority_usage(client: TestClient, conn
 def test_device_timeline_separates_offline_and_afk(client: TestClient, connection) -> None:
     """时间轴要能区分离线（没心跳）与空档（在线但 AFK）喵。"""
     # 造三条心跳：9 分钟前、8 分钟前（AFK）、刚刚（AFK），中间留一段心跳空窗喵
-    now = datetime.now(timezone.utc)
+    # 喵~注意：用接口时区口径的基准时刻，避免系统时区不一致与采样跨天喵
+    now = _timeline_now()
     beats = [
         (now - timedelta(minutes=9), False),
         (now - timedelta(minutes=8), True),
@@ -809,7 +888,7 @@ def test_device_timeline_separates_offline_and_afk(client: TestClient, connectio
     )
     connection.commit()
     # 查今天的时间轴喵
-    today = now.astimezone().strftime("%Y-%m-%d")
+    today = _timeline_date(now)
     response = client.get(
         f"/api/v1/devices/win-presence-0001/timeline?date={today}", headers=AUTH_HEADERS
     )
@@ -831,7 +910,8 @@ def test_device_timeline_separates_offline_and_afk(client: TestClient, connectio
 def test_timeline_segments_carry_device_name(client: TestClient, connection) -> None:
     """多设备合并时，每段要带设备名，泳道才能标出来喵。"""
     # 两台设备各写一条使用记录喵
-    now = datetime.now(timezone.utc)
+    # 喵~注意：用接口时区口径的基准时刻，避免系统时区不一致与采样跨天喵
+    now = _timeline_now()
     for index, name in enumerate(("书房主机", "客厅主机")):
         connection.execute(
             """
@@ -854,7 +934,7 @@ def test_timeline_segments_carry_device_name(client: TestClient, connection) -> 
         )
     connection.commit()
     # 合并两台设备查时间轴喵
-    today = now.astimezone().strftime("%Y-%m-%d")
+    today = _timeline_date(now)
     body = client.get(
         f"/api/v1/timeline?devices=win-seg-name-0,win-seg-name-1&date={today}", headers=AUTH_HEADERS
     ).json()
@@ -866,7 +946,8 @@ def test_timeline_segments_carry_device_name(client: TestClient, connection) -> 
 def test_timeline_returns_title_spans(client: TestClient, connection) -> None:
     """同应用不同窗口标题要压成区间下发，指针悬浮时才能显示标题喵。"""
     # 造两台设备与几条窗口采样喵
-    now = datetime.now(timezone.utc)
+    # 喵~注意：用接口时区口径的基准时刻，避免系统时区不一致与采样跨天喵
+    now = _timeline_now()
     connection.execute(
         """
         INSERT INTO devices (device_id, platform, display_name, os_version, hardware_json,
@@ -888,7 +969,7 @@ def test_timeline_returns_title_spans(client: TestClient, connection) -> None:
     )
     connection.commit()
     # 查今天的时间轴喵
-    today = now.astimezone().strftime("%Y-%m-%d")
+    today = _timeline_date(now)
     body = client.get(f"/api/v1/devices/win-title-0001/timeline?date={today}", headers=AUTH_HEADERS).json()
     # 两段标题都要在，且按时间从早到晚排序喵
     titles = [span["title"] for span in body["title_spans"]]
@@ -1085,6 +1166,48 @@ def test_report_stores_open_windows(client: TestClient) -> None:
     assert fetched.status_code == 200
     # 没传图标的那个应用仍然给空串喵
     assert body["windows"][1]["icon_key"] == ""
+
+
+def test_windows_endpoint_falls_back_to_archive(client: TestClient, app_config: AppConfig) -> None:
+    """窗口数据被归档后，窗口接口要能从归档块里读回来喵。
+
+    喵~注意：这是真实缺陷。`window_samples` 过完热保留期会被压成月块、
+    并从原表删掉，于是 `MAX(reported_at)` 变成 NULL，
+    窗口接口回一个空列表——看起来像「这台设备的窗口数据丢了」。
+    同一时刻时间轴走 `day_title_spans`（已带回退）却还正常，
+    两个页面对同一台设备给出互相矛盾的结论喵。
+    """
+    # 造一台设备并塞一条两个月前的窗口快照喵
+    payload = make_payload(device_id="win-archive-0001")
+    payload["open_windows"] = [
+        {"app": "Code", "package": "code.exe", "title": "main.py", "minimized": False, "foreground": True},
+        {"app": "QQ", "package": "qq.exe", "title": "聊天", "minimized": False, "foreground": False},
+    ]
+    assert client.post("/api/v1/report", json=payload, headers=AUTH_HEADERS).status_code == 200
+    # 把这条窗口数据的时刻挪到 70 天前，让它进入归档范围喵
+    old_moment = to_utc_text(utc_now() - timedelta(days=70))
+    with db.connect(app_config.server.db_path) as connection:
+        connection.execute(
+            "UPDATE window_samples SET reported_at = ? WHERE device_id = ?",
+            (old_moment, "win-archive-0001"),
+        )
+        connection.commit()
+        # 归档：热保留 7 天，70 天前的整月会被压成块并删掉原行喵
+        archive.archive_cold_rows(connection, hot_days=7)
+        connection.commit()
+        # 确认原表真的被清空了，否则这个用例测不到回退喵
+        remaining = connection.execute(
+            "SELECT COUNT(*) AS c FROM window_samples WHERE device_id = ?", ("win-archive-0001",)
+        ).fetchone()["c"]
+        assert remaining == 0, "归档没生效，用例前提不成立"
+    # 现在窗口接口必须仍能读回来喵
+    body = client.get("/api/v1/devices/win-archive-0001/windows", headers=AUTH_HEADERS).json()
+    assert len(body["windows"]) == 2, f"归档后窗口列表空了：{body}"
+    # 报错时刻要回显归档里那个时刻，而不是空串喵
+    assert body["reported_at"] == old_moment
+    # 前台窗口仍排在最前喵
+    assert body["windows"][0]["app"] == "Code"
+    assert body["windows"][0]["foreground"] is True
 
 
 def test_windows_endpoint_requires_token(client: TestClient) -> None:
@@ -1297,3 +1420,48 @@ def test_rankings_groups_include_device_seconds(client: TestClient) -> None:
         for entry in group["entries"]:
             assert entry["device_seconds"], "分组条目缺 device_seconds"
             assert sum(item["seconds"] for item in entry["device_seconds"]) == entry["seconds"]
+
+def test_scrub_secrets_masks_query_tokens() -> None:
+    """访问日志里的查询串口令必须被替换成掩码喵。
+
+    喵~注意：主人常直接拿带 ?token=... 的链接在浏览器里打开看板，
+    uvicorn 会把整条 URL 写进日志文件，口令就长期留在磁盘上喵。
+    """
+    # 常规的 token 参数喵
+    assert _scrub_secrets("/api/v1/devices?token=abc123") == "/api/v1/devices?token=***"
+    # 多个参数时只换敏感那个，其它原样保留喵
+    assert _scrub_secrets("/x?a=1&token=s3cret&b=2") == "/x?a=1&token=***&b=2"
+    # 大小写不敏感喵
+    assert _scrub_secrets("/x?TOKEN=abc") == "/x?TOKEN=***"
+    # 其它敏感键也要脱敏喵
+    assert _scrub_secrets("/x?ingest_token=abc") == "/x?ingest_token=***"
+    assert _scrub_secrets("/x?password=hunter2") == "/x?password=***"
+    # 没有敏感键时一个字都不能改喵
+    assert _scrub_secrets("/x?a=1&b=2") == "/x?a=1&b=2"
+    # 完全不含等号的文本原样返回喵
+    assert _scrub_secrets("GET /api/v1/devices HTTP/1.1") == "GET /api/v1/devices HTTP/1.1"
+
+
+def test_secret_filter_rewrites_log_record() -> None:
+    """过滤器要真的改写最终日志文本，而不只是能脱敏字符串喵。
+
+    喵~注意：只测 `_scrub_secrets` 是不够的——过滤器如果忘了清空 `record.args`，
+    后续格式化会把原始参数再拼一次，口令照样落盘喵。
+    """
+    # 造一条带口令的记录喵
+    record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="%s - GET /api/v1/devices?token=%s HTTP/1.1",
+        args=("127.0.0.1", "topsecret"),
+        exc_info=None,
+    )
+    # 跑一遍过滤器喵
+    assert _SecretScrubbingFilter().filter(record) is True
+    # 最终文本里不能再有原始口令喵
+    assert "topsecret" not in record.getMessage()
+    assert "token=***" in record.getMessage()
+    # 参数必须被清空，否则会被二次格式化喵
+    assert record.args == ()

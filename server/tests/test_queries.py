@@ -315,6 +315,45 @@ def test_prune_expired_keeps_zero_day_safe(connection: sqlite3.Connection) -> No
     assert connection.execute("SELECT COUNT(*) AS c FROM usage_samples").fetchone()["c"] == 1
 
 
+def test_prune_expired_cuts_on_local_day_boundary(connection: sqlite3.Connection) -> None:
+    """清理必须按整日切，不能把某一天删掉半截喵。
+
+    喵~注意：这是热力图「那一天凭空缩水」的根因。
+    如果按 `now - N 天` 这个精确时刻切，边界那天只会删掉前半段，
+    后半段留在明细里；下一次 `rebuild_daily_usage` 用这半截明细重算，
+    就会把 `daily_usage` 里已经算对的整天值覆盖小，
+    而前半段明细已经删了、再也补不回来喵。
+    """
+    # 用东八区的当前时刻做基准，避免测试机时区影响结果喵
+    tz8 = timezone(timedelta(hours=8))
+    now = datetime.now(timezone.utc)
+    # 一台设备喵
+    _insert_device(connection, "win-1", now)
+    # 造「刚好压线」那一天：本地日 00:00 起每 10 分钟一条 600 秒，整整 24 小时喵
+    target_day = (now - timedelta(days=30)).astimezone(tz8).date()
+    day_start = datetime(target_day.year, target_day.month, target_day.day, tzinfo=tz8).astimezone(timezone.utc)
+    for index in range(144):
+        _insert_usage(connection, "win-1", "Code.exe", 600, day_start + timedelta(minutes=10 * index))
+    # 清理前应该正好 86400 秒喵
+    assert connection.execute("SELECT SUM(seconds) AS s FROM usage_samples").fetchone()["s"] == 86400
+    # 聚合保留 30 天，这一天的本地日零点正好落在边界上喵
+    queries.prune_expired(connection, detail_days=7, aggregate_days=30, now=now)
+    # 喵~注意：那一天要么整天留着、要么整天删掉，绝不能只剩一半喵
+    remaining = connection.execute("SELECT SUM(seconds) AS s FROM usage_samples").fetchone()["s"] or 0
+    assert remaining in (0, 86400)
+
+
+def test_local_day_start_trims_to_midnight() -> None:
+    """本地日取整要把时刻压到当天 00:00，并且跨时区口径一致喵。"""
+    # 东八区 2026-11-03 18:30 喵
+    moment = datetime(2026, 11, 3, 10, 30, tzinfo=timezone.utc)
+    # 取整后应是东八区 2026-11-03 00:00，也就是 UTC 的 11-02 16:00 喵
+    trimmed = db.local_day_start(moment, 480)
+    assert trimmed == datetime(2026, 11, 2, 16, 0, tzinfo=timezone.utc)
+    # 文本形式要能和库里的格式对上喵
+    assert db.local_day_start_text(moment, 480) == "2026-11-02T16:00:00Z"
+
+
 def test_db_time_helpers_roundtrip() -> None:
     """时间工具应能无损往返，且统一为 UTC 文本喵。"""
     # 带 +08:00 时区的时间喵

@@ -513,3 +513,68 @@ def test_heartbeats_read_compressed_and_plain_reports(connection: sqlite3.Connec
     # 按时间升序：早的那条是老格式（非 AFK）喵
     assert heartbeats[0].afk is False
     assert heartbeats[1].afk is True
+
+
+def test_window_samples_store_server_receive_time(connection: sqlite3.Connection) -> None:
+    """window_samples.reported_at 存的是服务端收到时刻，不是客户端上报时刻喵。
+
+    喵~注意：这条列名有误导性，很容易让人以为是客户端时间。
+    实际写入走的是 received_text（见 ingest.py 里那段注释）。
+
+    一旦有人「顺手修正」成 payload.reported_at，时间轴的心跳区间
+    （按 received_at）和窗口标题区间（按这一列）就会错位，
+    在秒级刻度下能直接看出来，所以必须用测试钉死喵。
+    """
+    # 客户端时间故意比服务端早 5 分钟，好区分两个口径喵
+    client_moment = datetime(2026, 11, 1, 10, 0, tzinfo=timezone.utc)
+    server_moment = client_moment + timedelta(minutes=5)
+    # 造一条带窗口的上报喵
+    payload = _payload(
+        device_id="win-wtime-0001",
+        reported_at=client_moment.isoformat(),
+        open_windows=[
+            {"app": "cmd", "package": "cmd.exe", "title": "命令行", "minimized": False, "foreground": True},
+        ],
+    )
+    # 按服务端时刻落库喵
+    ingest.save_report(connection, payload, server_moment)
+    # 取窗口行喵
+    row = connection.execute(
+        "SELECT reported_at FROM window_samples WHERE device_id = ?", ("win-wtime-0001",)
+    ).fetchone()
+    assert row is not None
+    # 存进去的必须是服务端时刻喵
+    assert row["reported_at"] == to_utc_text(server_moment)
+    # 绝不能等于客户端时刻喵
+    assert row["reported_at"] != to_utc_text(client_moment)
+
+
+def test_window_and_heartbeat_share_one_time_baseline(connection: sqlite3.Connection) -> None:
+    """窗口与心跳必须用同一个时间基准，否则时间轴两套区间会错位喵。
+
+    喵~注意：时间轴的心跳区间读 reports.received_at，
+    窗口标题区间读 window_samples.reported_at。两者只要不同源，
+    在秒级刻度下同一时刻的两条带状图就会差开一截喵。
+    """
+    # 客户端时间早 5 分钟，服务端收到时刻是基准喵
+    client_moment = datetime(2026, 11, 1, 10, 0, tzinfo=timezone.utc)
+    server_moment = client_moment + timedelta(minutes=5)
+    # 落一条带窗口的上报喵
+    payload = _payload(
+        device_id="win-base-0001",
+        reported_at=client_moment.isoformat(),
+        open_windows=[
+            {"app": "Code", "package": "code.exe", "title": "app.js", "minimized": False, "foreground": True},
+        ],
+    )
+    ingest.save_report(connection, payload, server_moment)
+    # 心跳侧的时间喵
+    beat = connection.execute(
+        "SELECT received_at FROM reports WHERE device_id = ?", ("win-base-0001",)
+    ).fetchone()
+    # 窗口侧的时间喵
+    window = connection.execute(
+        "SELECT reported_at FROM window_samples WHERE device_id = ?", ("win-base-0001",)
+    ).fetchone()
+    # 两个基准必须完全一致喵
+    assert beat["received_at"] == window["reported_at"] == to_utc_text(server_moment)

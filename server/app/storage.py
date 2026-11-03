@@ -6,18 +6,38 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
-from datetime import timedelta, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import archive, db, queries
 from .db import to_utc_text, utc_now
 
+# 模块日志喵
+LOGGER = logging.getLogger(__name__)
+
+# 生成每日使用时长汇总时用的时区偏移喵
+# 喵~注意：和接口默认值保持一致，否则汇总表里的日期和看板请求的日期会错开一天喵
+DAILY_USAGE_TZ_MINUTES = 480
+
+# 需要「先归档、再删」的两张明细表喵
+#
+# 喵~注意：这两张表不进「按天数硬删」的路径，而是交给归档压缩。
+# 硬删 = 用户点一下清理就永久丢数据，归档还没来得及压，不可恢复喵
+_ARCHIVABLE_TABLES: frozenset[str] = frozenset({"reports", "window_samples"})
+
 # 允许清理的表，以及各自的时间列喵
+#
+# 喵~注意：`reports` 有两列时间（reported_at 客户端、received_at 服务端），
+# 归档和查询都按 `received_at` 切分，清理必须跟着用同一列，
+# 否则两边口径不一致，客户端时钟一偏就会删掉不该删的行喵
 CLEANABLE_TABLES: dict[str, str] = {
     "usage_samples": "sampled_at",
     "battery_samples": "sampled_at",
     "window_samples": "reported_at",
-    "reports": "reported_at",
+    "reports": "received_at",
 }
 
 # 清理天数下限，避免误操作把当天的数据删了喵
@@ -115,29 +135,141 @@ def parse_cleanup_request(raw: object) -> tuple[int, tuple[str, ...]]:
     return before_days, tuple(targets)
 
 
-def cleanup(connection: sqlite3.Connection, before_days: int, targets: tuple[str, ...]) -> dict[str, int]:
-    """删除早于 N 天的历史数据喵。
+def cleanup(
+    connection: sqlite3.Connection,
+    before_days: int,
+    targets: tuple[str, ...],
+) -> dict[str, int]:
+    """删除早于 N 天的历史数据，能归档的先归档再删喵。
 
     输入：连接、保留天数、目标表。
     输出：各表删除行数。
-    边界：只删时间列早于阈值的行，绝不动最近的数据喵。
+    边界：只处理时间列早于阈值的行，绝不动最近的数据喵。
+
+    喵~注意：这里**不是**简单 DELETE。`reports` 和 `window_samples` 会先压进
+    归档块，再删已归档的行——和自动维护走同一套语义。
+    以前这里是硬删，用户点一下设置页的清理就把明细永久丢了（归档还没来得及压），
+    时间轴的历史跟着消失，而且不可恢复喵。
+
+    `usage_samples` 删之前会先固化进 `daily_usage` 日汇总，
+    保证统计页的一年视图不会因为清理而出现空洞喵。
+
+    喵~注意：明细表的删除范围由**归档**决定（只压整月已过完的月份），
+    不是按 before_days 精确切。这是刻意的——归档必须按整月分块，
+    否则同一个月会被切成好几段，块内的数据也不连续喵。
+
+    喵~注意：聚合表的截止时刻对齐到本地日零点，理由同 `queries.prune_expired`。
+    不对齐的话，边界那天只会删掉前半段明细，而那天已经按整天
+    算进 `daily_usage` 了，下次重算就会用半截明细把真值改小喵。
     """
-    # 计算阈值喵
-    threshold = to_utc_text(utc_now() - timedelta(days=before_days))
-    # 逐表删除喵
+    # 计算阈值，对齐到本地日零点喵
+    base_moment = utc_now()
+    threshold = db.local_day_start_text(
+        base_moment - timedelta(days=before_days), DAILY_USAGE_TZ_MINUTES
+    )
+    # 结果字典喵
     deleted: dict[str, int] = {}
+    # 归档前后各表行数，用来精确统计「这张表被删了多少」喵
+    # 喵~注意：归档一次会把两张明细表一起处理，所以必须在**归档之前**
+    # 把两张表的行数都记下来，事后再各算差值，否则后处理的那张表
+    # 会显示 0 行（它的数据已经在上一张表触发归档时被删掉了）喵
+    archivable_in_targets = [t for t in targets if t in _ARCHIVABLE_TABLES]
+    rows_before: dict[str, int] = {}
+    for table in archivable_in_targets:
+        rows_before[table] = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    # 喵~注意：归档的 hot_days 必须用用户选的天数，不能写死 0喵。
+    # 写死的话「保留 365 天」也会把上个月压掉，清理的保留期参数就成了摆设喵
+    # 喵~注意：还要把 `targets` 传下去。归档默认两张明细表一起处理，
+    # 不看 targets 的话「只勾了原始上报」会连窗口快照一起清掉，
+    # 用户没勾的表被删了，而接口返回的 deleted 里又没有它，等于静默丢数据喵
+    if archivable_in_targets and any(rows_before.values()):
+        archive.archive_cold_rows(
+            connection, hot_days=before_days, now=None, tables=archivable_in_targets
+        )
+    # 时间列按清理阈值切喵
     for table in targets:
         time_column = CLEANABLE_TABLES[table]
+        # 喵~注意：明细表的删除已经由归档完成了，这里只核算行数喵
+        if table in _ARCHIVABLE_TABLES:
+            after = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            deleted[table] = max(0, rows_before.get(table, after) - after)
+            continue
+        # 聚合表直接按天数删，但使用时长要先固化汇总喵
+        if table == "usage_samples":
+            _backfill_daily_usage(connection, threshold, time_column)
+        # 执行删除喵
         cursor = connection.execute(
             f"DELETE FROM {table} WHERE {time_column} < ?", (threshold,)
         )
         deleted[table] = int(cursor.rowcount if cursor.rowcount > 0 else 0)
     # 删完提交喵
     connection.commit()
-    # 顺手把空页回收，文件才会真的变小喵
-    connection.execute("VACUUM")
-    connection.commit()
+    # 喵~注意：VACUUM 不能在事务里跑，必须在 commit 之后喵
+    # 喵~防御：VACUUM 撞上并发写入会抛 `database is locked`。
+    # 这时候数据**已经删完并提交了**，再把异常抛给调用方，
+    # 用户看到的就是「清理失败」——但数据其实早没了，谁也说不清到底成没成。
+    # 所以这里只把「没回收成磁盘」当降级处理，绝不假装整体失败喵
+    _vacuum_quietly(connection)
     return deleted
+
+
+def _vacuum_quietly(connection: sqlite3.Connection) -> None:
+    """尽力回收磁盘空间，失败时只记日志、不抛异常喵。
+
+    输入：数据库连接。
+    输出：无。
+    边界：只吞 `sqlite3.OperationalError`（锁/忙），其它异常照旧往外抛喵。
+    """
+    # 喵~注意：VACUUM 在「有别的连接正在写」时必然失败，重试几次能覆盖
+    # 维护和上报恰好撞车的那一小段时间喵
+    for attempt in range(3):
+        try:
+            connection.execute("VACUUM")
+            connection.commit()
+            return
+        except sqlite3.OperationalError as error:
+            # 还在忙就退一步再试，不要立刻放弃喵
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            # 喵~注意：这里不能抛，删除已经提交了，抛出去会让用户误判喵
+            LOGGER.info("暂时无法回收磁盘空间（有写入正在进行）：%s", error)
+
+
+def _backfill_daily_usage(connection: sqlite3.Connection, threshold: str, time_column: str) -> None:
+    """删使用时长之前，先把它固化进每日汇总表喵。
+
+    输入：连接、阈值文本、时间列名。
+    输出：无。
+    边界：没有任何明细时直接返回，不会白建表喵。
+
+    喵~注意：回溯天数必须按**库里最老的那条明细**算，不能按阈值算。
+    按阈值算的话，即将被删的那些（比阈值还老）正好落在窗口外，
+    汇总永远是空的——这正是第一版写错的地方喵。
+    """
+    # 取库里最老那条的时间喵
+    row = connection.execute(f"SELECT MIN({time_column}) FROM usage_samples").fetchone()
+    oldest = row[0] if row else None
+    # 喵~防御：没有明细就不用汇总喵
+    if not oldest:
+        return
+    # 从最老那条到今天的天数，多留 7 天余量喵
+    window_days = _days_since(str(oldest)) + 7
+    queries.rebuild_daily_usage(
+        connection, tz_offset_minutes=DAILY_USAGE_TZ_MINUTES, days=window_days
+    )
+
+
+def _days_since(threshold: str) -> int:
+    """算阈值文本距今有多少天，算不出来时给个保守值喵。"""
+    # 解析阈值喵
+    try:
+        moment = datetime.strptime(threshold, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        # 喵~防御：格式对不上就按一年算，宁可多算喵
+        return 365
+    # 差值天数喵
+    return max(1, int((utc_now() - moment).total_seconds() // 86400))
 
 
 def format_bytes(value: int) -> str:

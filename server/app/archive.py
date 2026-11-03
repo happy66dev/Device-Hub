@@ -37,12 +37,6 @@ class ArchiveResult:
     bytes_written: int
 
 
-def _month_of(moment_text: str) -> str:
-    """从 UTC 时间文本里截出月份，形如 2026-11喵。"""
-    # 前 7 个字符就是年月喵
-    return moment_text[:7]
-
-
 def _month_bounds(month: str) -> tuple[str, str]:
     """给一个月份算出它的起止 UTC 文本，供分页查询用喵。"""
     # 解析年月喵
@@ -234,10 +228,12 @@ def archive_cold_rows(
     hot_days: int = DEFAULT_HOT_DAYS,
     now: datetime | None = None,
     batch_months: int | None = None,
+    tables: Iterable[str] | None = None,
 ) -> ArchiveResult:
     """把已经过完的整月数据压成月块，返回归档摘要喵。
 
-    输入：连接、热保留天数（下限）、基准时刻、可选的单次处理批数（测试用）。
+    输入：连接、热保留天数（下限）、基准时刻、可选的单次处理批数（测试用）、
+          可选的目标表集合（None 表示两张明细表都处理）。
     输出：ArchiveResult。
     边界：只归档「上个月及更早」的完整月份，当月永不归档；
           同一月份只会被写一次，重复跑不会重复计数也不会覆盖丢数据喵。
@@ -245,6 +241,10 @@ def archive_cold_rows(
     喵~注意：归档范围用「now - hot_days」算截止日期，再要求**整月**都过完。
     不能用「本月 1 号 - hot_days」——那样截止日期在整个月内固定不动，
     上个月的最后几天永远迈不过门槛，那个月就永远归档不了喵。
+
+    喵~注意：`tables` 是给手动清理用的。清理接口允许用户只勾选某几张表，
+    但归档默认一次处理两张明细表，不看 `tables` 的话
+    「只勾了原始上报」会连窗口快照一起清掉——用户没选的东西被删了喵。
     """
     # 喵~防御：热窗口太短会让刚写入的数据立刻被归档，下限给 1 天喵
     safe_hot_days = max(1, int(hot_days))
@@ -258,7 +258,12 @@ def archive_cold_rows(
     blocks = 0
     archived_rows = 0
     bytes_written = 0
+    # 需要处理的目标表集合，None 表示全部喵
+    wanted = None if tables is None else {str(item) for item in tables}
     # 逐张表处理喵
+    # 喵~注意：两张表的列名不一样，但存的都是**服务端收到时刻**喵。
+    # reports 用 received_at，window_samples 的 reported_at 也是服务端时间
+    # （见 db.py 里的表注释），所以按它们切月口径是一致的，不会错位喵。
     for table, column, kind, fetcher, encoder in (
         ("reports", "received_at", archive_codec.KIND_HEARTBEATS, _fetch_heartbeats, archive_codec.encode_heartbeats),
         (
@@ -269,6 +274,9 @@ def archive_cold_rows(
             archive_codec.encode_windows,
         ),
     ):
+        # 喵~防御：调用方只要了其中一张表时，另一张一行都不要碰喵
+        if wanted is not None and table not in wanted:
+            continue
         # 找出这张表里「整月都过完」的 (设备, 月份)喵
         targets = _list_months(connection, table, column, cutoff_date)
         # 测试时只处理前几批，方便构造断言喵

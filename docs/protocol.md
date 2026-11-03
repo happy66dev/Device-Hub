@@ -317,7 +317,7 @@ android:  and-<型号小写去空格>-<4 位十六进制随机>
   "idle_seconds": 3600,
   "afk_seconds": 3600,
   "offline_seconds": 17400,
-  "heartbeat_timeout_seconds": 180,
+  "heartbeat_timeout_seconds": 60,
   "server_now": "2026-10-30T05:12:34.567Z",
   "clock": { "source": "ntp:ntp.aliyun.com", "offset_seconds": 0.014, "synced": true },
   "states": [

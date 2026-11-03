@@ -46,7 +46,7 @@ from .config import (
 from .device_id import ensure_device_id
 from .icons import IconUploader
 from .reporter import Reporter
-from .usage import UsageTracker, to_delta_list
+from .usage import PendingBatch, UsageTracker, to_delta_list
 from .usage_store import UsageStore, default_state_path
 
 # 模块日志器喵
@@ -227,15 +227,41 @@ def resolve_config(arguments: argparse.Namespace) -> tuple[AgentConfig, Path]:
     return config, config_path
 
 
-def compute_sample_gap(now_monotonic: float, last_sample_at: float, recovering: bool) -> float:
+def sample_gap_cap(sample_interval: float) -> float:
+    """算单轮最多能计入多少秒喵。
+
+    输入：当前配置的采样间隔（秒）。
+    输出：单轮计入上限。
+
+    喵~注意：这个上限原来写死 15 秒，和采样间隔完全脱钩。
+    默认 5 秒时没事，但 `config.py` 允许把采样间隔调到 60 秒——
+    那时每轮真实过去 60 秒，却只记 15 秒，**稳定丢掉 75% 的使用时长**，
+    而且丢得悄无声息，日志里一点异常都没有喵。
+
+    现在改成「至少 15 秒，并且足够覆盖两个采样周期」：
+    正常节奏（一个周期）能完整记上，偶发慢一轮也能补回来，
+    而进程被挂起几小时这种情况仍然会被这个上限挡住，不会凭空记上几个小时喵。
+    """
+    # 至少保留 15 秒的固定下限，避免间隔很小时上限过紧喵
+    return max(MAX_SAMPLE_GAP_SECONDS, max(1.0, float(sample_interval)) * 2.0)
+
+
+def compute_sample_gap(
+    now_monotonic: float,
+    last_sample_at: float,
+    recovering: bool,
+    cap: float | None = None,
+) -> float:
     """算这一轮要计入的秒数喵。
 
-    输入：当前单调时刻、上一次真正计入的时刻、上一轮是不是抓不到前台。
+    输入：当前单调时刻、上一次真正计入的时刻、上一轮是不是抓不到前台、
+          可选的上限（缺省用固定常量，兼容老调用方）。
     输出：要计入的秒数，负数按 0 处理。
     边界：抓不到前台时允许补记得更长，但同样有上限，避免把长时间挂机算进去喵。
     """
     # 喵~注意：上一轮抓不到前台时放宽上限，把那段没记的秒数一起补回来喵
-    gap_cap = MAX_RECOVER_SECONDS if recovering else MAX_SAMPLE_GAP_SECONDS
+    base_cap = MAX_SAMPLE_GAP_SECONDS if cap is None else max(0.0, float(cap))
+    gap_cap = max(base_cap, MAX_RECOVER_SECONDS) if recovering else base_cap
     # 夹到 [0, 上限] 之间喵
     return min(max(0.0, now_monotonic - last_sample_at), gap_cap)
 
@@ -273,12 +299,17 @@ def should_rescan_windows(now_monotonic: float, last_scan_at: float) -> bool:
     return (now_monotonic - last_scan_at) >= WINDOW_SCAN_SECONDS
 
 
-def compute_afk_tail(afk_since: datetime | None, last_counted_at: datetime | None) -> float:
+def compute_afk_tail(
+    afk_since: datetime | None,
+    last_counted_at: datetime | None,
+    cap: float | None = None,
+) -> float:
     """算出离开前还要补给上一个应用的秒数喵。
 
-    输入：停表时刻、上一轮记到的那一秒的时刻。
+    输入：停表时刻、上一轮记到的那一秒的时刻、可选的上限。
     输出：需要补记的秒数，0 表示不用补。
-    边界：任一时刻缺失或顺序颠倒时返回 0，上限是 MAX_SAMPLE_GAP_SECONDS 喵。
+    边界：任一时刻缺失或顺序颠倒时返回 0；上限缺省用固定常量，
+          调用方应传 `sample_gap_cap(采样间隔)`，否则采样间隔调大后会丢数据喵。
     """
     # 喵~防御：两个时刻缺一个就没法量差值喵
     if afk_since is None or last_counted_at is None:
@@ -286,7 +317,7 @@ def compute_afk_tail(afk_since: datetime | None, last_counted_at: datetime | Non
     # 停表时刻之前的秒数都算在用喵
     tail = (afk_since - last_counted_at).total_seconds()
     # 喵~防御：补记也设上限，避免把长时间空窗一次算进去喵
-    return min(max(0.0, tail), MAX_SAMPLE_GAP_SECONDS)
+    return min(max(0.0, tail), MAX_SAMPLE_GAP_SECONDS if cap is None else max(0.0, float(cap)))
 
 
 def clamp_resumed_gap(
@@ -305,33 +336,46 @@ def clamp_resumed_gap(
     return min(sample_gap, max(0.0, (now - active_since).total_seconds()))
 
 
-def discard_stale_usage_state(store: UsageStore) -> int:
-    """丢弃上次退出时残留的待上报秒数，返回丢掉的秒数喵。
+def discard_stale_usage_state(store: UsageStore) -> PendingBatch | None:
+    """处理上次退出时残留的待上报数据，返回可以原样重发的批次喵。
 
     输入：状态存储器。
-    输出：被丢弃的总秒数（没有残留时返回 0）。
+    输出：带固定 `reported_at` 的 `PendingBatch`（可以直接重发）；
+          没有残留、或残留是旧格式无法保证幂等时返回 None。
 
-    喵~注意：为什么不再恢复它——这份数据只有应用名和秒数、没有时间戳，
-    重启后无法知道它们发生在哪段时间里。服务端只能把它们铺在"上一次铺到的
-    位置"之后；一旦进程被强杀且中断较久，这堆秒数就会盖到离线时段上，
-    让离线期显示出使用色块，而主人要求「离线数据必须绝对真实，空档不那么
-    精确没关系」。代价很小：每次上报成功都会 clear()，所以文件里最多只有
-    约一个上报周期（默认 60 秒）的残留，丢掉它远好过让离线记录失真喵。
+    喵~注意：这里分两种情况，不能一刀切丢掉：
+    1. **新格式**（带 `reported_at`）——我们知道这批秒数属于哪个时刻，
+       服务端能靠 `(device_id, reported_at)` 认出是同一批，
+       原样重发只会加一次，**必须重发**，否则那几十秒凭空消失喵。
+    2. **旧格式**（只有应用名和秒数、没有时间戳）——重启后无法知道它们发生在
+       哪段时间里，服务端只能铺在"上一次铺到的位置"之后；进程被强杀且中断较久时，
+       这堆秒数就会盖到离线时段上，让离线期显示出使用色块。
+       主人要求「离线数据必须绝对真实」，所以这种**只能丢弃**喵。
     """
-    # 读一次旧文件，没有残留就什么都不做喵
+    # 先看是不是能安全重发的新格式喵
+    batch = store.load_batch()
+    if batch is not None:
+        LOGGER.info(
+            "恢复上次未上报的批次：%s 个应用共 %s 秒，将按原时刻重发",
+            len(batch.seconds),
+            batch.total_seconds(),
+        )
+        return batch
+    # 再读一次老格式的残留喵
     stale_seconds = store.load()
+    # 没有任何残留就什么都不做喵
     if not stale_seconds:
-        return 0
+        return None
     # 丢掉的总秒数，日志要用喵
     total = sum(int(value) for value in stale_seconds.values())
     LOGGER.info(
-        "丢弃上次未上报的残留时长：%s 个应用共 %s 秒（无时间戳，不再补报）",
+        "丢弃上次未上报的残留时长：%s 个应用共 %s 秒（旧格式无时间戳，不再补报）",
         len(stale_seconds),
         total,
     )
     # 清掉文件，避免下次启动又读到同一份陈旧数据喵
     store.clear()
-    return total
+    return None
 
 
 def _report_once(
@@ -352,16 +396,36 @@ def _report_once(
     rdp_target: str = "",
     rdp_client_ip: str = "",
     rdp_client_name: str = "",
-) -> bool:
-    """执行一次上报，失败时把数据还回累加器喵。
+    pending_batch: PendingBatch | None = None,
+) -> tuple[bool, PendingBatch | None]:
+    """执行一次上报，失败时把这一批冻结下来等重发喵。
 
     输入：上报器、累加器、硬件信息、当前应用、状态存储器、RDP 状态、投屏窗口、
-          AFK 标记与两个精确边界时刻。
-    输出：是否成功。
+          AFK 标记与两个精确边界时刻、上次失败留下的待重发批次。
+    输出：(是否成功, 需要继续重发的批次或 None)。
+
+    喵~注意：这里**不能**再按老办法「失败就把秒数并回累加器」了。
+    服务端用 `(device_id, reported_at)` 做幂等键，同一键重复上报只更新设备状态、
+    不会重复累加秒数；而并回累加器会让下一批变成「旧+新」的超集并重新取当前时刻，
+    服务端当成全新批次又加一遍，使用时长**永久翻倍**喵。
+    现在改成：失败就冻结这一批（秒数 + 首次的 reported_at），下一轮原样重发；
+    成功后清掉，再去动累加器里新攒的数据喵。
     """
-    # 取出待上报数据并清空累加器喵
-    pending_seconds = tracker.drain()
-    # 喵~注意：从 drain 到 restore 之间任何异常都不能把数据带走，统一在下面兜底喵
+    # 喵~注意：有上次没发出去的批次时优先重发它，这一轮不碰累加器喵
+    if pending_batch is not None and not pending_batch.is_empty():
+        # 这一批的秒数与固定时刻喵
+        pending_seconds = pending_batch.seconds
+        batch_reported_at = pending_batch.reported_at
+        # 喵~注意：重发期间累加器里的新数据原地留着，等这一批成功后再发喵
+        fresh_seconds: dict[str, int] = {}
+    else:
+        # 正常路径：取走当前攒下的数据并清空累加器喵
+        pending_seconds = tracker.drain()
+        # 这一批的身份在这一刻定下来，之后重试都不再变喵
+        batch_reported_at = datetime.now(timezone.utc).isoformat()
+        # 没有待重发批次，就没有额外的新数据要留喵
+        fresh_seconds = {}
+    # 喵~注意：从取数据到重放之间任何异常都不能把数据带走，统一在下面兜底喵
     try:
         # 转成协议数组喵
         usage_deltas = to_delta_list(pending_seconds)
@@ -389,32 +453,36 @@ def _report_once(
             rdp_target=rdp_target,
             rdp_client_ip=rdp_client_ip,
             rdp_client_name=rdp_client_name,
+            # 喵~注意：把这一批的身份一起传下去，重试时服务端才能认出是同一批喵
+            reported_at=batch_reported_at,
         )
         # 发送喵
         succeeded, message = reporter.send(payload)
     except Exception as error:  # 喵~防御：组装或发送炸了也不能丢这一批数据喵
         usage_deltas = []
         succeeded, message = False, f"上报过程异常：{error}"
-    # 喵~防御：失败时把数据还回去，等下一次一起发，避免丢数据喵
+    # 喵~防御：失败时把这一批冻结下来，等下一轮原样重发喵
     if not succeeded:
-        tracker.restore(pending_seconds)
-        # 喵~防御：还回去之后立刻落盘，防止这期间进程被杀又丢一次喵
+        # 喵~注意：这里**绝不**把秒数并回累加器。并回去会让下一批变成超集，
+        # 服务端就认不出是同一批，秒数会被再加一遍喵
+        retry_batch = PendingBatch(pending_seconds, batch_reported_at)
+        # 喵~防御：落盘时把秒数和它固定的身份一起存，重启后也能原样重发喵
         if store is not None:
-            store.save(tracker.snapshot())
+            store.save_batch(retry_batch)
         # 把缓存了多少说清楚，主人看日志就知道有没有欠账喵
         LOGGER.warning(
-            "上报失败，已缓存 %s 秒（%s 个应用）等下次一起补报：%s",
+            "上报失败，已冻结 %s 秒（%s 个应用）等下次原样重发：%s",
             sum(pending_seconds.values()),
             len(pending_seconds),
             message,
         )
-        return False
+        return False, retry_batch
     # 喵~防御：成功后清掉磁盘上的旧数据，避免下次启动重复上报喵
     if store is not None:
         store.clear()
     # 成功时记录本次上报了多少个应用喵
     LOGGER.info("上报成功：%s 个应用，共 %s 秒", len(usage_deltas), sum(pending_seconds.values()))
-    return True
+    return True, None
 
 
 def ensure_icon(
@@ -493,8 +561,8 @@ def run_forever(config: AgentConfig, state_path: Path | None = None) -> int:
     tracker = UsageTracker()
     # 创建状态存储器，用于上报失败时落盘、成功后清空喵
     store = UsageStore(state_path or default_state_path(default_config_path()))
-    # 喵~注意：重启后不再恢复旧文件里的残留秒数，只把它清掉喵
-    discard_stale_usage_state(store)
+    # 喵~注意：新格式的残留带固定时刻，能安全原样重发；老格式只能丢弃喵
+    pending_batch = discard_stale_usage_state(store)
     # 启动时采集一次硬件信息喵
     hardware = collect_hardware()
     # 是否为服务器角色：服务器只在 RDP 连接时统计喵
@@ -553,171 +621,194 @@ def run_forever(config: AgentConfig, state_path: Path | None = None) -> int:
     )
     try:
         while True:
-            # 记录本轮开始时间，用于补偿采样耗时喵
-            loop_started_at = time.monotonic()
-            # 喵~防御：服务器角色每轮都要刷新 RDP 与投屏状态，工作站不需要喵
-            if is_server:
-                # 服务器角色顺便记下连进来的是谁，服务端用来确认是自己人喵
-                rdp_client = rdp_client_info()
-                rdp_active = detect_rdp_active()
-                mirror_windows = list_mirror_windows(config.mirror_process_names)
-            # 采集当前前台应用喵
-            sampled_app = get_foreground_app()
-            # 取键鼠空闲秒数，超过阈值就算人离开了喵
-            idle_seconds_now = idle_seconds()
-            # 喵~注意：锁屏时人肯定不在用，直接算 AFK，别让"锁屏+动鼠标"变成假在线喵
-            screen_locked = session_locked()
-            # 本轮是否处于 AFK 状态喵
-            is_afk = screen_locked or idle_seconds_now >= config.afk_threshold_seconds
-            # 喵~注意：上一轮是不是"抓不到前台、也没法沿用"，这一轮要把那段间隔补回来喵
-            recover_gap = foreground_missed
-            # 喵~注意：前台窗口抓不到但人还在动（UAC 安全桌面、切桌面、窗口重建）时沿用上一个应用喵
-            if sampled_app is None and not is_afk and last_known_app is not None:
-                # 沿用有上限，超过就不再沿用，避免把长时间的空窗算给某个应用喵
-                reused_since = reused_since if reused_since is not None else time.monotonic()
-                if time.monotonic() - reused_since <= FOREGROUND_REUSE_SECONDS:
-                    sampled_app = last_known_app
+            try:
+                # 喵~防御：单轮炸掉不能把整个采集循环带走喵
+                # 喵~注意：Android 端一直有这层逐轮兜底（`catch (error: Exception)`），
+                # Windows 端原来没有——某一轮里任何一个采集调用抛出未捕获异常
+                # （比如 `rdp_client_info` 里 ctypes 解 WTS 结构体失败），
+                # 整个进程就直接退出。窗口化 exe 没有控制台，主人只会看到
+                # 「托盘图标还在，但数据再也不更新了」，极难排查喵
+                # 这里只兜单轮，`KeyboardInterrupt` 仍走外层正常退出喵
+                # 记录本轮开始时间，用于补偿采样耗时喵
+                loop_started_at = time.monotonic()
+                # 喵~防御：服务器角色每轮都要刷新 RDP 与投屏状态，工作站不需要喵
+                if is_server:
+                    # 服务器角色顺便记下连进来的是谁，服务端用来确认是自己人喵
+                    rdp_client = rdp_client_info()
+                    rdp_active = detect_rdp_active()
+                    mirror_windows = list_mirror_windows(config.mirror_process_names)
+                # 采集当前前台应用喵
+                sampled_app = get_foreground_app()
+                # 取键鼠空闲秒数，超过阈值就算人离开了喵
+                idle_seconds_now = idle_seconds()
+                # 喵~注意：锁屏时人肯定不在用，直接算 AFK，别让"锁屏+动鼠标"变成假在线喵
+                screen_locked = session_locked()
+                # 本轮是否处于 AFK 状态喵
+                is_afk = screen_locked or idle_seconds_now >= config.afk_threshold_seconds
+                # 喵~注意：上一轮是不是"抓不到前台、也没法沿用"，这一轮要把那段间隔补回来喵
+                recover_gap = foreground_missed
+                # 喵~注意：前台窗口抓不到但人还在动（UAC 安全桌面、切桌面、窗口重建）时沿用上一个应用喵
+                if sampled_app is None and not is_afk and last_known_app is not None:
+                    # 沿用有上限，超过就不再沿用，避免把长时间的空窗算给某个应用喵
+                    reused_since = reused_since if reused_since is not None else time.monotonic()
+                    if time.monotonic() - reused_since <= FOREGROUND_REUSE_SECONDS:
+                        sampled_app = last_known_app
+                    else:
+                        # 超时了，清掉沿用状态，这一轮就不计时喵
+                        reused_since = None
                 else:
-                    # 超时了，清掉沿用状态，这一轮就不计时喵
+                    # 抓到了窗口，或者人在离开，沿用状态作废喵
                     reused_since = None
-            else:
-                # 抓到了窗口，或者人在离开，沿用状态作废喵
-                reused_since = None
-            # 记住这次真正采到的应用，供下一次沿用喵
-            if sampled_app is not None:
-                last_known_app = sampled_app
-            # 喵~注意：沿用也救不回来时，这一轮就是"抓不到前台"，秒数要留到下次补喵
-            foreground_missed = sampled_app is None and not is_afk
-            # 喵~防御：抓不到前台的这段时间单独记账，随上报发给服务端喵
-            if foreground_missed:
-                missing_seconds += max(0.0, time.monotonic() - last_round_at)
-            # 刷新本轮时刻，供下一轮量间隔喵
-            last_round_at = time.monotonic()
-            # 喵~防御：AFK 状态变化时打一条日志，方便主人核对统计口径喵
-            afk_changed = is_afk != afk
-            # 本轮时刻，用来算两个边界喵
-            now_moment = datetime.now(timezone.utc)
-            if afk_changed:
-                afk = is_afk
-                if is_afk:
-                    # 锁屏是立刻停表；空闲则回溯到"空闲满阈值"那一刻喵
-                    afk_since_moment = now_moment if screen_locked else now_moment - timedelta(
-                        seconds=max(0.0, idle_seconds_now - config.afk_threshold_seconds)
+                # 记住这次真正采到的应用，供下一次沿用喵
+                if sampled_app is not None:
+                    last_known_app = sampled_app
+                # 喵~注意：沿用也救不回来时，这一轮就是"抓不到前台"，秒数要留到下次补喵
+                foreground_missed = sampled_app is None and not is_afk
+                # 喵~防御：抓不到前台的这段时间单独记账，随上报发给服务端喵
+                if foreground_missed:
+                    missing_seconds += max(0.0, time.monotonic() - last_round_at)
+                # 刷新本轮时刻，供下一轮量间隔喵
+                last_round_at = time.monotonic()
+                # 喵~防御：AFK 状态变化时打一条日志，方便主人核对统计口径喵
+                afk_changed = is_afk != afk
+                # 本轮时刻，用来算两个边界喵
+                now_moment = datetime.now(timezone.utc)
+                if afk_changed:
+                    afk = is_afk
+                    if is_afk:
+                        # 锁屏是立刻停表；空闲则回溯到"空闲满阈值"那一刻喵
+                        afk_since_moment = now_moment if screen_locked else now_moment - timedelta(
+                            seconds=max(0.0, idle_seconds_now - config.afk_threshold_seconds)
+                        )
+                    else:
+                        # 回来了，边界作废喵
+                        afk_since_moment = None
+                    LOGGER.info(
+                        "AFK 状态切换为 %s（空闲 %.0f 秒，锁屏=%s）",
+                        "离开" if afk else "在用",
+                        idle_seconds_now,
+                        screen_locked,
                     )
-                else:
-                    # 回来了，边界作废喵
-                    afk_since_moment = None
-                LOGGER.info(
-                    "AFK 状态切换为 %s（空闲 %.0f 秒，锁屏=%s）",
-                    "离开" if afk else "在用",
-                    idle_seconds_now,
-                    screen_locked,
+                # 本轮是不是刚从 AFK 回到在用喵
+                resumed_this_round = afk_changed and not is_afk
+                # 喵~注意：AFK 刚开始这一轮，把"还在用、只是还没到阈值"的那几秒补给上一个应用喵
+                if afk_changed and is_afk and afk_since_moment is not None and last_known_app is not None:
+                    # 停表时刻之前都算在用，和上一轮记到哪儿做差喵
+                    # 喵~注意：上限跟着采样间隔走，否则间隔调大后这里也会截断喵
+                    tail_seconds = compute_afk_tail(
+                        afk_since_moment, last_counted_moment, sample_gap_cap(config.sample_interval_seconds)
+                    )
+                    if tail_seconds >= 1.0:
+                        tracker.add_seconds(
+                            last_known_app.name, int(round(tail_seconds)), last_known_app.package
+                        )
+                        last_counted_moment = afk_since_moment
+                        store.save(tracker.snapshot())
+                        LOGGER.info("离开前补记 %.0f 秒到 %s", tail_seconds, last_known_app.name)
+                # 喵~注意：边界时刻只在切换那一刻算一次，之后每轮复用，避免上报之间漂移喵
+                afk_since = afk_since_moment if is_afk else None
+                # 恢复计时发生在最后一次输入的那一刻喵
+                active_since = None if is_afk else now_moment - timedelta(seconds=max(0.0, idle_seconds_now))
+                # 喵~防御：服务器在 RDP 未连接时不计时，AFK 时也不计时，避免把挂机时间算进去喵
+                # 投屏窗口是否在前台，服务端据此决定本机与手机各自是否计时喵
+                mirror_foreground = is_mirror_foreground(sampled_app, mirror_process_names_lower)
+                # 本轮是否计入使用时长：AFK、服务器未连 RDP、前台是远程桌面客户端都不计喵
+                should_count = should_count_sample(
+                    sampled_app,
+                    is_server=is_server,
+                    rdp_active=rdp_active,
+                    is_afk=is_afk,
                 )
-            # 本轮是不是刚从 AFK 回到在用喵
-            resumed_this_round = afk_changed and not is_afk
-            # 喵~注意：AFK 刚开始这一轮，把"还在用、只是还没到阈值"的那几秒补给上一个应用喵
-            if afk_changed and is_afk and afk_since_moment is not None and last_known_app is not None:
-                # 停表时刻之前都算在用，和上一轮记到哪儿做差喵
-                tail_seconds = compute_afk_tail(afk_since_moment, last_counted_moment)
-                if tail_seconds >= 1.0:
-                    tracker.add_seconds(
-                        last_known_app.name, int(round(tail_seconds)), last_known_app.package
+                if should_count and sampled_app is not None:
+                    # 喵~防御：应用切换时重置 since，避免一直显示首次进入时间喵
+                    if sampled_app.name != last_app_name:
+                        current_app = ForegroundApp(
+                            name=sampled_app.name,
+                            package=sampled_app.package,
+                            title=sampled_app.title,
+                            since=datetime.now(timezone.utc),
+                        )
+                        last_app_name = sampled_app.name
+                        LOGGER.debug("前台应用切换为 %s", sampled_app.name)
+                    # 喵~防御：新出现的应用顺手把图标传上去，同一个应用只传一次喵
+                    ensure_icon(icon_uploader, sampled_app.name, sampled_app.package, sampled_app.exe_path, exe_paths)
+                    # 喵~注意：按真实流逝时间累计，循环被拖慢时不会凭空少记喵
+                    now_monotonic = time.monotonic()
+                    # 喵~注意：上一轮抓不到前台时放宽上限，把那段没记的秒数一起补回来喵
+                    # 喵~注意：上限必须跟着采样间隔走，写死 15 秒会在间隔调大后系统性丢时长喵
+                    sample_gap = compute_sample_gap(
+                        now_monotonic, last_sample_at, recover_gap, sample_gap_cap(config.sample_interval_seconds)
                     )
-                    last_counted_moment = afk_since_moment
+                    # 喵~注意：刚离开回来时只从"恢复计时那一刻"开始算，别把挂机的秒数算成使用喵
+                    sample_gap = clamp_resumed_gap(sample_gap, resumed_this_round, active_since, now_moment)
+                    # 包名一起记下来，服务端才能匹配应用图标与包名喵
+                    tracker.add_seconds(sampled_app.name, max(1, int(round(sample_gap))), sampled_app.package)
+                    # 喵~注意：记下"最后一秒"的真实时刻，上报时按它给色块落位喵
+                    last_counted_moment = now_moment
+                    # 喵~防御：每次采样后落盘，进程被强杀也能保住这几秒数据喵
                     store.save(tracker.snapshot())
-                    LOGGER.info("离开前补记 %.0f 秒到 %s", tail_seconds, last_known_app.name)
-            # 喵~注意：边界时刻只在切换那一刻算一次，之后每轮复用，避免上报之间漂移喵
-            afk_since = afk_since_moment if is_afk else None
-            # 恢复计时发生在最后一次输入的那一刻喵
-            active_since = None if is_afk else now_moment - timedelta(seconds=max(0.0, idle_seconds_now))
-            # 喵~防御：服务器在 RDP 未连接时不计时，AFK 时也不计时，避免把挂机时间算进去喵
-            # 投屏窗口是否在前台，服务端据此决定本机与手机各自是否计时喵
-            mirror_foreground = is_mirror_foreground(sampled_app, mirror_process_names_lower)
-            # 本轮是否计入使用时长：AFK、服务器未连 RDP、前台是远程桌面客户端都不计喵
-            should_count = should_count_sample(
-                sampled_app,
-                is_server=is_server,
-                rdp_active=rdp_active,
-                is_afk=is_afk,
-            )
-            if should_count and sampled_app is not None:
-                # 喵~防御：应用切换时重置 since，避免一直显示首次进入时间喵
-                if sampled_app.name != last_app_name:
-                    current_app = ForegroundApp(
-                        name=sampled_app.name,
-                        package=sampled_app.package,
-                        title=sampled_app.title,
-                        since=datetime.now(timezone.utc),
+                # 喵~注意：只有这一轮真的计入（或明确暂停）才推进采样时刻；
+                # 抓不到前台的那一轮先不推进，等下一次计入时一起补喵
+                if not foreground_missed:
+                    last_sample_at = time.monotonic()
+                # 到达上报时间点、或者 AFK 状态刚变化时立刻上报一次喵
+                if time.monotonic() >= next_report_at or afk_changed:
+                    # 喵~防御：窗口列表只在要上报时扫一遍，不必每 5 秒扫全桌面喵
+                    exe_paths = exe_path_map()
+                    # 喵~注意：上报间隔可能被调到 10 秒，窗口扫描单独节流到 30 秒一次喵
+                    if should_rescan_windows(time.monotonic(), last_window_scan):
+                        window_snapshot = list_open_windows()
+                        # 喵~防御：窗口里的应用也要有图标，否则后台常驻的 QQ、v2rayN 永远缺图喵
+                        upload_window_icons(icon_uploader, window_snapshot, exe_paths)
+                        last_window_scan = time.monotonic()
+                    # 公共参数只组一次，AFK 切换时要连发两条喵
+                    report_extras: dict[str, Any] = {
+                        "rdp_connected": rdp_active if is_server else None,
+                        "mirror_windows": mirror_windows if is_server else None,
+                        "mirror_foreground": mirror_foreground if is_server else None,
+                        "open_windows": window_snapshot,
+                        "rdp_target": rdp_target_address(sampled_app),
+                        "rdp_client_ip": rdp_client[0] if is_server else "",
+                        "rdp_client_name": rdp_client[1] if is_server else "",
+                    }
+                    # 喵~注意：带上待重发批次，失败的批会原样重发而不会翻倍喵
+                    _succeeded, pending_batch = _report_once(
+                        reporter,
+                        tracker,
+                        hardware,
+                        current_app,
+                        store,
+                        afk=is_afk,
+                        afk_since=afk_since,
+                        active_since=active_since,
+                        usage_ended_at=last_counted_moment,
+                        foreground_missing_seconds=int(round(missing_seconds)),
+                        pending_batch=pending_batch,
+                        **report_extras,
                     )
-                    last_app_name = sampled_app.name
-                    LOGGER.debug("前台应用切换为 %s", sampled_app.name)
-                # 喵~防御：新出现的应用顺手把图标传上去，同一个应用只传一次喵
-                ensure_icon(icon_uploader, sampled_app.name, sampled_app.package, sampled_app.exe_path, exe_paths)
-                # 喵~注意：按真实流逝时间累计，循环被拖慢时不会凭空少记喵
-                now_monotonic = time.monotonic()
-                # 喵~注意：上一轮抓不到前台时放宽上限，把那段没记的秒数一起补回来喵
-                sample_gap = compute_sample_gap(now_monotonic, last_sample_at, recover_gap)
-                # 喵~注意：刚离开回来时只从"恢复计时那一刻"开始算，别把挂机的秒数算成使用喵
-                sample_gap = clamp_resumed_gap(sample_gap, resumed_this_round, active_since, now_moment)
-                # 包名一起记下来，服务端才能匹配应用图标与包名喵
-                tracker.add_seconds(sampled_app.name, max(1, int(round(sample_gap))), sampled_app.package)
-                # 喵~注意：记下"最后一秒"的真实时刻，上报时按它给色块落位喵
-                last_counted_moment = now_moment
-                # 喵~防御：每次采样后落盘，进程被强杀也能保住这几秒数据喵
-                store.save(tracker.snapshot())
-            # 喵~注意：只有这一轮真的计入（或明确暂停）才推进采样时刻；
-            # 抓不到前台的那一轮先不推进，等下一次计入时一起补喵
-            if not foreground_missed:
-                last_sample_at = time.monotonic()
-            # 到达上报时间点、或者 AFK 状态刚变化时立刻上报一次喵
-            if time.monotonic() >= next_report_at or afk_changed:
-                # 喵~防御：窗口列表只在要上报时扫一遍，不必每 5 秒扫全桌面喵
-                exe_paths = exe_path_map()
-                # 喵~注意：上报间隔可能被调到 10 秒，窗口扫描单独节流到 30 秒一次喵
-                if should_rescan_windows(time.monotonic(), last_window_scan):
-                    window_snapshot = list_open_windows()
-                    # 喵~防御：窗口里的应用也要有图标，否则后台常驻的 QQ、v2rayN 永远缺图喵
-                    upload_window_icons(icon_uploader, window_snapshot, exe_paths)
-                    last_window_scan = time.monotonic()
-                # 公共参数只组一次，AFK 切换时要连发两条喵
-                report_extras: dict[str, Any] = {
-                    "rdp_connected": rdp_active if is_server else None,
-                    "mirror_windows": mirror_windows if is_server else None,
-                    "mirror_foreground": mirror_foreground if is_server else None,
-                    "open_windows": window_snapshot,
-                    "rdp_target": rdp_target_address(sampled_app),
-                    "rdp_client_ip": rdp_client[0] if is_server else "",
-                    "rdp_client_name": rdp_client[1] if is_server else "",
-                }
-                _report_once(
-                    reporter,
-                    tracker,
-                    hardware,
-                    current_app,
-                    store,
-                    afk=is_afk,
-                    afk_since=afk_since,
-                    active_since=active_since,
-                    usage_ended_at=last_counted_moment,
-                    foreground_missing_seconds=int(round(missing_seconds)),
-                    **report_extras,
+                    # 喵~防御：损耗计数上报过就清零，下一次重新统计喵
+                    missing_seconds = 0.0
+                    # 喵~注意：按本轮起点对齐采样网格，设 15 秒就真的 15 秒报一次喵
+                    next_report_at = plan_next_report(
+                        loop_started_at,
+                        config.sample_interval_seconds,
+                        config.report_interval_seconds,
+                    )
+                # 到达刷新时间点时重新采集硬件信息喵
+                if time.monotonic() >= next_hardware_refresh_at:
+                    hardware = collect_hardware()
+                    next_hardware_refresh_at = time.monotonic() + HARDWARE_REFRESH_SECONDS
+                    LOGGER.debug("硬件信息已刷新")
+                # 计算本轮剩余休眠时间，保证采样节奏稳定喵
+                elapsed_seconds = time.monotonic() - loop_started_at
+                time.sleep(max(0.0, config.sample_interval_seconds - elapsed_seconds))
+            except Exception as loop_error:  # 喵~防御：故意兜住一切，绝不让循环退出
+                LOGGER.warning("本轮采集异常，跳过本轮继续跑：%s", loop_error, exc_info=True)
+                # 喵~注意：睡满这一轮再继续，否则异常会变成忙等待把 CPU 打满喵
+                time.sleep(
+                    max(0.0, config.sample_interval_seconds - (time.monotonic() - loop_started_at))
                 )
-                # 喵~防御：损耗计数上报过就清零，下一次重新统计喵
-                missing_seconds = 0.0
-                # 喵~注意：按本轮起点对齐采样网格，设 15 秒就真的 15 秒报一次喵
-                next_report_at = plan_next_report(
-                    loop_started_at,
-                    config.sample_interval_seconds,
-                    config.report_interval_seconds,
-                )
-            # 到达刷新时间点时重新采集硬件信息喵
-            if time.monotonic() >= next_hardware_refresh_at:
-                hardware = collect_hardware()
-                next_hardware_refresh_at = time.monotonic() + HARDWARE_REFRESH_SECONDS
-                LOGGER.debug("硬件信息已刷新")
-            # 计算本轮剩余休眠时间，保证采样节奏稳定喵
-            elapsed_seconds = time.monotonic() - loop_started_at
-            time.sleep(max(0.0, config.sample_interval_seconds - elapsed_seconds))
+
     except KeyboardInterrupt:
         # 喵~防御：Ctrl+C 属于正常退出，先把待发数据尝试发一次再走喵
         LOGGER.info("收到退出信号，尝试最后一次上报")
@@ -737,6 +828,8 @@ def run_forever(config: AgentConfig, state_path: Path | None = None) -> int:
             usage_ended_at=last_counted_moment,
             foreground_missing_seconds=int(round(missing_seconds)),
             open_windows=list_open_windows(),
+            # 喵~注意：收尾时先把上次没发出去的批原样重发喵
+            pending_batch=pending_batch,
         )
         return 0
     finally:

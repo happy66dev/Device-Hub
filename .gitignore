@@ -45,3 +45,6 @@ logs/
 client-windows/usage-state.json
 # 图标调试用的临时图片，曾经误入库一次，这里拦住喵
 tmp_icon.png
+
+# 代码审查临时报告，不进仓库喵
+.review/

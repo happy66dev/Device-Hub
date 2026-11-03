@@ -110,6 +110,25 @@ class NormalizedMessage:
     # 原始事件，排查问题用喵
     raw: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def send_target(self) -> str:
+        """发送回复时该填的目标标识喵。
+
+        输出：群聊返回 `group_key`；单聊返回 `user_key`（即 user_openid）喵。
+
+        喵~注意：单聊的 `group_key` 是**故意留空**的（单聊没有群概念），
+        而官方接口的单聊路径是 `/v2/users/{openid}/messages`，
+        目标必须是 user_openid 而不是空串。之前调用方一律传 `group_key`，
+        单聊就拼成了 `/v2/users//messages`，**私聊完全收不到回复**，
+        而错误又被 `SEND_ERRORS` 吞成一条 warning，很难发现喵。
+        统一从这里取目标，就不会再有人各自拼错喵。
+        """
+        # 单聊用发送者标识当目标喵
+        if self.scope == SCOPE_PRIVATE:
+            return self.user_key
+        # 群聊用群标识喵
+        return self.group_key
+
 
 class BotChannel(Protocol):
     """所有通道实现同一套生命周期与发送能力喵。"""

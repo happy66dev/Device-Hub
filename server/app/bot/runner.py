@@ -81,9 +81,8 @@ class BotRunner:
 
     async def run(self) -> None:
         """启动机器人主循环，直到被取消喵。"""
-        # 喵~注意：一个通道都没启用时直接返回，不要再在这儿跑清理任务。
-        # 归档与清理已经搬到 app/maintenance.py，由 main 的生命周期无条件启动，
-        # 挂在机器人上的话「纯服务端部署」就永远不清理了喵
+        # 喵~注意：没有通道就直接返回。归档与清理已经搬到 maintenance.py，
+        # 由 main 的生命周期无条件启动，不归机器人管喵
         if not self._channels:
             LOGGER.warning("没有启用任何机器人通道（napcat.enabled 与 qqbot.enabled 都是 false）")
             return
@@ -210,7 +209,7 @@ class BotRunner:
         try:
             # 发送「稍等」提示喵
             await channel.send_text(
-                message.group_key,
+                message.send_target,
                 BUSY_REPLY_TEXT,
                 scope=message.scope,
                 reply_token=message.reply_token,
@@ -218,7 +217,7 @@ class BotRunner:
             )
         except SEND_ERRORS as send_error:
             # 喵~防御：忙时提示发不出去也不影响主流程喵
-            LOGGER.warning("回复 %s 的「稍等」失败：%s", message.group_key, send_error)
+            LOGGER.warning("回复 %s 的「稍等」失败：%s", message.send_target, send_error)
 
     async def _run_command(
         self,
@@ -242,7 +241,7 @@ class BotRunner:
             try:
                 # 发送图片消息喵
                 await channel.send_image(
-                    message.group_key,
+                    message.send_target,
                     image_bytes,
                     scope=message.scope,
                     reply_token=message.reply_token,
@@ -261,7 +260,7 @@ class BotRunner:
         try:
             # 发送回复喵
             await channel.send_text(
-                message.group_key,
+                message.send_target,
                 reply_text,
                 scope=message.scope,
                 reply_token=message.reply_token,
@@ -269,7 +268,7 @@ class BotRunner:
             )
         except SEND_ERRORS as send_error:
             # 喵~防御：发送失败只记录日志，不能让机器人任务整体崩掉喵
-            LOGGER.warning("回复 %s 失败：%s", message.group_key, send_error)
+            LOGGER.warning("回复 %s 失败：%s", message.send_target, send_error)
 
     def _build_image(self, command_text: str) -> bytes | None:
         """在线程里打开数据库并尝试生成图片喵。

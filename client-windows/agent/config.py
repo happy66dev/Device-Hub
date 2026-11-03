@@ -46,13 +46,14 @@ MIN_SAMPLE_INTERVAL_SECONDS = 1
 # 采集频率上限（秒）：超过一分钟就分不清两个应用谁在用喵
 MAX_SAMPLE_INTERVAL_SECONDS = 60
 
-# 默认上报间隔（秒）：60 秒一批，正好是服务端心跳超时 180 秒的三分之一喵
+# 默认上报间隔（秒）：60 秒一批，与服务端心跳超时正好持平喵
+# 喵~注意：服务端超时是 60 秒（server/app/presence.py），不是早期的 180 秒喵
 DEFAULT_REPORT_INTERVAL_SECONDS = 60.0
 
 # 上报间隔下限（秒）：再快就是拿网络换精度，服务端也会被高频请求拖慢喵
 MIN_REPORT_INTERVAL_SECONDS = 10.0
 
-# 上报间隔上限（秒）：服务端心跳超时是 180 秒，间隔超过 60 秒就可能被误判成离线喵
+# 上报间隔上限（秒）：不能超过服务端 60 秒的心跳超时，再慢就会被判成离线喵
 MAX_REPORT_INTERVAL_SECONDS = 60.0
 
 

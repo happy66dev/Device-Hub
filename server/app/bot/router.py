@@ -13,6 +13,7 @@ commands.COMMANDS 的模板里；这里只做「决策 + 兜底」喵。
 from __future__ import annotations
 
 import logging
+import math
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -117,6 +118,13 @@ def inspect_normalized(message: NormalizedMessage, config: AppConfig) -> tuple[b
         # 喵~防御：私聊默认一律不响应，必须显式配置 user_openid 喵
         if message.user_key not in acl.private_users:
             return False, "", REASON_GROUP_NOT_WHITELISTED
+        # 喵~防御：黑名单对私聊同样生效喵
+        # 喵~注意：这里原来直接 return，**跳过了黑名单检查**——
+        # 同一个用户在群里被拉黑后不响应，私聊却照样能查数据，
+        # WebUI 里那个「拉黑」按钮对私聊看起来生效、实际无效。
+        # 《docs/qqbot.md》写明黑名单是两道闸门之一，群聊与单聊都必须过喵
+        if message.user_key in acl_module.effective_blacklist(config, message.channel):
+            return False, "", REASON_USER_BLACKLISTED
         # 私聊本身就是对机器人说话，不需要 @ 喵
         return _match_prefix(message.text)
     # 喵~防御：白名单为空时任何群都不响应，这是安全默认值喵
@@ -428,7 +436,13 @@ def _snapshot_command(
     else:
         # 排行榜页签，窗口换算成小时喵
         tab = "rankings"
-        hours = max(1, round(int(scope["window_seconds"]) / 3600))
+        # 喵~注意：看板的 hours 参数只接受**整数小时**，所以一小时以内的窗口
+        # 没法精确表达。这里改成向上取整而不是四舍五入——四舍五入会把
+        # 30 分钟画成 1 小时（图上写着 1h、文字却说「最近 30 分钟」），
+        # 45 分钟也画成 1 小时；向上取整至少保证「图上显示的窗口 ⊇ 文字说的窗口」，
+        # 宁可多看一点也不能让人少看数据喵。
+        # 真要精确到分钟，得给看板加一个 hours 的小数/分钟参数，属于接口改动喵
+        hours = max(1, math.ceil(int(scope["window_seconds"]) / 3600))
         params["hours"] = str(hours)
         # 看板按设备分组展示，这样单设备与多设备都能只显示指定范围喵
         params["scope"] = "device"

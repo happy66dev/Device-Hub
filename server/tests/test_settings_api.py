@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -181,6 +182,104 @@ def test_bot_signature_detects_channel_switch(config_file: Path) -> None:
     opened = load_config(config_file)
     # 签名必须不同喵
     assert _bot_signature(base) != _bot_signature(opened)
+
+
+def test_bot_signature_covers_bot_and_render_sections(config_file: Path) -> None:
+    """签名必须覆盖 bot 与 render 两段，否则改了它们机器人也不会重建喵。
+
+    喵~注意：早先只比 napcat / qqbot / acl，于是设置页说「已热更新」，
+    而 happy 命令的窗口口径、出图尺寸其实还是旧值，要等下次重启才生效喵。
+    """
+    # 基准配置喵
+    base = load_config(config_file)
+    # 只改 bot 段里的一个值喵
+    bot_changed = replace(base, bot=replace(base.bot, happy_group=f"{base.bot.happy_group}9"))
+    # 只改 render 段里的一个值喵
+    render_changed = replace(
+        base, render=replace(base.render, max_hardware_fields=base.render.max_hardware_fields + 1)
+    )
+    # 两段改动都必须被签名察觉喵
+    assert base.bot != bot_changed.bot
+    assert base.render != render_changed.render
+    assert _bot_signature(base) != _bot_signature(bot_changed)
+    assert _bot_signature(base) != _bot_signature(render_changed)
+
+
+def test_hot_reload_of_db_path_keeps_running_database(client: TestClient, config_file: Path) -> None:
+    """改 server.db_path 时不能把运行中的服务切到一个空库上喵。
+
+    喵~注意：这是曾经的 P1。`_apply_runtime_config` 原来把整份新配置直接塞进
+    `app.state.config`，连接池却还是按启动时的路径建的——于是所有查询都去开
+    那个还不存在的新文件，SQLite 顺手造一个空库，接口全 500，
+    磁盘上还多出一个 4KB 的空文件。现在要求「保留旧库路径 + 标记要重启」喵。
+    """
+    # 先确认正常能读到数据喵
+    before = client.get("/api/v1/devices", headers=AUTH_HEADERS)
+    assert before.status_code == 200
+    # 运行中的库路径喵
+    running_db = client.app.state.config.server.db_path
+    # 造一个不存在的新库路径写进配置文件喵
+    new_db = config_file.parent / "brand-new-empty.db"
+    config_file.write_text(
+        _sample_text(config_file.parent).replace(
+            f'"{_posix(config_file.parent / "device_hub.db")}"', f'"{_posix(new_db)}"'
+        ),
+        encoding="utf-8",
+    )
+    # 触发一次热更新：改一个能热更新的项，让服务重新加载整份配置喵
+    response = client.patch(
+        "/api/v1/settings",
+        json={"changes": {"acl.whitelist_groups": [123456]}},
+        headers=AUTH_HEADERS,
+    )
+    assert response.status_code == 200
+    # 喵~注意：必须如实告知需要重启喵
+    assert "server.db_path" in response.json()["restart_fields"]
+    assert response.json()["restart_required"] is True
+    # 喵~注意：运行中的库路径不能被换掉喵
+    assert client.app.state.config.server.db_path == running_db
+    # 新路径上不该凭空出现文件喵
+    assert not new_db.exists()
+    # 数据接口照常能读喵
+    after = client.get("/api/v1/devices", headers=AUTH_HEADERS)
+    assert after.status_code == 200
+
+
+def test_settings_reads_the_file_the_config_came_from(tmp_path: Path) -> None:
+    """设置页读写必须用「这份配置是从哪加载的」，不能自己重推一遍路径喵。
+
+    喵~注意：原来无条件调 `resolve_config_path()`。正常启动时两者恰好一致，
+    但只要调用方显式传了自己的配置，设置页就会去读写**另一个** config.yaml——
+    于是「保存了却没生效」，最坏还会把别的文件改坏喵。
+    """
+    # 造一份属于本次测试的配置喵
+    path = tmp_path / "explicit.yaml"
+    path.write_text(_sample_text(tmp_path), encoding="utf-8")
+    # 加载它，AppConfig 应记住来源喵
+    loaded = load_config(path)
+    assert loaded.config_path == path.resolve()
+    # 用这份配置建一个应用（不传环境变量，模拟显式传参的场景）喵
+    app = create_app(loaded)
+    # 喵~注意：设置页必须指向同一份文件喵
+    with TestClient(app) as http:
+        response = http.get("/api/v1/settings", headers=AUTH_HEADERS)
+    assert response.status_code == 200
+    assert Path(response.json()["config_path"]) == path.resolve()
+
+
+def test_config_signature_reports_pending_restart(client: TestClient, config_file: Path) -> None:
+    """盘上改了端口时，GET 设置页要如实标出「需要重启」喵。"""
+    # 直接把端口改在文件里，模拟主人手工编辑配置喵
+    config_file.write_text(
+        _sample_text(config_file.parent).replace("port: 8080", "port: 18081"), encoding="utf-8"
+    )
+    # 取设置页喵
+    response = client.get("/api/v1/settings", headers=AUTH_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    # 喵~注意：不能硬编码 False，否则主人以为改完就生效了喵
+    assert body["restart_required"] is True
+    assert "server.port" in body["restart_fields"]
 
 
 def test_patch_settings_rejects_unknown_key(client: TestClient, config_file: Path) -> None:

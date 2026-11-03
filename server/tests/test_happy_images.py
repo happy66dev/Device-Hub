@@ -311,6 +311,41 @@ def test_build_image_rank_passes_hours(
     assert params["devices"] == "win-a"
 
 
+def test_build_image_rank_hours_never_less_than_spoken_window(
+    connection: sqlite3.Connection, app_config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """图上画的窗口不能比文字说的窗口**小**，否则会少显示数据喵。
+
+    喵~注意：这是真实缺陷。看板的 `hours` 参数只接受整数小时，
+    原来用 `round()` 换算，`70分钟`（1.17h）会四舍五入成 **1 小时**——
+    文字说「最近 70 分钟」，图上只画 60 分钟，中间 10 分钟凭空消失。
+    `150分钟`（2.5h）更糟，直接少画半小时喵。
+    现在改成向上取整：宁可多看一点，也不能让人少看数据喵。
+    """
+    # 打开图片渲染喵
+    config = replace(app_config, render=replace(app_config.render, image_enabled=True))
+    # 造设备与分组喵
+    _seed(connection, "win-a", "本机 Windows")
+    _set_group(config, [people.PersonGroup(name="happy", devices=("win-a",))])
+    # 逐个窗口验证：图上的小时数覆盖的秒数必须 >= 文字窗口秒数喵
+    for window_text, window_seconds in (
+        ("70分钟", 70 * 60),
+        ("75分钟", 75 * 60),
+        ("85分钟", 85 * 60),
+        ("130分钟", 130 * 60),
+        ("150分钟", 150 * 60),
+        ("2小时", 2 * 3600),
+        ("7天", 7 * 24 * 3600),
+    ):
+        params = _capture_params(monkeypatch, f"看看happy 全部 排行榜 {window_text}", connection, config)
+        # 图上的小时数喵
+        hours = int(params["hours"])
+        # 必须覆盖文字说的窗口喵
+        assert hours * 3600 >= window_seconds, f"{window_text} 只画了 {hours} 小时"
+        # 也不能多画超过一小时，否则就是另一种失真喵
+        assert hours * 3600 - window_seconds < 3600, f"{window_text} 多画了太多"
+
+
 def test_build_image_timeline_passes_window(
     connection: sqlite3.Connection, app_config, monkeypatch: pytest.MonkeyPatch
 ) -> None:

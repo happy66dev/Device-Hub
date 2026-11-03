@@ -16,8 +16,12 @@ class ReportIntervalTest {
         // 区间是 10 到 60 秒喵
         assertEquals(10, ReportInterval.MIN_SECONDS)
         assertEquals(60, ReportInterval.MAX_SECONDS)
-        // 喵~注意：上限乘 2 仍要小于服务端 180 秒心跳超时，否则连丢两轮就会被误判离线喵
-        assertTrue(ReportInterval.MAX_SECONDS * 2 < ReportInterval.HEARTBEAT_TIMEOUT_SECONDS)
+        // 喵~注意：这里以前断言的是「上限乘 2 < 180」，那是在跟着一个写错的常量走。
+        // 服务端真实的心跳超时是 60 秒（presence.DEFAULT_HEARTBEAT_TIMEOUT_SECONDS），
+        // 所以正确的约束是「上限不超过超时」，而不是「留出两轮余量」喵
+        assertTrue(ReportInterval.MAX_SECONDS <= ReportInterval.HEARTBEAT_TIMEOUT_SECONDS)
+        // 常量本身必须与服务端一致，防呆用喵
+        assertEquals(60, ReportInterval.HEARTBEAT_TIMEOUT_SECONDS)
     }
 
     @Test

@@ -56,6 +56,10 @@ python -m app.main
 curl http://127.0.0.1:8080/healthz
 ```
 
+`/healthz` 的 `bot_enabled` 表示「NapCat 与官方通道任一启用」，
+与启动日志里的 `机器人=启用/关闭` 同一口径；想知道具体是哪个通道，
+另看 `napcat_enabled` 与 `qqbot_enabled` 两个字段喵。
+
 ## 3. 让 NapCat 打开 7999 端口
 
 项目已在 `onebot11_<你的机器人QQ>.json` 里新增了一个名为 `DeviceHub` 的正向 WebSocket 服务端：

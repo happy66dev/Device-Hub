@@ -12,9 +12,10 @@ import json
 import os
 import re
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
@@ -77,6 +78,15 @@ FIELD_BY_NAME: dict[str, SettingField] = {field.name: field for field in SETTING
 # 密钥类字段在读取时统一替换成这个占位符，前端看到占位符表示「没改」喵
 SECRET_PLACEHOLDER = "********"
 
+# 配置文件「读-改-写」全程持有的模块级可重入锁喵
+# 喵~注意：这里是同步代码，FastAPI 里走 run_in_threadpool，所以用 threading 的 RLock，
+# 不能用 asyncio.Lock（它绑事件循环，跨线程无效）喵
+_CONFIG_WRITE_LOCK = threading.RLock()
+
+# 测试注入点：持有锁并读完原文本后回调一次，用来放大并发窗口、稳定复现丢更新喵
+# 喵~注意：生产环境恒为 None，不产生任何行为；只有并发回归测试会临时替换它喵
+_AFTER_READ_HOOK: Callable[[], None] | None = None
+
 # 顶层段标题：`section:` 独占一行喵
 _SECTION_PATTERN = re.compile(r"^([A-Za-z_][\w-]*):\s*(#.*)?$")
 
@@ -130,7 +140,10 @@ def _render_value(kind: str, value: Any) -> str:
     # 整数直接写喵
     if kind == "int":
         return str(int(value))
-    # 字符串用双引号包起来，转义交给 json 保证合法喵
+    # 字符串一律用双引号包起来，转义交给 json 保证合法喵
+    # 喵~注意：这里刻意保持「总是加引号」的既有行为，普通值写出来要和不改之前逐字节一致喵
+    # 喵~注意：json.dumps 生成的双引号字符串与 YAML 1.2 双引号语法兼容喵
+    # 喵~注意：所以含 # : " ' 前后空格、空串、换行的值都能安全往返，不会再被当成注释喵
     if kind in ("str", "secret"):
         return json.dumps(str(value), ensure_ascii=False)
     # 列表用 flow 风格，和配置文件里现有的 [] 写法一致喵
@@ -140,6 +153,52 @@ def _render_value(kind: str, value: Any) -> str:
         return "[" + ", ".join(str(int(item)) for item in value) + "]"
     # 喵~防御：字段表里写了未知类型直接报错，别静默写坏配置喵
     raise SettingsError(f"未知的配置类型：{kind}")
+
+
+def _split_value_comment(remainder: str) -> tuple[str, str]:
+    """把「冒号后面的原文」拆成「值文本」和「行尾注释」两段喵。
+
+    输入：`_KEY_PATTERN` 捕获到的冒号之后那一段（可能带前导空格、引号和注释）。
+    输出：(值文本, 注释)。注释不含前导空格，没有注释时返回空串。
+    边界：引号内的 `#` 属于值本身，绝不能当注释切掉喵。
+    """
+    # 冒号后面的空白不属于值，先去掉喵
+    body = remainder.strip()
+    # 逐字符扫描，跳过一个完整的引号字符串再找注释起点喵
+    index = 0
+    length = len(body)
+    while index < length:
+        char = body[index]
+        if char == '"':
+            # 双引号串：反斜杠转义的下一个字符直接跳过喵
+            index += 1
+            while index < length:
+                if body[index] == "\\":
+                    index += 2
+                    continue
+                if body[index] == '"':
+                    index += 1
+                    break
+                index += 1
+            continue
+        if char == "'":
+            # 单引号串：YAML 里用两个单引号表示一个单引号喵
+            index += 1
+            while index < length:
+                if body[index] == "'":
+                    if index + 1 < length and body[index + 1] == "'":
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            continue
+        # 喵~注意：YAML 规定 `#` 只有在行首或前面是空白时才开始注释喵
+        if char == "#" and (index == 0 or body[index - 1].isspace()):
+            return body[:index].rstrip(), body[index:].strip()
+        index += 1
+    # 整段都是值，没有注释喵
+    return body, ""
 
 
 def _split_items(raw: Any) -> list[str]:
@@ -231,9 +290,10 @@ def _set_value(text: str, section: str, key: str, rendered: str) -> str:
             continue
         indent, _, remainder = match.groups()
         # 保留行尾注释喵
-        comment = ""
-        if "#" in remainder:
-            comment = "  " + remainder[remainder.index("#") :].strip()
+        # 喵~防御：旧实现直接找第一个 #，值里含 # 时会把值的一部分当注释搬走，
+        # 所以改成先跳过引号串再判断注释起点喵
+        _, comment_body = _split_value_comment(remainder)
+        comment = f"  {comment_body}" if comment_body else ""
         lines[index] = f"{indent}{key}: {rendered}{comment}"
         return newline.join(lines)
     # 键不存在就插到段尾（跳过尾部空行）喵
@@ -275,31 +335,40 @@ def apply_settings(config_path: Path, changes: Mapping[str, Any]) -> list[str]:
         effective[name] = raw
     if not effective:
         return []
-    # 读原文本喵
-    try:
-        original = config_path.read_text(encoding="utf-8")
-    except OSError as error:
-        raise SettingsError(f"无法读取配置文件 {config_path}：{error}") from error
-    # 就地替换喵
-    updated = update_config_text(original, effective)
-    if updated == original:
-        return []
-    # 先写同目录临时文件并校验，校验通过再整体替换喵
-    handle, temp_name = tempfile.mkstemp(prefix="config.", suffix=".yaml.tmp", dir=str(config_path.parent))
-    os.close(handle)
-    temp_path = Path(temp_name)
-    try:
-        temp_path.write_text(updated, encoding="utf-8")
+    # 喵~注意：锁只包住「读文本 → 改文本 → 写临时文件 → 校验 → 替换」这一段，
+    # 参数过滤、返回值整理这些纯内存工作在锁外，免得白占临界区喵
+    # 喵~取舍：单进程部署（一个 uvicorn 进程 + 线程池），进程内 RLock 足够；
+    # 不做跨进程文件锁，因为多进程同时改同一份 config.yaml 不在部署形态内喵
+    with _CONFIG_WRITE_LOCK:
+        # 读原文本喵
         try:
-            # 复用正式加载器做完整校验喵
-            load_config(temp_path)
-        except ConfigError as error:
-            raise SettingsError(f"配置校验失败：{error}") from error
-        os.replace(temp_path, config_path)
-    finally:
-        # 喵~防御：临时文件没被 replace 掉时清理干净喵
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
+            original = config_path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise SettingsError(f"无法读取配置文件 {config_path}：{error}") from error
+        # 测试注入点：在「已读完旧内容、还没写回」的窗口里回调，用来放大并发丢更新的概率喵
+        hook = _AFTER_READ_HOOK
+        if hook is not None:
+            hook()
+        # 就地替换喵
+        updated = update_config_text(original, effective)
+        if updated == original:
+            return []
+        # 先写同目录临时文件并校验，校验通过再整体替换喵
+        handle, temp_name = tempfile.mkstemp(prefix="config.", suffix=".yaml.tmp", dir=str(config_path.parent))
+        os.close(handle)
+        temp_path = Path(temp_name)
+        try:
+            temp_path.write_text(updated, encoding="utf-8")
+            try:
+                # 复用正式加载器做完整校验喵
+                load_config(temp_path)
+            except ConfigError as error:
+                raise SettingsError(f"配置校验失败：{error}") from error
+            os.replace(temp_path, config_path)
+        finally:
+            # 喵~防御：临时文件没被 replace 掉时清理干净喵
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
     return list(effective.keys())
 
 

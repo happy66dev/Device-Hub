@@ -46,9 +46,14 @@ PURE_FUNCTIONS = (
     "formatDuration",
     # 统计页热力图的纯函数喵
     "heatmapLevel",
+    "heatmapCellStyle",
+    "heatmapCellHtml",
     "heatmapCells",
     "pad2",
     "dateText",
+    # 请求竞态的序号纯函数喵
+    "nextRequestSeq",
+    "isStaleResponse",
     # 日期计算要按服务端时区走，这几个是依赖喵
     "serverNow",
     "inServerZone",
@@ -58,10 +63,17 @@ PURE_FUNCTIONS = (
     "trendPoints",
     "trendTickText",
     "monotoneCubicPath",
+    # 时间轴日期加减（依赖 el/state/loadTimeline 桩）喵
+    "shiftTimelineDate",
+    # 近 24 小时柱状图（依赖 state/formatClock/formatDuration）喵
+    "utcHourKey",
+    "usageChart",
+    # usageChart 的 tooltip 依赖 formatClock，formatDuration 上面已列喵
+    "formatClock",
 )
 
 # 纯函数依赖的模块级常量，抽函数时要一起带上喵
-PURE_CONSTANTS = ("DEVICE_SHADE_STEPS", "APP_COLORS", "TREND_DAYS")
+PURE_CONSTANTS = ("DEVICE_SHADE_STEPS", "APP_COLORS", "TREND_DAYS", "HEATMAP_LEVELS")
 
 
 def extract_function(source: str, name: str) -> str:
@@ -958,6 +970,102 @@ console.log(JSON.stringify({
     assert outputs[0]["cells"] == outputs[1]["cells"], "浏览器时区影响了热力图起始日"
 
 
+def test_shift_timeline_date_ignores_browser_timezone() -> None:
+    """时间轴「前一天/后一天」必须按服务端时区算，浏览器在 UTC+9 以东不能错一天喵。
+
+    喵~注意：这是真实缺陷。`shiftTimelineDate` 原来用
+    `new Date(`${value}T00:00:00`)` + `setDate/getDate`（浏览器本地），
+    再交给 `localDateText`（按服务端时区）去读。
+    两套时区混用，浏览器在 UTC+9 及以东时**连 days=0 都会错一天**：
+    实测 UTC+9/+10/+12 输 2026-11-03、点「前一天」得 2026-11-01（应为 11-02）喵。
+    """
+    script = """
+// 桩：时间轴日期输入框 + 不让它真去发请求喵
+globalThis.el = { tlDate: { value: "2026-11-03" } };
+globalThis.loadTimeline = function () {};
+// 走一次「后退一天」喵
+shiftTimelineDate(-1);
+console.log(JSON.stringify({
+  back: el.tlDate.value,
+  stateDate: state.timelineDate,
+}));
+"""
+    outputs = []
+    for zone in ("UTC", "Asia/Shanghai", "Asia/Tokyo", "Pacific/Auckland"):
+        env = dict(**__import__("os").environ)
+        env["TZ"] = zone
+        completed = subprocess.run(
+            [shutil.which("node"), "-e", harness(script)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            check=False,
+            env=env,
+        )
+        assert completed.returncode == 0, completed.stderr
+        outputs.append(json.loads(completed.stdout))
+    # 每个时区都必须退到 11-02喵
+    for zone_output in outputs:
+        assert zone_output["back"] == "2026-11-02", f"日期退错：{zone_output}"
+        assert zone_output["stateDate"] == "2026-11-02"
+    # 四个时区结果必须完全一致，不允许浏览器时区掺进来喵
+    assert outputs[0] == outputs[1] == outputs[2] == outputs[3], "浏览器时区影响了时间轴日期"
+
+
+def test_usage_chart_buckets_align_in_half_hour_timezones() -> None:
+    """近 24 小时柱状图的桶要对齐，浏览器在非整小时时区也不能全空喵。
+
+    喵~注意：这是真实缺陷。服务端按 **UTC 整点**切桶
+    （`substr(sampled_at,1,13)` + ':00:00Z'），前端原来用
+    `moment.getTime()` 精确比毫秒。两者只在浏览器是**整小时偏移**时才碰得上：
+    东八区(+8)、UTC、纽约(-5) 都刚好对上，
+    但 UTC+5:30（印度）、+8:45（Eucla）这类会整体错开 30/45 分钟
+    → 24 根柱子全是 0，界面一片空白而且不报错喵。
+    """
+    script = """
+// 服务端给的桶：24 个 UTC 整点喵
+const base = new Date("2026-11-03T05:00:00Z");
+const timeline = [];
+for (let index = 23; index >= 0; index -= 1) {
+  timeline.push({
+    bucket_start: new Date(base.getTime() - index * 3600000).toISOString(),
+    seconds: 60 * index,
+  });
+}
+// 固定「现在」，避免测试随真实时间漂移喵
+const fixedNow = new Date("2026-11-03T05:07:00Z");
+const svg = usageChart(timeline, fixedNow);
+// 数一下非零柱子（height 不为 0）喵
+const heights = [...svg.matchAll(/height="([\\d.]+)"/g)].map((m) => Number(m[1]));
+console.log(JSON.stringify({
+  bars: heights.length,
+  nonZero: heights.filter((value) => value > 0).length,
+}));
+"""
+    outputs = []
+    for zone in ("Asia/Shanghai", "UTC", "Asia/Kolkata", "Australia/Eucla", "America/New_York"):
+        env = dict(**__import__("os").environ)
+        env["TZ"] = zone
+        completed = subprocess.run(
+            [shutil.which("node"), "-e", harness(script)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            check=False,
+            env=env,
+        )
+        assert completed.returncode == 0, completed.stderr
+        outputs.append((zone, json.loads(completed.stdout)))
+    # 每个时区都必须画出柱子，不能因为偏移把桶全丢掉喵
+    for zone, result in outputs:
+        assert result["nonZero"] > 0, f"{zone} 下柱子全空：{result}"
+    # 各时区画出的柱子数必须一样，说明桶对齐与浏览器时区无关喵
+    counts = {result["nonZero"] for _, result in outputs}
+    assert len(counts) == 1, f"不同时区画出的柱子数不一致：{outputs}"
+
+
 def test_merge_ranking_entries_falls_back_without_breakdown() -> None:
     """服务端没给按设备拆分时，单设备记录整条算给它自己喵。"""
     output = run_in_node(
@@ -1102,3 +1210,266 @@ console.log(JSON.stringify(cases));
     assert ratios[0] == 1
     assert abs(ratios[1] - 0.5) < 1e-9 and ratios[2] == 1
     assert 0 < ratios[3] < 1
+
+
+def test_heatmap_empty_day_differs_from_zero_seconds() -> None:
+    """热力图必须把「没有数据」和「0 秒（确实没用）」画成两种东西喵。
+
+    喵~注意：这是真实缺陷。原来的 `heatmapLevel` 用 `if (!seconds || seconds <= 0) return 0`
+    把「这一天压根没上报」和「这一天上报了但用了 0 秒」压成同一个色阶 0，
+    用户看不出是设备没开机还是真的没用电脑喵。
+    """
+    output = run_in_node(
+        harness(
+            """
+// 无数据（null）与 0 秒必须给出不同的等级喵
+const noData = heatmapLevel(null, 1000);
+const zero = heatmapLevel(0, 1000);
+// 样式与 HTML 也必须不同喵
+const emptyStyle = heatmapCellStyle(noData);
+const zeroStyle = heatmapCellStyle(zero);
+const cell = { date: "2026-11-01" };
+console.log(JSON.stringify({
+  noData,
+  zero,
+  emptyStyle,
+  zeroStyle,
+  noDataHtml: heatmapCellHtml(cell, null, 1000),
+  zeroHtml: heatmapCellHtml(cell, 0, 1000),
+  // 有数据的日子不能被这次改动带偏喵
+  normal: heatmapLevel(1000, 1000),
+}));
+"""
+        )
+    )
+    payload = json.loads(output)
+    # 无数据不能再落到 0~4 这五个色阶里，必须是单独的标记（这里约定为 null）喵
+    assert payload["noData"] is None
+    # 0 秒仍然是最浅的实心色阶 0，向后兼容既有断言喵
+    assert payload["zero"] == 0
+    # 两者的等级必须不相等，这是本用例的核心喵
+    assert payload["noData"] != payload["zero"]
+    # 样式也必须能区分：无数据空心、0 秒实心最低色阶喵
+    assert payload["emptyStyle"] != payload["zeroStyle"]
+    assert "transparent" in payload["emptyStyle"]
+    assert "transparent" not in payload["zeroStyle"]
+    # 渲染出来的格子也必须是两种不同的 HTML喵
+    assert payload["noDataHtml"] != payload["zeroHtml"]
+    assert "no-data" in payload["noDataHtml"]
+    assert "no-data" not in payload["zeroHtml"]
+    # 满峰值那天还是最深色阶，原有行为不变喵
+    assert payload["normal"] == 4
+
+
+def test_heatmap_render_marks_missing_day_as_empty() -> None:
+    """渲染层不能再用 `|| 0` 把缺的日期压成 0 秒喵。
+
+    直接盯着 renderHeatmap 的源码：它必须用 Map.has 区分「查不到」与「查到 0」，
+    并且把秒数交给 heatmapCellHtml 时用 null 表示无数据喵。
+    """
+    app_js = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    # 喵~注意：定位到 renderHeatmap 函数体，避免误伤别处的 has()喵
+    start = app_js.index("function renderHeatmap(")
+    body = app_js[start : app_js.index("\n}", start)]
+    # 必须用 has() 判断存在性喵
+    assert "secondsByDate.has(cell.date)" in body
+    # 不能再用「查不到就当 0」的老写法喵
+    assert "secondsByDate.get(cell.date) || 0" not in body
+    # 无数据必须传 null 给渲染纯函数喵
+    assert "heatmapCellHtml(cell, seconds, peak)" in body
+
+
+def test_request_seq_discards_stale_response() -> None:
+    """请求序号：后发的请求领到更大的号，先发的那次回来时必须被判为过期喵。
+
+    喵~注意：这是真实缺陷。`loadTimeline` / `selectDevice` / `loadStats` 原来
+    发请求→等回来→直接渲染，没有序号。快速切设备或日期时先发的请求可能后回来，
+    用旧数据覆盖新数据，画面就停在上一个设备/日期上喵。
+    """
+    output = run_in_node(
+        harness(
+            """
+// 清空序号表，从零开始喵
+if (!state.requestSeq) state.requestSeq = { timeline: 0, device: 0, stats: 0 };
+state.requestSeq.timeline = 0;
+state.requestSeq.stats = 0;
+// 连发两次，第二次后发喵
+const first = nextRequestSeq("timeline");
+const second = nextRequestSeq("timeline");
+// 第二次发出之后，第一次的响应就该被判过期喵
+const firstStale = isStaleResponse("timeline", first);
+const secondStale = isStaleResponse("timeline", second);
+// 第二次回来之前，第一次还没过期（模拟「还没发新请求」的场景）喵
+state.requestSeq.timeline = 1;
+const firstBeforeSecond = isStaleResponse("timeline", 1);
+console.log(JSON.stringify({
+  first,
+  second,
+  firstStale,
+  secondStale,
+  firstBeforeSecond,
+}));
+"""
+        )
+    )
+    payload = json.loads(output)
+    # 序号必须严格递增喵
+    assert payload["first"] == 1
+    assert payload["second"] == 2
+    # 先发的那次后回来 → 必须丢弃喵
+    assert payload["firstStale"] is True
+    # 最新的那次不算过期，要正常渲染喵
+    assert payload["secondStale"] is False
+    # 没有更新请求时，自己就是最新的喵
+    assert payload["firstBeforeSecond"] is False
+
+
+def test_request_seq_is_per_page() -> None:
+    """每个页面的序号各数各的，一个页面刷新不能把另一个页面的响应判成过期喵。
+
+    喵~注意：序号必须在 `loadTimeline` / `loadStats` 里各自领，
+    绝不能塞进共用的 `api()` 里做全局计数，否则统计页每拉一次数据，
+    时间轴在飞的那次响应就会被无辜丢掉喵。
+    """
+    output = run_in_node(
+        harness(
+            """
+// 两个页面各自从零开始喵
+state.requestSeq = { timeline: 0, device: 0, stats: 0 };
+const timelineSeq = nextRequestSeq("timeline");
+// 统计页连推三次，时间轴的号不能跟着动喵
+const statsSeq1 = nextRequestSeq("stats");
+const statsSeq2 = nextRequestSeq("stats");
+const statsSeq3 = nextRequestSeq("stats");
+console.log(JSON.stringify({
+  timelineSeq,
+  statsSeq1,
+  statsSeq2,
+  statsSeq3,
+  timelineCounter: state.requestSeq.timeline,
+  statsCounter: state.requestSeq.stats,
+  // 时间轴手上那张号，在统计页刷新之后依然有效喵
+  timelineStillFresh: isStaleResponse("timeline", timelineSeq),
+  statsOldStale: isStaleResponse("stats", statsSeq1),
+  statsMidStale: isStaleResponse("stats", statsSeq2),
+  statsNewestStale: isStaleResponse("stats", statsSeq3),
+}));
+"""
+        )
+    )
+    payload = json.loads(output)
+    # 时间轴只领了一次号，不能因为统计页刷新而增长喵
+    assert payload["timelineSeq"] == 1
+    assert payload["timelineCounter"] == 1
+    # 统计页三次递增互不干扰喵
+    assert payload["statsSeq1"] == 1 and payload["statsSeq2"] == 2 and payload["statsSeq3"] == 3
+    assert payload["statsCounter"] == 3
+    # 时间轴那次响应依然是最新的喵
+    assert payload["timelineStillFresh"] is False
+    # 统计页自己内部照常判过期：前两次作废、最后一次有效喵
+    assert payload["statsOldStale"] is True
+    assert payload["statsMidStale"] is True
+    assert payload["statsNewestStale"] is False
+
+
+def test_load_stats_keeps_newest_response_on_out_of_order_arrival() -> None:
+    """真正跑一遍 loadStats：旧请求后回来时，画面必须停在新数据上喵。
+
+    喵~注意：光扫源码只能证明「比对写在了该在的位置」，证明不了它真的拦得住。
+    这个用例用可控 Promise 让两个请求**乱序返回**，
+    先发的（slow）后回来，只要序号机制没接线，它就会把 fast 的数据盖掉喵。
+    """
+    source = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+    script = "\n".join(
+        [
+            # 最小 DOM / 网络桩：api() 把每次请求挂起，由脚本决定谁先回来喵
+            "function escapeHtml(value) { return String(value); }",
+            'const state = { requestSeq: { timeline: 0, device: 0, stats: 0 }, statsDays: 90,'
+            ' statsDeviceId: "", tzOffsetMinutes: 480, stats: null, statsDeviceList: [] };',
+            'const el = { heatmapBody: { innerHTML: "" } };',
+            "const pending = [];",
+            "function api(path) {",
+            "  return new Promise((resolve, reject) => pending.push({ path, resolve, reject }));",
+            "}",
+            # 渲染只记下这一屏画的是哪份数据喵
+            "function renderStats() { globalThis.rendered = state.stats ? state.stats.tag : null; }",
+            "function markShotReady() {}",
+            "function handleUnauthorized() {}",
+            extract_function(source, "nextRequestSeq"),
+            extract_function(source, "isStaleResponse"),
+            # 喵~注意：extract_function 从 `function` 关键字开始截，
+            # loadStats 前面的 async 会丢，这里补回去，否则 await 是语法错误喵
+            "async " + extract_function(source, "loadStats"),
+            """
+(async () => {
+  // 先请求 slow，紧接着改成 fast 再请求一次喵
+  state.statsDeviceId = "slow";
+  const slow = loadStats();
+  state.statsDeviceId = "fast";
+  const fast = loadStats();
+  // 后发的 fast 先回来，正常渲染喵
+  pending[1].resolve({ tag: "fast", devices: [] });
+  await fast;
+  const afterFast = globalThis.rendered;
+  // 先发的 slow 后回来，必须被丢掉，不能覆盖已画好的 fast喵
+  pending[0].resolve({ tag: "slow", devices: [] });
+  await slow;
+  console.log(JSON.stringify({
+    afterFast,
+    rendered: globalThis.rendered,
+    stateTag: state.stats.tag,
+    calls: pending.length,
+  }));
+})();
+""",
+        ]
+    )
+    payload = json.loads(run_in_node(script))
+    # 两次请求都真的发出去了喵
+    assert payload["calls"] == 2
+    # fast 先回来时正常画上喵
+    assert payload["afterFast"] == "fast"
+    # slow 后回来不许改动画面，最终必须还是 fast喵
+    assert payload["rendered"] == "fast"
+    assert payload["stateTag"] == "fast"
+
+
+def test_request_seq_wired_into_loaders() -> None:
+    """三个加载函数都必须真的领号并比对，只写纯函数不接线就等于没修喵。
+
+    喵~注意：这里用「整行精确匹配」而不是子串包含——
+    子串匹配会被 `isStaleResponse(...) && false` 这类语义上关掉的写法骗过去，
+    也会被 catch 分支里的第二处调用骗过去喵。
+    """
+    app_js = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    def body_of(name: str) -> str:
+        """按函数名截出函数体，方便逐段断言喵。"""
+        start = app_js.index(f"async function {name}(")
+        return app_js[start : app_js.index("\n}", start)]
+
+    def assert_guarded_before(func: str, key: str, write_marker: str) -> None:
+        """领号 + 独立成行的比对必须都在写 state 之前喵。"""
+        body = body_of(func)
+        # 必须先领号喵
+        assert f'nextRequestSeq("{key}")' in body, f"{func} 没领号"
+        # 比对必须是完整独立的一行判断，带 && false 之类的一律不算喵
+        guard = re.compile(
+            rf'^\s*if \(isStaleResponse\("{key}", seq\)\) return;$', re.MULTILINE
+        )
+        matches = list(guard.finditer(body))
+        # 成功路径与 catch 各要一处喵
+        assert len(matches) >= 2, f"{func} 的过期比对不全或写法被改坏"
+        # 关键：第一处比对必须在写 state 之前，否则旧数据已经落盘了喵
+        assert matches[0].start() < body.index(write_marker), (
+            f"{func} 先写了 state 才比对，等于没修"
+        )
+
+    # 时间轴 / 设备详情 / 统计各领各的号，且都在写 state 之前拦住旧响应喵
+    assert_guarded_before("loadTimeline", "timeline", "state.timeline = body")
+    assert_guarded_before("selectDevice", "device", "state.detail = detail")
+    assert_guarded_before("loadStats", "stats", "state.stats = body")
+    # 喵~注意：共用的 api() 里不许做全局序号，不同页面要互不干扰喵
+    api_body = body_of("api")
+    assert "requestSeq" not in api_body
+    assert "isStaleResponse" not in api_body

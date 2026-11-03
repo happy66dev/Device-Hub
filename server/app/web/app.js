@@ -66,6 +66,9 @@ const state = {
   timelineTimer: null,
   // 截图挂起的定位请求，等时间轴画完再执行喵
   pendingShotFocus: null,
+  // 喵~注意：每个页面各自的请求序号，用来丢掉「后发先至」的旧响应喵。
+  // 必须按页面分开计数——api() 是共用的，全局一个号会让统计页把时间轴的号顶掉喵
+  requestSeq: { timeline: 0, device: 0, stats: 0 },
   loading: false,
 };
 
@@ -236,6 +239,39 @@ async function api(path, options) {
   return response.json();
 }
 
+/**
+ * 开一次新请求，返回本次请求的序号喵。
+ *
+ * 输入：页面键（timeline / device / stats）。
+ * 输出：本次请求的序号（从 1 开始递增）。
+ * 边界：state.requestSeq 缺失时按需建表，老页面也不会炸喵。
+ *
+ * 喵~注意：为什么需要它——快速切设备或切日期时会同时飞好几个请求，
+ * 先发的可能后回来，回来晚的旧数据会把新数据覆盖掉。
+ * 每个请求出发前领一个号，回来时比对「我还是不是最新的那个」就能丢掉旧响应喵。
+ */
+function nextRequestSeq(key) {
+  // 喵~防御：序号表是模块级共享的，缺失时补上，避免读写 undefined 喵
+  if (!state.requestSeq) state.requestSeq = { timeline: 0, device: 0, stats: 0 };
+  // 只给本页面的计数器加一，别的页面不受影响喵
+  state.requestSeq[key] = (Number(state.requestSeq[key]) || 0) + 1;
+  return state.requestSeq[key];
+}
+
+/**
+ * 判断这次响应是不是过期的那一次喵。
+ *
+ * 输入：页面键、发请求时领到的序号。
+ * 输出：true 表示已经有更新的请求发出去过，本次结果必须丢弃。
+ * 边界：计数器缺失或为 0 时只认序号 0，正常流程里不会走到喵。
+ */
+function isStaleResponse(key, seq) {
+  // 读本页面当前的号，跟手上这个比喵
+  const latest = state.requestSeq ? Number(state.requestSeq[key]) || 0 : 0;
+  // 不相等说明期间又发过新请求，自己已经过期喵
+  return latest !== Number(seq);
+}
+
 /** 电量进度条颜色：低于 20% 用警示色喵。 */
 function batteryClass(percent) {
   return percent != null && percent < 20 ? "battery-fill low" : "battery-fill";
@@ -397,13 +433,20 @@ async function selectDevice(deviceId) {
   }
   renderDeviceTable();
   el.deviceDetail.innerHTML = '<div class="panel detail"><p class="empty">加载中…</p></div>';
+  // 喵~注意：领号要在发请求之前，回来时用它判断自己有没有被后来的点击顶掉喵
+  const seq = nextRequestSeq("device");
   try {
-    state.detail = await api(`/api/v1/devices/${encodeURIComponent(deviceId)}`);
+    const detail = await api(`/api/v1/devices/${encodeURIComponent(deviceId)}`);
+    // 喵~防御：期间又点了别的设备时，这份旧详情直接丢掉，别覆盖新画面喵
+    if (isStaleResponse("device", seq)) return;
+    state.detail = detail;
     el.deviceDetail.innerHTML = renderDetail(state.detail);
     bindDetailActions(deviceId);
     // 窗口列表单独拉，避免详情接口变慢喵
-    await loadDeviceWindows(deviceId);
+    await loadDeviceWindows(deviceId, seq);
   } catch (error) {
+    // 喵~防御：旧请求失败也别去改已经换过的详情面板喵
+    if (isStaleResponse("device", seq)) return;
     if (error.unauthorized) {
       handleUnauthorized();
       return;
@@ -413,11 +456,13 @@ async function selectDevice(deviceId) {
 }
 
 /** 拉取并渲染某台设备当前打开的窗口喵。 */
-async function loadDeviceWindows(deviceId) {
+async function loadDeviceWindows(deviceId, seq) {
   const container = document.getElementById("detail-windows");
   if (!container) return;
   try {
     const body = await api(`/api/v1/devices/${encodeURIComponent(deviceId)}/windows`);
+    // 喵~防御：窗口列表比详情更慢，回来时设备可能已经被换掉，这份就作废喵
+    if (seq != null && isStaleResponse("device", seq)) return;
     const windows = body.windows || [];
     if (!windows.length) {
       container.innerHTML = '<p class="empty">没有窗口数据（安卓端不上报窗口）</p>';
@@ -434,6 +479,8 @@ async function loadDeviceWindows(deviceId) {
       )
       .join("");
   } catch (error) {
+    // 喵~防御：过期请求的报错也不许画到新设备的窗口区里喵
+    if (seq != null && isStaleResponse("device", seq)) return;
     if (error.unauthorized) {
       handleUnauthorized();
       return;
@@ -675,20 +722,35 @@ function batteryChart(points) {
   </svg>`;
 }
 
+/** 把时刻压成「UTC 整点」键，用于和服务端按 UTC 切的桶对齐喵。 */
+function utcHourKey(moment) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${moment.getUTCFullYear()}-${pad(moment.getUTCMonth() + 1)}-${pad(moment.getUTCDate())}T${pad(moment.getUTCHours())}`;
+}
+
 /** 生成近 24 小时使用时长柱状图 SVG 喵。 */
-function usageChart(timeline) {
+function usageChart(timeline, nowOverride) {
   const hours = 24;
-  const now = serverNow();
+  const now = nowOverride instanceof Date ? new Date(nowOverride.getTime()) : serverNow();
   now.setMinutes(0, 0, 0);
+  // 喵~注意：桶的键必须用「小时」字符串比，不能用毫秒时间戳精确比。
+  // 服务端的桶是按 **UTC 整点**切的（`substr(sampled_at,1,13)` + ':00:00Z'），
+  // 而这里的槽位是 `serverNow()` 减小时数得到的**同一毫秒偏移**。
+  // 两者只有在浏览器时区是整小时偏移时才碰得上：东八区(+8)刚好对上，
+  // 但 UTC+5:30、+9:45 这类非整小时时区会整体错开 30/45 分钟 → 24 根柱子全 0，
+  // 界面一片空白，还不报错喵。
+  // 改成按 UTC 整点的小时键对齐，任何时区都能命中同一个桶喵
   const bucketMap = new Map();
   (timeline || []).forEach((bucket) => {
     const moment = new Date(bucket.bucket_start);
-    if (!Number.isNaN(moment.getTime())) bucketMap.set(moment.getTime(), bucket.seconds);
+    if (Number.isNaN(moment.getTime())) return;
+    // 用 UTC 整点做键，和服务端切桶口径一致喵
+    bucketMap.set(utcHourKey(moment), bucket.seconds);
   });
   const slots = [];
   for (let offset = hours - 1; offset >= 0; offset -= 1) {
     const moment = new Date(now.getTime() - offset * 3600 * 1000);
-    slots.push({ moment, seconds: bucketMap.get(moment.getTime()) || 0 });
+    slots.push({ moment, seconds: bucketMap.get(utcHourKey(moment)) || 0 });
   }
   const maxSeconds = Math.max(1, ...slots.map((slot) => slot.seconds));
   const width = 320;
@@ -1540,6 +1602,9 @@ async function loadTimeline(options = {}) {
   const silent = Boolean(options.silent);
   // 下拉框每次都重建，新设备才会及时出现在列表里（当前选中项会保留）喵
   renderTimelineControls();
+  // 喵~注意：一进函数就先领本次序号——包括下面「没有设备」的提前返回也要占一个号，
+  // 这样之前还在飞的旧请求会被判成过期，不会回头把「还没有任何设备」的提示盖掉喵
+  const seq = nextRequestSeq("timeline");
   const deviceId = state.timelineDeviceId || el.tlDevice.value;
   // 喵~防御：一台设备都没有时不用发请求喵
   if (!deviceId) {
@@ -1593,6 +1658,9 @@ async function loadTimeline(options = {}) {
         ? `/api/v1/timeline?devices=${encodeURIComponent(mergedIds.join(","))}&${query}`
         : `/api/v1/devices/${encodeURIComponent(deviceId)}/timeline?${query}`;
     const body = await api(url);
+    // 喵~注意：这是竞态修复的关键判断——快速切设备或切日期时先发的请求可能后回来，
+    // 只要期间又发过新请求，手上这份就是旧数据，直接丢掉，绝不能往画面上盖喵
+    if (isStaleResponse("timeline", seq)) return;
     // 时间轴响应带服务端"现在"，顺手校准浏览器时钟喵
     applyServerClock(body.server_now);
     // 时区以服务端为准，换个时区的电脑看也一致喵
@@ -1613,6 +1681,8 @@ async function loadTimeline(options = {}) {
     // 恢复滚动位置喵
     if (el.tlScroll && scrollLeft > 0) el.tlScroll.scrollLeft = scrollLeft;
   } catch (error) {
+    // 喵~防御：过期请求的错误也不许画，否则新日期上会突然冒出旧日期的「加载失败」喵
+    if (isStaleResponse("timeline", seq)) return;
     if (error.unauthorized) {
       // 喵~注意：口令无效时页面会弹遮罩，截图那边有专门的自检会拦下，这里照样置位
       // 免得后端白等到超时喵
@@ -2204,8 +2274,16 @@ function hideTimelinePointer() {
 }
 
 function shiftTimelineDate(days) {
-  const base = el.tlDate.value ? new Date(`${el.tlDate.value}T00:00:00`) : new Date();
-  base.setDate(base.getDate() + days);
+  // 喵~注意：这里必须用 UTC 口径。`el.tlDate.value` 是「服务端时区的日历日」，
+  // 拼上 T00:00:00 后是**浏览器本地**零点，而 localDateText 又按服务端时区去读。
+  // 用 setDate/getDate（本地）加减，再被 localDateText 按服务端时区一读，
+  // 浏览器在 UTC+9 及以东时就会整体错一天（实测 UTC+9/+10/+12 输 2026-11-03 得 2026-11-02，
+  // 连 days=0 都是错的）喵。
+  // 所以：先把日期当成 UTC 零点，用 setUTCDate 加减，再交给 localDateText喵
+  const base = el.tlDate.value
+    ? new Date(`${el.tlDate.value}T00:00:00Z`)
+    : new Date(serverNow().getTime());
+  base.setUTCDate(base.getUTCDate() + days);
   state.timelineDate = localDateText(base);
   el.tlDate.value = state.timelineDate;
   loadTimeline();
@@ -2383,9 +2461,17 @@ function renderRankings() {
  */
 const HEATMAP_LEVELS = ["#ebedf0", "#9be9a8", "#40c463", "#30a14e", "#216e39"];
 
-/** 把秒数换算成热力图的色阶下标喵。 */
+/** 把秒数换算成热力图的色阶下标喵。
+ *
+ * 喵~注意：返回 null 表示「这一天根本没有数据」（设备没开机 / 没上报），
+ * 而 0 表示「确实上报了、只是这一天用了 0 秒」——两者必须分开，
+ * 否则用户分不清是设备没开机还是真的没用电脑喵。
+ */
 function heatmapLevel(seconds, peak) {
-  // 没有记录就是最浅的那格喵
+  // 喵~注意：null / undefined 才是「无数据」，这里不能用 !seconds 判断，
+  // 否则 0 秒会被一起吞掉，又退回到原来那个看不出区别的误区喵
+  if (seconds === null || seconds === undefined) return null;
+  // 有记录但为 0 秒时给最浅的实心色阶喵
   if (!seconds || seconds <= 0) return 0;
   // 喵~防御：峰值缺失时按「有数据就算一级」处理，避免除零喵
   if (!peak || peak <= 0) return 1;
@@ -2395,6 +2481,41 @@ function heatmapLevel(seconds, peak) {
   if (ratio >= 0.5) return 3;
   if (ratio >= 0.25) return 2;
   return 1;
+}
+
+/** 按色阶给出格子的内联样式喵。
+ *
+ * 输入：heatmapLevel 的返回值（0~4，或 null 表示无数据）。
+ * 输出：可直接塞进 style 的字符串。
+ * 边界：无数据时画成空心灰框，和 0 秒的实心最低色阶一眼就能分开喵。
+ */
+function heatmapCellStyle(level) {
+  // 喵~注意：无数据不能只画最浅色——那正好就是 0 秒的颜色，等于没区分；
+  // 这里用透明底 + 一圈浅灰描边，做成「空心格」喵
+  if (level === null) return "background:transparent;box-shadow:inset 0 0 0 1px #d0d7de";
+  // 有数据就按色阶填实心色喵
+  return `background:${HEATMAP_LEVELS[level]}`;
+}
+
+/** 画一个热力图格子喵。
+ *
+ * 输入：格子描述（date / blank）、当天秒数（null 表示无数据）、峰值。
+ * 输出：一个 <i> 元素的 HTML。
+ * 边界：未来日期留空；无数据画空心灰框；0 秒画实心最低色阶喵。
+ */
+function heatmapCellHtml(cell, seconds, peak) {
+  // 未来日期画成透明占位喵
+  if (cell.blank) return '<i class="heatmap-cell blank"></i>';
+  // 色阶（null 表示这一天没有任何数据）喵
+  const level = heatmapLevel(seconds, peak);
+  // 无数据多挂一个 class，方便样式与测试识别喵
+  const className = level === null ? "heatmap-cell no-data" : "heatmap-cell";
+  // 悬浮提示把三种情况说清楚：无数据 / 0 秒 / 有用时喵
+  let tip = `${cell.date} · 无数据（设备未上报）`;
+  if (level !== null) {
+    tip = seconds > 0 ? `${cell.date} · ${formatDuration(seconds)}` : `${cell.date} · 0 秒（未使用）`;
+  }
+  return `<i class="${className}" style="${heatmapCellStyle(level)}" title="${escapeHtml(tip)}"></i>`;
 }
 
 /** 把日期补成两位喵。 */
@@ -2462,13 +2583,11 @@ function renderHeatmap(payload) {
   // 格子矩阵，按周分列喵
   const cellHtml = cells
     .map((cell) => {
-      // 未来日期画成透明占位喵
-      if (cell.blank) return '<i class="heatmap-cell blank"></i>';
-      const seconds = secondsByDate.get(cell.date) || 0;
-      const level = heatmapLevel(seconds, peak);
-      // 悬浮提示写清日期与时长，没记录就明说喵
-      const tip = seconds > 0 ? `${cell.date} · ${formatDuration(seconds)}` : `${cell.date} · 没有记录`;
-      return `<i class="heatmap-cell" style="background:${HEATMAP_LEVELS[level]}" title="${escapeHtml(tip)}"></i>`;
+      // 喵~注意：这里必须用 has() 判断「有没有这一天」，
+      // 不能写成 `|| 0`——那会把「无数据」压成「0 秒」，正是要修的那个缺陷喵
+      const seconds = secondsByDate.has(cell.date) ? secondsByDate.get(cell.date) : null;
+      // 单个格子的 HTML 交给纯函数生成，方便单测喵
+      return heatmapCellHtml(cell, seconds, peak);
     })
     .join("");
   // 月份标签：在每月第一次出现的那一列上写月份喵
@@ -2500,9 +2619,10 @@ function renderHeatmap(payload) {
       <div class="heatmap-cells">${cellHtml}</div>
     </div>
   </div>`;
-  // 图例：少 → 多喵
+  // 图例：先给一个「无数据」的空心格，再由少到多排色阶喵
   if (el.heatmapLegend) {
-    el.heatmapLegend.innerHTML = `<span>少</span>${HEATMAP_LEVELS.map(
+    el.heatmapLegend.innerHTML = `<i class="heatmap-cell no-data" style="${heatmapCellStyle(null)}"></i><span>无数据</span>
+      <span>少</span>${HEATMAP_LEVELS.map(
       (color) => `<i class="heatmap-cell" style="background:${color}"></i>`,
     ).join("")}<span>多</span>`;
   }
@@ -2846,17 +2966,25 @@ function renderStatsDeviceSwitch(payload) {
 
 /** 拉取热力图数据并渲染喵。 */
 async function loadStats() {
+  // 喵~注意：连续点设备筛选按钮会连发好几个请求，先发的可能后回来。
+  // 领号后回来时比对，确认自己是最新那次才允许写进 state 并重画喵
+  const seq = nextRequestSeq("stats");
   try {
     // 设备筛选走服务端，热力图与汇总都只算那一台喵
     let query = `days=${state.statsDays}&tz_offset_minutes=${state.tzOffsetMinutes}`;
     if (state.statsDeviceId) query += `&devices=${encodeURIComponent(state.statsDeviceId)}`;
     const body = await api(`/api/v1/stats/heatmap?${query}`);
+    // 喵~防御：过期响应必须原样丢掉，否则筛选明明换了台设备，
+    // 画面却被慢回来的旧数据改回上一台，看起来像按钮点了没反应喵
+    if (isStaleResponse("stats", seq)) return;
     // 喵~注意：筛了设备时服务端只返回那一台的明细，
     // 但切换按钮需要完整清单，所以记下上一次的全量清单复用喵
     if (!state.statsDeviceId) state.statsDeviceList = body.devices || [];
     state.stats = body;
     renderStats();
   } catch (error) {
+    // 喵~防御：过期请求的报错也别画，避免老请求把新设备的热力图换成错误提示喵
+    if (isStaleResponse("stats", seq)) return;
     // 喵~防御：口令失效走统一处理喵
     if (error.unauthorized) {
       handleUnauthorized();

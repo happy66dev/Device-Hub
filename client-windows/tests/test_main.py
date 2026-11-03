@@ -492,6 +492,16 @@ class _StubTracker:
         for key, seconds in pending.items():
             self._pending[key] = self._pending.get(key, 0) + seconds
 
+    def add_seconds(self, app_name: str, seconds: int) -> None:
+        """模拟采集到新的使用时长喵。"""
+        # 直接累加到待上报表里喵
+        self._pending[app_name] = self._pending.get(app_name, 0) + seconds
+
+    def pending_total_seconds(self) -> int:
+        """返回当前待上报的总秒数喵。"""
+        # 求和喵
+        return sum(self._pending.values())
+
 
 def test_report_once_keeps_afk_with_usage_pending() -> None:
     """进入 AFK 的那一批要同时带上 afk=true 与攒下的时长，服务端才能立刻画出空档喵。"""
@@ -718,6 +728,29 @@ def test_foreground_reuse_keeps_counting(tmp_path: Path, monkeypatch) -> None:
     totals = {item["app"]: item["seconds"] for item in reported[-1]}
     assert totals.get("Code.exe", 0) >= 3
 
+def test_sample_gap_cap_follows_configured_interval() -> None:
+    """单轮计入上限必须跟着采样间隔走，否则间隔调大就会系统性丢时长喵。
+
+    喵~注意：这是真实缺陷。上限原来写死 15 秒，而 `config.py` 允许把
+    `sample_interval_seconds` 调到 60。那时每轮真实过去 60 秒、却只记 15 秒，
+    **稳定丢掉 75% 的使用时长**，而且日志里一点异常都没有，
+    事后完全看不出是「少记」还是「没在用」喵。
+    """
+    # 每个合法间隔都必须能完整记上一轮，一秒钟都不能丢喵
+    for interval in (1, 5, 10, 15, 20, 30, 45, 60):
+        # 该间隔下的单轮上限喵
+        cap = main_module.sample_gap_cap(interval)
+        # 上限至少要覆盖一个完整周期喵
+        assert cap >= interval, f"间隔 {interval}s 时上限只有 {cap}s，会丢数据"
+        # 真实跑一轮：过去一个周期，必须原样记满喵
+        assert main_module.compute_sample_gap(float(interval), 0.0, False, cap) == float(interval)
+    # 默认 5 秒时仍保留原来 15 秒的宽松下限喵
+    assert main_module.sample_gap_cap(5) == main_module.MAX_SAMPLE_GAP_SECONDS
+    # 喵~防御：进程被挂起几小时不能凭空记成使用时长，上限照旧挡住喵
+    assert main_module.compute_sample_gap(10800.0, 0.0, False, main_module.sample_gap_cap(5)) == 15.0
+    assert main_module.compute_sample_gap(10800.0, 0.0, False, main_module.sample_gap_cap(60)) == 120.0
+
+
 def test_compute_sample_gap_caps_short_rounds() -> None:
     """普通轮次最多补 15 秒，抓不到前台的轮次最多补 60 秒喵。"""
     # 正常 5 秒一轮喵
@@ -805,56 +838,120 @@ class _ExplodingReporter(_StubReporter):
         raise RuntimeError("发送炸了")
 
 
-def test_report_once_keeps_data_when_send_raises(tmp_path: Path) -> None:
-    """发送抛异常时这一批数据要还回累加器并立刻落盘，等下次补报喵。"""
+def test_report_once_freezes_batch_when_send_raises(tmp_path: Path) -> None:
+    """发送抛异常时这一批要冻结下来原样重发，**不能**并回累加器喵。
+
+    喵~注意：这是 P0 缺陷的防线。服务端用 `(device_id, reported_at)` 做幂等键，
+    同一键重复上报只更新设备状态、不重复加秒数。
+    老做法「失败就把秒数并回累加器」会让下一批变成「旧+新」的超集并重新取当前时刻，
+    服务端当成全新批次又加一遍，使用时长**永久翻倍**（实测 30 秒重发一次变 60 秒）喵。
+    """
     # 假上报器在发送阶段炸喵
     reporter = _ExplodingReporter("send")
     tracker = _StubTracker({"Code.exe": 42})
     store = main_module.UsageStore(tmp_path / "usage-state.json")
     # 这次上报必须返回失败，而不是把异常抛给主循环喵
-    assert main_module._report_once(reporter, tracker, {}, None, store) is False
-    # 数据要原样还回累加器喵
-    assert tracker.restored == {"Code.exe": 42}
-    # 磁盘上也要留一份，进程被杀也不会丢喵
-    assert store.load() == {"Code.exe": 42}
+    succeeded, batch = main_module._report_once(reporter, tracker, {}, None, store)
+    assert succeeded is False
+    # 喵~注意：绝对不能并回累加器，否则下一批就是超集、身份变了喵
+    assert tracker.restored == {}, "失败后不该把数据并回累加器"
+    # 这一批要被冻结下来，秒数原样喵
+    assert batch is not None
+    assert batch.seconds == {"Code.exe": 42}
+    # 而且它必须带一个固定的上报时刻，重试期间不能变喵
+    assert batch.reported_at
+    # 磁盘上也要留一份，进程被杀也能按原时刻重发喵
+    saved = store.load_batch()
+    assert saved is not None
+    assert saved.seconds == {"Code.exe": 42}
+    assert saved.reported_at == batch.reported_at
 
 
-def test_report_once_keeps_data_when_payload_build_raises(tmp_path: Path) -> None:
-    """组装上报体抛异常时同样不能丢数据喵。"""
+def test_retry_keeps_same_reported_at_so_server_dedupes(tmp_path: Path) -> None:
+    """重试时 reported_at 必须和第一次一模一样，服务端才能认出是同一批喵。
+
+    喵~注意：这是整个 P0 修复的核心断言。只要时刻变了，
+    服务端就会把重发当成新数据、再累加一遍喵。
+    """
+    # 第一次失败，拿到冻结的批次喵
+    reporter = _ExplodingReporter("send")
+    tracker = _StubTracker({"Code.exe": 30})
+    store = main_module.UsageStore(tmp_path / "usage-state.json")
+    _succeeded, batch = main_module._report_once(reporter, tracker, {}, None, store)
+    assert batch is not None
+    # 喵~注意：这期间累加器里又攒了新数据，重发这一批时不能把它带进去喵
+    tracker.add_seconds("QQ.exe", 10)
+    # 第二次重试，用一个记录 payload 的假上报器喵
+    recorder = _StubReporter()
+    succeeded, still_pending = main_module._report_once(
+        recorder, tracker, {}, None, store, pending_batch=batch
+    )
+    assert succeeded is True
+    # 重试成功后不再有待重发批次喵
+    assert still_pending is None
+    # 喵~注意：发出去的时刻必须还是第一次那个喵
+    assert recorder.payloads[0]["reported_at"] == batch.reported_at
+    # 而且这一批只含原来那 30 秒，不含后来攒的 10 秒喵
+    deltas = recorder.payloads[0]["usage_delta"]
+    assert sum(item["seconds"] for item in deltas) == 30
+    # 排在后面的新数据要原封不动留在累加器里，等下一轮再发喵
+    assert tracker.pending_total_seconds() == 10
+
+
+def test_report_once_freezes_batch_when_payload_build_raises(tmp_path: Path) -> None:
+    """组装上报体抛异常时同样要冻结这一批，不能丢数据喵。"""
     # 假上报器在组装阶段炸喵
     reporter = _ExplodingReporter("build")
     tracker = _StubTracker({"Code.exe": 17, "QQ.exe": 3})
     store = main_module.UsageStore(tmp_path / "usage-state.json")
     # 上报失败但不抛异常喵
-    assert main_module._report_once(reporter, tracker, {}, None, store) is False
-    # 两个应用的秒数都要留着喵
-    assert tracker.restored == {"Code.exe": 17, "QQ.exe": 3}
-    assert store.load() == {"Code.exe": 17, "QQ.exe": 3}
+    succeeded, batch = main_module._report_once(reporter, tracker, {}, None, store)
+    assert succeeded is False
+    # 两个应用的秒数都要留在冻结的批次里喵
+    assert batch is not None
+    assert batch.seconds == {"Code.exe": 17, "QQ.exe": 3}
+    # 累加器不能被写回喵
+    assert tracker.restored == {}
+    # 落盘的批次也要能读回来喵
+    assert store.load_batch().seconds == {"Code.exe": 17, "QQ.exe": 3}
 
 
-def test_discard_stale_usage_state_clears_leftovers(tmp_path: Path) -> None:
-    """重启时残留的待上报秒数要被丢弃，不能补报到可能离线的时段上喵。"""
-    # 造一份上次退出时的残留文件喵
+def test_discard_stale_usage_state_resends_new_format(tmp_path: Path) -> None:
+    """新格式（带固定时刻）的残留要原样重发，不能丢喵。
+
+    喵~注意：这和下面那条「老格式丢弃」是两种不同处置。
+    新格式知道这批秒数属于哪个时刻，服务端能靠幂等键认出，
+    重发只会加一次；丢了才是真的丢数据喵。
+    """
+    # 造一份带固定时刻的残留喵
+    store = main_module.UsageStore(tmp_path / "usage-state.json")
+    batch = main_module.PendingBatch({"Code.exe": 120}, "2026-11-03T05:00:00+00:00")
+    store.save_batch(batch)
+    # 恢复后要拿回同一个批次喵
+    restored = main_module.discard_stale_usage_state(store)
+    assert restored is not None
+    assert restored.seconds == {"Code.exe": 120}
+    # 喵~注意：时刻必须原样带回来，否则幂等就失效了喵
+    assert restored.reported_at == "2026-11-03T05:00:00+00:00"
+
+
+def test_discard_stale_usage_state_drops_legacy_format(tmp_path: Path) -> None:
+    """老格式（无时间戳）的残留只能丢，不能补报到可能离线的时段上喵。"""
+    # 老格式：平铺字典，没有时刻喵
     store = main_module.UsageStore(tmp_path / "usage-state.json")
     store.save({"DeepSeek Harness\u0000deepseek harness.exe": 360, "QQ.exe\u0000": 40})
-    # 丢弃后应当返回被丢掉的秒数总和喵
-    assert main_module.discard_stale_usage_state(store) == 400
+    # 丢弃后返回 None喵
+    assert main_module.discard_stale_usage_state(store) is None
     # 文件要被清空，下次启动不再读到同一份陈旧数据喵
     assert store.load() == {}
 
 
 def test_discard_stale_usage_state_is_noop_when_clean(tmp_path: Path) -> None:
-    """没有残留文件时什么也不做，返回值是 0 喵。"""
+    """没有残留文件时什么也不做，返回 None 喵。"""
     # 全新目录，文件根本不存在喵
     store = main_module.UsageStore(tmp_path / "usage-state.json")
-    assert main_module.discard_stale_usage_state(store) == 0
+    assert main_module.discard_stale_usage_state(store) is None
     # 调用之后也不该凭空造出文件喵
     assert not (tmp_path / "usage-state.json").exists()
 
 
-def test_discard_stale_usage_state_clears_empty_file(tmp_path: Path) -> None:
-    """文件存在但内容为空时同样返回 0，并且不报错喵。"""
-    # 先写一个空字典喵
-    store = main_module.UsageStore(tmp_path / "usage-state.json")
-    store.save({})
-    assert main_module.discard_stale_usage_state(store) == 0

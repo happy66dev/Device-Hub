@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app.config import ConfigError, load_config
+from app.config import ConfigError, LOG_LEVELS, load_config
 
 
 def _write_config(tmp_path: Path, text: str) -> Path:
@@ -214,3 +214,93 @@ def test_example_config_has_no_real_secret(tmp_path: Path) -> None:
             if stripped.startswith(key):
                 value = stripped.split(":", 1)[1].strip()
                 assert value == '""', f"{key} 在示例里应留空，实际是 {value}"
+
+
+# ==================== 日志级别枚举校验（任务 3）喵 ====================
+
+
+def _config_with_log_level(tmp_path: Path, log_level_line: str) -> Path:
+    """拼一份带指定 log_level 行的最小配置喵。"""
+    # 其余字段保持最小可用，确保失败原因只可能来自 log_level喵
+    text = f"server:\n{log_level_line}\ningest:\n  token: \"0123456789abcdef\"\n"
+    return _write_config(tmp_path, text)
+
+
+def test_load_config_rejects_invalid_log_level(tmp_path: Path) -> None:
+    """拼错的 verbose 必须报配置错误，不能留到启动 logging 时才炸喵。"""
+    # 写成 verbose 这种不存在的级别喵
+    config_path = _config_with_log_level(tmp_path, '  log_level: "verbose"')
+    # 喵~防御：错误信息里要列出全部合法取值，主人照着改就行喵
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(config_path)
+    message = str(excinfo.value)
+    # 报错要指名字段路径喵
+    assert "server.log_level" in message
+    # 合法取值必须逐个出现喵
+    for level in LOG_LEVELS:
+        assert level in message
+    # 原始错误值也要带上，方便定位喵
+    assert "verbose" in message
+
+
+@pytest.mark.parametrize("raw", ["info", "INFO", "Info", "  warning  "])
+def test_load_config_normalizes_log_level(tmp_path: Path, raw: str) -> None:
+    """大小写不敏感的合法值都要通过，并规范成大写喵。"""
+    # 写进去喵
+    config_path = _config_with_log_level(tmp_path, f'  log_level: "{raw}"')
+    # 读出来必须是大写规范值喵
+    config = load_config(config_path)
+    assert config.server.log_level == raw.strip().upper()
+
+
+def test_load_config_log_level_defaults_to_info(tmp_path: Path) -> None:
+    """不写 log_level 时用默认值 INFO喵。"""
+    # 完全省略 log_level 喵
+    config_path = _write_config(
+        tmp_path,
+        "server:\n  port: 8080\ningest:\n  token: \"0123456789abcdef\"\n",
+    )
+    # 默认值必须是 INFO喵
+    assert load_config(config_path).server.log_level == "INFO"
+
+
+@pytest.mark.parametrize("raw", ["", "   "])
+def test_load_config_blank_log_level_falls_back(tmp_path: Path, raw: str) -> None:
+    """空串按「没写」处理，退回默认值 INFO，而不是报错喵。
+
+    喵~取舍：配置文件里写 `log_level: ""` 通常是想用默认值；
+    这里按默认值处理比直接拒绝启动更宽容，行为也在注释里写明了喵。
+    """
+    # 空串或纯空白喵
+    config_path = _config_with_log_level(tmp_path, f'  log_level: "{raw}"')
+    # 退回 INFO喵
+    assert load_config(config_path).server.log_level == "INFO"
+
+
+def test_load_config_rejects_non_string_log_level(tmp_path: Path) -> None:
+    """log_level 写成数字时仍按类型错误拒绝喵。"""
+    # 写成数字喵
+    config_path = _config_with_log_level(tmp_path, "  log_level: 20")
+    # 期望类型错误提示喵
+    with pytest.raises(ConfigError, match="必须是字符串"):
+        load_config(config_path)
+
+
+def test_real_config_log_level_is_legal() -> None:
+    """仓库里真实的 config.yaml 用的级别必须仍然合法，保证向后兼容喵。"""
+    # 喵~注意：这个用例只读文件，绝不写回真实配置喵
+    real_config = Path(__file__).resolve().parents[1] / "config.yaml"
+    if not real_config.is_file():
+        # 没有真实配置（例如 CI 环境）就跳过喵
+        pytest.skip("仓库里没有 config.yaml，跳过向后兼容检查")
+    # 读取真实配置里写的值喵
+    text = real_config.read_text(encoding="utf-8")
+    # 取出 log_level 那一行喵
+    line = next(
+        (item for item in text.splitlines() if item.strip().startswith("log_level:")),
+        None,
+    )
+    assert line is not None, "真实配置里应该有 log_level"
+    # 取值必须能通过新的枚举校验喵
+    value = line.split(":", 1)[1].strip().strip('"').strip("'")
+    assert value.upper() in LOG_LEVELS, value

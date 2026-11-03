@@ -415,6 +415,11 @@ def save_report(
             if not app_name:
                 continue
             # 逐条写入快照喵
+            # 喵~注意：这里写的是 received_text（服务端收到时刻），
+            # **不是** payload.reported_at（客户端上报时刻）。
+            # 列名虽然叫 reported_at，但语义与 reports.received_at 一致，
+            # 这样时间轴的心跳区间和窗口标题区间才用同一个时间基准喵。
+            # 改动这里会让两套区间错位，改前先看 db.py 里那张表的注释喵
             connection.execute(
                 insert_window_sql,
                 (

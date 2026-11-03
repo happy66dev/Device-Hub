@@ -15,12 +15,14 @@ import hmac
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import time
+import zlib
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import AsyncIterator
@@ -34,6 +36,7 @@ from starlette.concurrency import run_in_threadpool
 from .clock import DEFAULT_SERVERS, TrustedClock, get_clock, set_clock
 
 from . import acl, botcheck, db, icons, ingest, maintenance, people, presence, queries, settings, storage
+from . import archive, archive_codec
 from .bot import simulate
 from .bot import users as bot_users
 from .bot.runner import BotRunner
@@ -57,17 +60,25 @@ HEARTBEAT_TIMEOUT_SECONDS = presence.DEFAULT_HEARTBEAT_TIMEOUT_SECONDS
 
 
 def _bot_signature(config: AppConfig) -> tuple[str, ...]:
-    """把影响机器人连接与准入的配置摊平成可比较的元组喵。
+    """把影响机器人行为的配置摊平成可比较的元组喵。
 
     输入：完整配置。
     输出：字符串元组；两次取值不同说明需要重建机器人任务。
-    边界：只覆盖 napcat / qqbot / acl 三段，其它段改了不影响机器人喵。
+    边界：只覆盖真正影响机器人连接、准入与出图结果的段喵。
+
+    喵~注意：这里漏掉任何一段都会造成「设置页说已热更新、实际还在用旧值」。
+    早先只比了 napcat / qqbot / acl，于是改 `bot`（happy 命令的口径）或
+    `render`（出图尺寸与字体）时任务根本不会重建，改动要等下次重启才生效喵。
     """
     # 喵~注意：用 repr 把嵌套列表也拍平，避免列表不可哈希带来的比较麻烦喵
     return (
         repr(asdict(config.napcat)),
         repr(asdict(config.qqbot)),
         repr(asdict(config.acl)),
+        # happy 系列命令的窗口、条数、开场白等都从这一段来喵
+        repr(asdict(config.bot)),
+        # 出图尺寸、字体、超时等，重建任务时才会重新读进渲染器喵
+        repr(asdict(config.render)),
     )
 
 
@@ -98,6 +109,28 @@ async def _restart_bot(app: FastAPI, config: AppConfig) -> None:
     LOGGER.info("配置热更新：机器人通道已重建（%s）", ", ".join(runner.channel_names()) or "无")
 
 
+def _pending_restart_fields(active_config: AppConfig, disk_config: AppConfig) -> list[str]:
+    """列出盘上配置与运行中配置之间「必须重启才能生效」的字段喵。
+
+    输入：当前正在用的配置、刚从磁盘读出来的配置。
+    输出：需要重启的字段名列表；没有则为空列表。
+    边界：只比较启动阶段才绑定的字段（端口、数据库路径），
+          其它字段即便盘上不同也能靠热更新或下次请求生效喵。
+
+    喵~注意：这个函数只做只读比较，不会去切换运行中的库或端口喵。
+    """
+    # 逐项比较启动阶段绑定的字段喵
+    pending: list[str] = []
+    # 端口在 uvicorn 启动时就固定了喵
+    if active_config.server.port != disk_config.server.port:
+        pending.append("server.port")
+    # 数据库连接池是按路径建好的，换路径必须重启喵
+    if active_config.server.db_path != disk_config.server.db_path:
+        pending.append("server.db_path")
+    # 返回需要重启的项喵
+    return pending
+
+
 async def _apply_runtime_config(app: FastAPI, new_config: AppConfig) -> list[str]:
     """把新配置热更新到运行中的服务，返回需要重启才生效的项喵。
 
@@ -107,6 +140,21 @@ async def _apply_runtime_config(app: FastAPI, new_config: AppConfig) -> list[str
     """
     # 取旧配置用于比较喵
     old_config: AppConfig = app.state.config
+    # 端口与数据库路径绑在进程启动阶段，改了只能重启喵
+    restart_required: list[str] = []
+    # 喵~防御：数据库路径改了**不能**直接换进运行中的配置。
+    # 连接池是按启动时的路径建好的，app.state.config 一换，所有查询就会去开
+    # 那个还不存在的新文件——SQLite 会顺手创建一个空库，于是全部数据接口 500，
+    # 而且磁盘上凭空多出一个 4KB 空文件。这里把旧值写回去，只提示需要重启喵
+    if old_config.server.db_path != new_config.server.db_path:
+        restart_required.append("server.db_path")
+        # 喵~注意：AppConfig 与 ServerSection 都是 frozen dataclass，不能原地赋值，
+        # 必须整份替换出一个「旧库路径 + 其余字段全新」的配置对象喵
+        new_config = replace(
+            new_config,
+            # 只把库路径退回运行中那个，其它段照旧用新值喵
+            server=replace(new_config.server, db_path=old_config.server.db_path),
+        )
     # 换上新配置，所有路由都从 app.state 取，下一次请求就生效喵
     app.state.config = new_config
     # 日志级别立刻生效喵
@@ -116,12 +164,9 @@ async def _apply_runtime_config(app: FastAPI, new_config: AppConfig) -> list[str
         await _restart_bot(app, new_config)
     # 记录确实热更新了喵
     LOGGER.info("配置热更新完成")
-    # 端口与数据库路径绑在进程启动阶段，改了只能重启喵
-    restart_required: list[str] = []
+    # 端口也是启动阶段绑定的，改了只能重启喵
     if old_config.server.port != new_config.server.port:
         restart_required.append("server.port")
-    if old_config.server.db_path != new_config.server.db_path:
-        restart_required.append("server.db_path")
     return restart_required
 
 
@@ -344,10 +389,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         db.init_db(active_config.server.db_path)
         # 图标键规则升级后把历史行重算一遍，避免「图标存在但显示不出来」喵
         _rekey_icon_keys(active_config)
-        # 喵~注意：归档与清理必须无条件启动，不能挂在机器人上。
-        # 以前这段长在 BotRunner 里，纯服务端部署（两个通道都关）时
-        # main 压根不创建 BotRunner，归档和清理就永远不跑，
-        # 数据一直涨而日志里一个字都不打——这种静默失效最难发现喵
+        # 喵~注意：维护任务无条件启动，不跟机器人绑在一起。
+        # 挂在 BotRunner 上的话，纯服务端部署（两个通道都关）时压根不会跑喵
         maintenance_task = asyncio.create_task(
             maintenance.maintenance_loop(active_config),
             name="device-hub-maintenance",
@@ -444,7 +487,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 "ok": True,
                 "version": SERVER_VERSION,
                 "database": str(active_config.server.db_path),
-                "bot_enabled": active_config.napcat.enabled,
+                # 喵~注意：任意一个通道启用就算机器人启用，只看 napcat 会与启动日志"机器人=启用"打架喵
+                "bot_enabled": active_config.napcat.enabled or active_config.qqbot.enabled,
+                # 分通道给出，排查"官方通道开着但 napcat 关着"这种半开状态时不用猜喵
+                "napcat_enabled": active_config.napcat.enabled,
+                "qqbot_enabled": active_config.qqbot.enabled,
             }
         )
 
@@ -711,7 +758,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         if not _verify_token(request, active_config):
             return _error_response(401, "invalid_token", "X-Ingest-Token 缺失或不匹配")
         # 配置文件路径喵
-        config_path = resolve_config_path()
+        #
+        # 喵~注意：优先用当前配置自己记录的来源路径。
+        # 原来这里无条件调 resolve_config_path()，在正常启动时恰好一致，
+        # 但只要调用方显式传了 config_path（或测试里用 create_app(自己的配置)），
+        # 设置页就会去读写**另一个** config.yaml 喵
+        config_path = active_config.config_path or resolve_config_path()
         # 喵~注意：以磁盘上的文件为准，否则刚保存的值会被内存里的旧配置"重置"回去喵
         try:
             disk_config = await run_in_threadpool(load_config, config_path)
@@ -720,13 +772,19 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             disk_config = active_config
         # 摊平成字段列表喵
         fields = settings.read_settings(disk_config)
+        # 喵~注意：别硬编码 False。启动后如果配置文件被手工改过、或有人直接编辑了
+        # 端口/库路径，页面上要先看到「需要重启」，否则主人会以为改完就生效了喵
+        pending_restart = _pending_restart_fields(active_config, disk_config)
         # 返回喵
         return JSONResponse(
             content={
                 "ok": True,
                 "config_path": str(config_path),
                 "fields": fields,
-                "restart_required": False,
+                # 有任何需要重启的项就为 True喵
+                "restart_required": bool(pending_restart),
+                # 具体是哪些项，界面可以照着提示喵
+                "restart_fields": pending_restart,
             }
         )
 
@@ -750,7 +808,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         if not isinstance(changes, dict):
             return _error_response(422, "invalid_payload", "changes 必须是「配置项 -> 新值」的对象")
         # 配置文件路径喵
-        config_path = resolve_config_path()
+        # 喵~注意：与 GET 用同一套来源，保证「读的」和「写的」是同一个文件喵
+        config_path = active_config.config_path or resolve_config_path()
         try:
             # 线程池里改文件，避免阻塞事件循环喵
             changed = await run_in_threadpool(settings.apply_settings, config_path, changes)
@@ -1124,7 +1183,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             return _error_response(401, "invalid_token", "X-Ingest-Token 缺失或不匹配")
         # 时区偏移，默认按东八区喵
         tz_offset = _parse_bounded_int(request.query_params.get("tz_offset_minutes"), default=480, minimum=-720, maximum=840)
-        # 合并间隔，默认 15 分钟，和 patina 的 AFK 阈值一致喵
+        # 合并间隔，值为 5 秒喵
+        #
+        # 喵~注意：这里原来写着「默认 15 分钟，和 patina 的 AFK 阈值一致」，
+        # 但代码是 `default=5`（**秒**），注释和代码差了好几个数量级喵。
+        # 而且 5 秒这个值是和客户端 60 秒上报节奏脱钩的：
+        # 相邻两批上报天然间隔 60 秒，5 秒的合并窗口等于「永不合并」，
+        # 一次连续使用会被切成好几段。真要按「会话」看，合并间隔应该 ≥ 上报间隔。
+        # 当前保持 5 秒不动（改动会改变时间轴观感，属于产品口径），先修注释喵
         merge_gap = _parse_bounded_int(request.query_params.get("merge_gap_seconds"), default=5, minimum=0, maximum=7200)
         # 把本地日期换算成 UTC 窗口喵
         day_range = _day_range_utc(request.query_params.get("date"), tz_offset)
@@ -1426,7 +1492,12 @@ def _load_heatmap(
         # 顺带把设备明细也查出来，统计页要显示「哪台设备用得多」喵
         # 喵~注意：明细**不加**设备过滤，统计页的设备切换按钮就靠它，
         # 过滤掉的话前端选中一台之后按钮就只剩那一台，换不回去了喵
-        device_totals = queries.device_usage_totals(connection, seconds=days * 86400, now=now)
+        device_totals = queries.device_usage_totals(
+            connection,
+            seconds=days * 86400,
+            now=now,
+            tz_offset_minutes=tz_offset_minutes,
+        )
         # 设备名映射，明细里要写人话喵
         names = queries.device_name_map(connection)
         # 组装明细并按秒数倒序喵
@@ -1615,6 +1686,89 @@ def _storage_cleanup(config: AppConfig, before_days: int, targets: tuple[str, ..
         connection.close()
 
 
+def _archived_latest_window_snapshot(
+    connection: sqlite3.Connection, device_id: str
+) -> list[dict[str, object]]:
+    """从归档块里取该设备最近一次窗口快照喵。
+
+    输入：连接、设备 ID。
+    输出：按「前台优先、最小化靠后、应用名升序」排好的字典列表；
+          排在最前的那条带 `reported_at`，供上层回显时刻喵。
+    边界：没有归档块、块解不开、或归档表不存在时一律返回空列表喵。
+
+    喵~注意：`window_samples` 超过热保留期会被压成月块并从原表删掉。
+    `_device_windows` 原来只查原表，归档一发生 `MAX(reported_at)` 就变成 NULL，
+    接口回一个空的窗口列表——看起来就像这台设备的窗口数据丢了，
+    而同一时刻时间轴（走已带回退的 `day_title_spans`）却还正常喵。
+    """
+    # 结果列表喵
+    collected: list[dict[str, object]] = []
+    try:
+        # 从最新月份往前找，找到一个月就够了喵
+        months = connection.execute(
+            "SELECT DISTINCT month FROM archives WHERE device_id = ? AND kind = ? ORDER BY month DESC",
+            (device_id, archive_codec.KIND_WINDOWS),
+        ).fetchall()
+    except sqlite3.Error:
+        # 喵~防御：老库没有归档表时当作没有归档喵
+        return collected
+    for month_row in months:
+        # 这个月的块喵
+        month = str(month_row["month"])
+        try:
+            block = archive.load_window_block(connection, device_id, month)
+        except sqlite3.Error:
+            continue
+        # 没有块就继续往前找喵
+        if block is None:
+            continue
+        try:
+            records = archive_codec.decode_windows(block)
+        except (zlib.error, ValueError):
+            # 喵~防御：坏块跳过，换个思路让人还能看到别的月份喵
+            LOGGER.warning(
+                "归档块解不开，跳过：device=%s kind=%s month=%s",
+                device_id,
+                archive_codec.KIND_WINDOWS,
+                month,
+            )
+            continue
+        # 只有这个月真的有记录才用喵
+        if not records:
+            continue
+        # 这一块里最新的那个时刻喵
+        latest_moment = max(record[0] for record in records)
+        for moment_text, app_name, package, title, minimized, foreground, _row_id in records:
+            # 只保留最新那一次快照的行喵
+            if moment_text != latest_moment:
+                continue
+            collected.append(
+                {
+                    "reported_at": moment_text,
+                    "app_name": str(app_name),
+                    "package": str(package or ""),
+                    "title": str(title or ""),
+                    "minimized": bool(minimized),
+                    "foreground": bool(foreground),
+                }
+            )
+        # 找到一个月就够，不再往前翻喵
+        if collected:
+            # 按原表的排序口径排好喵
+            collected.sort(
+                key=lambda item: (
+                    # 前台排最前喵
+                    0 if item["foreground"] else 1,
+                    # 最小化的靠后喵
+                    0 if not item["minimized"] else 1,
+                    # 应用名升序喵
+                    str(item["app_name"]),
+                )
+            )
+            return collected
+    return collected
+
+
 def _device_windows(config: AppConfig, device_id: str, row_limit: int) -> dict[str, object] | None:
     """线程内查某台设备最近一次窗口快照喵。"""
     # 打开连接喵
@@ -1633,19 +1787,41 @@ def _device_windows(config: AppConfig, device_id: str, row_limit: int) -> dict[s
         ).fetchone()
         # 喵~防御：从来没有窗口数据时返回空列表喵
         latest_at = latest[0] if latest and latest[0] else ""
+        # 喵~注意：热数据被归档后这里会变成空串，但归档块里其实还有数据。
+        # 不补这一步的话，「窗口列表」会在设备挂机跨月后突然变空，
+        # 而同一时刻时间轴那边（走 day_title_spans，已带回退）却正常显示，
+        # 两个页面对同一台设备给出互相矛盾的结论喵
+        archived_rows: list[dict[str, object]] = []
         if not latest_at:
+            archived_rows = _archived_latest_window_snapshot(connection, device_id)
+        # 归档里也没有才算真的没有喵
+        if not latest_at and not archived_rows:
             return {"device_id": device_id, "reported_at": "", "windows": []}
-        # 取该次快照的所有窗口喵
-        rows = connection.execute(
-            """
-            SELECT app_name, package, title, minimized, foreground
-            FROM window_samples
-            WHERE device_id = ? AND reported_at = ?
-            ORDER BY foreground DESC, minimized ASC, app_name ASC
-            LIMIT ?
-            """,
-            (device_id, latest_at, row_limit),
-        ).fetchall()
+        if archived_rows:
+            # 归档回退：reported_at 取归档里最新的那个时刻喵
+            latest_at = str(archived_rows[0]["reported_at"])
+            rows = [
+                {
+                    "app_name": item["app_name"],
+                    "package": item["package"],
+                    "title": item["title"],
+                    "minimized": item["minimized"],
+                    "foreground": item["foreground"],
+                }
+                for item in archived_rows[:row_limit]
+            ]
+        else:
+            # 取该次快照的所有窗口喵
+            rows = connection.execute(
+                """
+                SELECT app_name, package, title, minimized, foreground
+                FROM window_samples
+                WHERE device_id = ? AND reported_at = ?
+                ORDER BY foreground DESC, minimized ASC, app_name ASC
+                LIMIT ?
+                """,
+                (device_id, latest_at, row_limit),
+            ).fetchall()
         # 喵~注意：图标键一次查全表拿到，窗口列表可能有几十条喵
         icon_keys = icons.current_icon_keys(connection)
         # 组装响应喵
@@ -1954,6 +2130,80 @@ def _set_device_role(config: AppConfig, device_id: str, role: str) -> bool:
 app = create_app()
 
 
+# 查询参数里需要脱敏的键名喵
+SENSITIVE_QUERY_KEYS = ("token", "ingest_token", "access_token", "key", "password")
+
+
+def _scrub_secrets(text: str) -> str:
+    """把日志文本里查询参数中的密钥替换成掩码喵。
+
+    输入：任意日志文本。
+    输出：脱敏后的文本；没命中敏感键时原样返回。
+    边界：只处理 `?a=1&token=xxx` 这种查询串形式，
+          不碰请求体，也不碰其它字段的空格与编码喵。
+
+    喵~注意：浏览器地址栏里带 `?token=...` 打开看板时，
+    uvicorn 的访问日志会把整条 URL 原样写进文件，密钥就长期留在磁盘上。
+    这里在输出前统一替换掉，日志里只留参数名喵
+    """
+    # 没命中任何敏感键就省掉正则开销喵
+    if "=" not in text:
+        return text
+    # 逐个键替换成掩码喵
+    scrubbed = text
+    for key in SENSITIVE_QUERY_KEYS:
+        # 喵~注意：值可能是任意非 & 字符，含 URL 编码与等号，一律吃掉喵
+        pattern = re.compile(rf"([?&]{re.escape(key)}=)[^&\s\"']+", re.IGNORECASE)
+        # 替换成「键=***」喵
+        scrubbed = pattern.sub(r"\1***", scrubbed)
+    # 返回脱敏结果喵
+    return scrubbed
+
+
+class _SecretScrubbingFilter(logging.Filter):
+    """在日志落盘前把查询串里的密钥换成掩码喵。
+
+    喵~注意：挂到 uvicorn 的 access 与 error 两个日志器上，
+    这样无论访问日志还是异常栈里的 URL 都不会泄漏口令喵。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """改写日志消息文本，永远放行喵。
+
+        输入：日志记录。
+        输出：恒为 True（不丢弃任何日志）。
+        边界：消息拼装失败时保持原样，绝不让日志系统抛异常喵。
+        """
+        try:
+            # 先按记录自带的参数格式化出最终文本喵
+            message = record.getMessage()
+            # 脱敏后写回，后续 handler 直接用它喵
+            record.msg = _scrub_secrets(message)
+            # 参数已经被消化进 msg，必须清空，否则会被二次格式化喵
+            record.args = ()
+        except Exception:  # 喵~防御：日志系统自身绝不能把请求带崩喵
+            pass
+        # 始终放行喵
+        return True
+
+
+def _install_log_scrubbing() -> None:
+    """给 uvicorn 的日志器装上脱敏过滤器喵。
+
+    输出：无。
+    边界：重复调用不会重复添加过滤器；日志器还没建好时静默跳过喵。
+    """
+    # 需要处理的日志器喵
+    for name in ("uvicorn.access", "uvicorn.error", "uvicorn"):
+        # 取日志器，不存在就跳过喵
+        logger = logging.getLogger(name)
+        # 喵~防御：已经装过就不重复装，避免同一行被处理多次喵
+        if any(isinstance(existing, _SecretScrubbingFilter) for existing in logger.filters):
+            continue
+        # 装上过滤器喵
+        logger.addFilter(_SecretScrubbingFilter())
+
+
 def _run_server() -> None:
     """按配置里的监听参数直接启动服务，供重启功能与本地调试使用喵。"""
     # 延迟导入 uvicorn，避免只做导入时拉起依赖喵
@@ -1961,6 +2211,8 @@ def _run_server() -> None:
 
     # 读一份最新配置喵
     config = load_config()
+    # 喵~防御：启动前先给日志器装脱敏过滤器，避免地址栏里的口令被写进日志喵
+    _install_log_scrubbing()
     # 直接传应用对象，避免 uvicorn 再导入一次模块喵
     uvicorn.run(app, host=config.server.host, port=config.server.port, log_level=config.server.log_level)
 

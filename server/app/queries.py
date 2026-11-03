@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import zlib
 from collections.abc import Sequence
@@ -14,12 +15,38 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from . import archive, archive_codec, presence
-from .db import days_ago_text, hours_ago_text, parse_utc_text, to_utc_text, utc_now
+from .db import (
+    days_ago_text,
+    hours_ago_text,
+    local_day_start,
+    local_day_start_text,
+    local_day_text,
+    parse_utc_text,
+    to_utc_text,
+    utc_now,
+)
 from .payload_codec import decode_payload
 from .people import PersonGroup
 
-# 判定设备在线的时长阈值：心跳 30 秒一次，超过 3 个周期没上报就算离线喵
+# 判定设备在线的时长阈值喵
+#
+# 喵~注意：这里**故意**比 `presence.DEFAULT_HEARTBEAT_TIMEOUT_SECONDS`（60 秒）宽。
+# 两个数字服务的是不同场景，不要「统一」成 60：
+# - `presence` 的 60 秒是画时间轴用的，主人要求「离线必须绝对真实」，
+#   所以按分钟粒度判定，连丢 3 轮才出离线；
+# - 这里的 90 秒只是列表页头上那个「在线/离线」小圆点，
+#   上报间隔本身就是 60 秒，卡到 60 会让每次轻微延迟都闪一下离线喵。
+# 原来注释写的是「心跳 30 秒一次」，那是旧版节奏，早就不对了喵
 ONLINE_WINDOW_SECONDS = 90
+
+# 聚合表清理时用的本地时区偏移喵
+#
+# 喵~注意：必须和热力图、daily_usage 用同一个偏移，否则「按本地日对齐」
+# 对齐出来的边界会和汇总表里的日期错开一天喵
+AGGREGATE_TZ_MINUTES = 480
+
+# 日志器喵
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -415,16 +442,28 @@ def device_usage_totals(
     hours: int = 0,
     seconds: int = 0,
     now: datetime | None = None,
+    tz_offset_minutes: int | None = None,
 ) -> dict[str, int]:
     """按设备汇总窗口内的使用总秒数喵。
 
-    输入：连接、窗口小时数、窗口秒数、可选基准时间。
+    输入：连接、窗口小时数、窗口秒数、可选基准时间、可选时区偏移。
     输出：设备 ID 到总秒数的映射，没有数据的设备不出现在结果里。
     边界：只返回大于 0 的合计喵。
+
+    喵~注意：传了 `tz_offset_minutes` 就会**连同 `daily_usage` 一起算**，
+    并且和 `daily_usage_totals` 用同一套「按本地日、明细优先」的规则。
+    不传则只读明细——这是给「近 24 小时」这类短窗口用的，
+    短窗口内明细一定完整，不需要也不该去碰汇总表喵。
+
+    喵~注意：加这个分支是因为统计页上出现过「合计 4200 / 设备合计 600」：
+    合计走 `daily_usage_totals`（含汇总表），设备明细只读明细表，
+    明细一过保留期，两个数字就对不上，而它们在同一屏上并排显示喵。
     """
     # 计算窗口起点喵
     window_start = usage_window_start(hours, seconds, now)
-    # 一台设备一行，直接聚合喵
+    # 基准时间喵
+    moment = now or utc_now()
+    # 明细按设备汇总喵
     rows = connection.execute(
         """
         SELECT device_id, SUM(seconds) AS total_seconds
@@ -435,8 +474,56 @@ def device_usage_totals(
         """,
         (window_start,),
     ).fetchall()
-    # 转成字典喵
-    return {str(row["device_id"]): int(row["total_seconds"]) for row in rows}
+    # 明细侧结果喵
+    totals: dict[str, int] = {str(row["device_id"]): int(row["total_seconds"]) for row in rows}
+    # 喵~防御：没要时区、或者老库没这张表，就只按明细算喵
+    if tz_offset_minutes is None or not _has_table(connection, "daily_usage"):
+        return totals
+    # 偏移量夹到合法范围喵
+    offset_minutes = max(-720, min(840, int(tz_offset_minutes)))
+    # 喵~注意：这里同样要把窗口起点对齐到本地日零点，
+    # 否则「哪几天算在窗口内」会和 daily_usage_totals 那边差一天，
+    # 两个数字又对不上喵
+    window_moment = moment - timedelta(seconds=int(seconds or hours * 3600))
+    summary_start = local_day_start(window_moment, offset_minutes)
+    # 喵~注意：`daily_usage.local_day` 是 **本地日期**字符串
+    # （写入时用 `date(sampled_at, '+480 minutes')` 切的），
+    # 而 `summary_start` 已经换算回 UTC——直接对它 `.strftime` 拿到的是 UTC 日期，
+    # 恒定比本地日期早一天（东八区下 24 个小时全错）。
+    # 表现就是「合计」和「按设备合计」相差一整天的汇总喵，必须用 local_day_text 取本地日期
+    summary_day = local_day_text(window_moment, offset_minutes)
+    # 汇总表按设备+本地日取数喵
+    summary_rows = connection.execute(
+        """
+        SELECT device_id, local_day, SUM(seconds) AS total_seconds
+        FROM daily_usage
+        WHERE local_day >= ?
+        GROUP BY device_id, local_day
+        HAVING total_seconds > 0
+        """,
+        (summary_day,),
+    ).fetchall()
+    # 明细覆盖到的「设备+日期」集合，用来实现「明细优先」喵
+    detail_days: set[tuple[str, str]] = set()
+    detail_rows = connection.execute(
+        """
+        SELECT device_id, date(sampled_at, ?) AS local_day
+        FROM usage_samples
+        WHERE sampled_at >= ?
+        GROUP BY device_id, local_day
+        """,
+        (f"{offset_minutes:+d} minutes", to_utc_text(summary_start)),
+    ).fetchall()
+    for row in detail_rows:
+        detail_days.add((str(row["device_id"]), str(row["local_day"])))
+    # 明细里没有的「设备+日期」才用汇总补喵
+    for row in summary_rows:
+        key = (str(row["device_id"]), str(row["local_day"]))
+        if key in detail_days:
+            continue
+        totals[key[0]] = totals.get(key[0], 0) + int(row["total_seconds"])
+    # 只返回大于 0 的喵
+    return {device: value for device, value in totals.items() if value > 0}
 
 
 def devices_with_usage(
@@ -460,6 +547,87 @@ def devices_with_usage(
     ).fetchall()
     # 收集成集合喵
     return {str(row["device_id"]) for row in rows}
+
+
+def rebuild_daily_usage(
+    connection: sqlite3.Connection,
+    tz_offset_minutes: int = 480,
+    days: int = 400,
+    now: datetime | None = None,
+) -> int:
+    """把明细里的每日使用时长固化进 daily_usage 表，返回写入行数喵。
+
+    输入：连接、时区偏移、回溯天数、可选基准时间。
+    输出：写入（或更新）的行数。
+    边界：只重算窗口内还有明细的日子；明细已经过期的日子保持原样不动喵。
+
+    喵~注意：这张表是为「明细只留 30 天、热力图要看一年」这个矛盾存在的。
+    维护循环每次跑都重算一遍窗口内的数据，重复跑不会把秒数越加越多喵。
+
+    喵~注意：这里是**覆盖**而不是累加，前提是「明细要么整天都在、要么整天没了」。
+    这个前提由两处共同保证：清理的截止时刻对齐到本地日零点（见 `prune_expired`），
+    以及**这里的读取窗口也对齐到本地日零点**。只对齐删除侧是不够的——
+    窗口起点落在某天中间时，那天零点到起点之间的明细会被 `WHERE sampled_at >= ?`
+    排除掉，SUM 只算出后半截，再用它覆盖就又把真值改小了喵。
+    """
+    # 基准时间喵
+    moment = now or utc_now()
+    # 喵~防御：偏移量夹到合法范围喵
+    offset_minutes = max(-720, min(840, int(tz_offset_minutes)))
+    # 回溯窗口起点喵
+    #
+    # 喵~注意：必须向下取整到本地日零点，不能直接用「now - N 天」这个精确时刻。
+    # 否则起点落在某天中午时，那天的 SUM 只有后半天，覆盖写回就把整天值改小了，
+    # 等那天滑出窗口后错误值永久留存喵
+    window_start = local_day_start(
+        moment - timedelta(days=max(1, int(days))), offset_minutes
+    )
+    # 按「采样时刻 + 偏移」截出本地日期再聚合喵
+    rows = connection.execute(
+        """
+        SELECT device_id, date(sampled_at, ?) AS local_day, SUM(seconds) AS total_seconds
+        FROM usage_samples
+        WHERE sampled_at >= ?
+        GROUP BY device_id, local_day
+        HAVING total_seconds > 0
+        """,
+        (f"{offset_minutes:+d} minutes", to_utc_text(window_start)),
+    ).fetchall()
+    # 喵~防御：老库可能还没这张表，先补上再写喵
+    # 喵~注意：这里不 import db，会因为循环导入炸掉，所以直接写建表语句喵
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_usage (
+            device_id   TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+            local_day   TEXT NOT NULL,
+            seconds     INTEGER NOT NULL DEFAULT 0,
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (device_id, local_day)
+        )
+        """
+    )
+    # 喵~防御：没有明细就什么都不做，别把已有汇总清掉喵
+    if not rows:
+        return 0
+    # 现在时刻文本，写进 updated_at 喵
+    stamp = to_utc_text(moment)
+    # 逐行 upsert，覆盖而不是累加喵
+    written = 0
+    for row in rows:
+        connection.execute(
+            """
+            INSERT INTO daily_usage (device_id, local_day, seconds, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(device_id, local_day) DO UPDATE SET
+                seconds    = excluded.seconds,
+                updated_at = excluded.updated_at
+            """,
+            (str(row["device_id"]), str(row["local_day"]), int(row["total_seconds"]), stamp),
+        )
+        written += 1
+    # 提交喵
+    connection.commit()
+    return written
 
 
 def daily_usage_totals(
@@ -486,6 +654,8 @@ def daily_usage_totals(
     # 喵~注意：这是「从此刻往前推 N 天」的滚动窗口，不是本地零点对齐的，
     # 所以最早那一天可能只截到半天——热力图首格偏淡是正常的，不是丢数据喵
     window_start = moment - timedelta(days=max(1, int(days)))
+    # 喵~注意：窗口里的「本地日」也按同一个滚动时刻算，供汇总表那边对齐口径喵
+    window_local_day = local_day_text(window_start, offset_minutes)
     # 拼设备过滤条件喵
     params: list[object] = [to_utc_text(window_start)]
     device_clause = ""
@@ -505,8 +675,51 @@ def daily_usage_totals(
         """,
         [f"{offset_minutes:+d} minutes", *params],
     ).fetchall()
-    # 转成 (日期, 秒数) 的列表喵
-    return [(str(row["local_day"]), int(row["total_seconds"])) for row in rows]
+    # 明细表算出来的每日秒数喵
+    totals: dict[str, int] = {
+        str(row["local_day"]): int(row["total_seconds"]) for row in rows
+    }
+    # 喵~注意：明细只保留 30 天，更早的日子靠 daily_usage 这张日汇总表补上。
+    # 喵~防御：老库可能还没建这张表，没有就只用明细，别让统计接口整个挂掉喵
+    #
+    # 喵~注意：`daily_usage.local_day` 是用**固定**的 AGGREGATE_TZ_MINUTES 切出来的，
+    # 而明细那边用的是请求里的 `offset_minutes`。两者只在请求偏移恰好等于 480 时一致。
+    # 本机部署下前端传的就是浏览器偏移（东八区 = 480），所以实际不会错位；
+    # 但如果有别的时区的浏览器来查长程热力图，汇总那部分日期会整体错一天喵。
+    # 真要彻底修，得给 daily_usage 加一列记下切日用的偏移，属于表结构改动，
+    # 当前单时区部署下不值得，先在这里说明清楚，别让人误以为是同一套日历喵
+    summary_rows: list[sqlite3.Row] = []
+    if _has_table(connection, "daily_usage"):
+        # 喵~注意：比较的左边是 `local_day`（本地日期），右边也必须取本地日期。
+        # `window_start` 是 UTC 时刻，直接 `.strftime` 得到的是 UTC 日期，
+        # 会恒定比本地日期早一天，把窗口首日整天的汇总漏掉喵
+        summary_params: list[object] = [window_local_day]
+        summary_clause = ""
+        if device_ids:
+            # 喵~防御：同样要防 IN () 这种非法 SQL 喵
+            summary_clause = f" AND device_id IN ({','.join('?' for _ in device_ids)})"
+            summary_params.extend(str(item) for item in device_ids)
+        summary_rows = connection.execute(
+            f"""
+            SELECT local_day, SUM(seconds) AS total_seconds
+            FROM daily_usage
+            WHERE local_day >= ?{summary_clause}
+            GROUP BY local_day
+            HAVING total_seconds > 0
+            """,
+            summary_params,
+        ).fetchall()
+    # 明细里没有的日子才用汇总表补喵
+    #
+    # 喵~注意：两边都有那天时，明细优先——明细是精确值，汇总表可能是旧的。
+    # 这个「明细优先」之所以安全，是因为清理的截止时刻对齐到本地日零点，
+    # 那天的明细要么完整留着、要么整天都被清掉，不会出现半截明细喵。
+    for row in summary_rows:
+        day = str(row["local_day"])
+        if day not in totals:
+            totals[day] = int(row["total_seconds"])
+    # 按日期升序返回喵
+    return sorted(totals.items())
 
 
 def _build_device_segments(
@@ -833,7 +1046,15 @@ def _archived_heartbeats(
                 # 只解出窗口内的行喵
                 records = archive_codec.decode_heartbeats(block)
             except (zlib.error, ValueError):
-                # 喵~防御：坏块不能拖垮整次查询喵
+                # 喵~防御：坏块不能拖垮整次查询，但必须留下痕迹喵
+                # 喵~注意：静默跳过会让「数据坏了」表现成「那几天本来就没数据」，
+                # 用户和排查的人都看不出区别，所以这里一定要记日志喵
+                LOGGER.warning(
+                    "归档块解不开，跳过：device=%s kind=%s month=%s",
+                    device_id,
+                    archive_codec.KIND_HEARTBEATS,
+                    month,
+                )
                 continue
             for moment_text, afk, afk_since_text, active_since_text, row_device, row_id in records:
                 # 时间要落在窗口内喵
@@ -1163,7 +1384,13 @@ def _archived_window_rows(
                 # 整块解出来喵
                 records = archive_codec.decode_windows(block)
             except (zlib.error, ValueError):
-                # 喵~防御：坏块不能拖垮整次查询喵
+                # 喵~防御：坏块不能拖垮整次查询，理由同心跳那边喵
+                LOGGER.warning(
+                    "归档块解不开，跳过：device=%s kind=%s month=%s",
+                    device_id,
+                    archive_codec.KIND_WINDOWS,
+                    month,
+                )
                 continue
             for moment_text, app_name, _package, title, _minimized, _foreground, row_id in records:
                 # 时间要落在窗口内喵
@@ -1895,9 +2122,19 @@ def prune_expired(
 
     喵~注意：`detail_days` 参数还留着，但它现在不决定删哪些行了。
     留着是为了不改动调用方签名，也方便日后想恢复「硬性上限」时有据可依喵。
+
+    喵~注意：聚合表的截止时刻要**对齐到本地日零点**，不能直接用 `now - N 天`。
+    精确时刻会把边界那天切成半截：前半段被删、后半段留下，
+    而 `daily_usage` 那天已经按整天算好过了，下一次重算就会用这半截明细
+    把真值覆盖小——热力图上那一天凭空缩水，且明细已删、无法恢复喵。
+    对齐到整日后，每个本地日的明细要么整天留着、要么整天清掉喵。
     """
-    # 聚合截止时间喵
-    aggregate_cutoff = days_ago_text(aggregate_days, now)
+    # 聚合截止时间：先按天数回推，再对齐到本地日零点喵
+    # 喵~注意：不能 import db，会循环导入，所以用上面单独导入的函数喵
+    aggregate_cutoff = local_day_start_text(
+        (now or utc_now()) - timedelta(days=max(1, aggregate_days)),
+        AGGREGATE_TZ_MINUTES,
+    )
     # 记录各表删除行数喵
     deleted_counts: dict[str, int] = {}
     # 喵~防御：老库可能还没有归档表，没有就直接跳过这两张表喵
@@ -1921,13 +2158,28 @@ def prune_expired(
     return deleted_counts
 
 
-def _has_archives_table(connection: sqlite3.Connection) -> bool:
-    """判断归档表是否存在喵。"""
-    # 查系统表，不依赖异常喵
+def _has_table(connection: sqlite3.Connection, name: str) -> bool:
+    """判断某张表是否存在喵。
+
+    输入：连接、表名。
+    输出：存在返回 True。
+    边界：只查 sqlite_master，不碰数据，开销可以忽略喵。
+
+    喵~注意：老库升级上来时可能还没有新加的表（archives、daily_usage）。
+    查询路径要么建表、要么像这里一样先探一下，否则接口会直接报
+    `no such table` 整个挂掉喵。
+    """
+    # 表名是代码里写死的常量，不是外部输入，可以参数化查询喵
     row = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'archives'"
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
     ).fetchone()
     return row is not None
+
+
+def _has_archives_table(connection: sqlite3.Connection) -> bool:
+    """判断归档表是否存在喵。"""
+    # 转发给通用实现喵
+    return _has_table(connection, "archives")
 
 
 def _delete_archived_rows(
@@ -1951,19 +2203,28 @@ def _delete_archived_rows(
     if not has_archives:
         return 0
     # 表名列名都是代码里写死的常量，不是外部输入，可以拼进 SQL 喵
-    cursor = connection.execute(
-        f"""
-        DELETE FROM {table}
-        WHERE EXISTS (
+    # 喵~注意：`DELETE ... WHERE EXISTS` 的 rowcount 不可靠（实测返回 0 但行已删），
+    # 所以先数一遍再删，返回值才准喵
+    condition = f"""
+        EXISTS (
             SELECT 1 FROM archives
             WHERE archives.device_id = {table}.device_id
               AND archives.kind = ?
               AND archives.month = substr({table}.{column}, 1, 7)
         )
-        """,
-        (kind,),
+    """
+    # 先数符合条件的行喵
+    matched = int(
+        connection.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {condition}", (kind,)
+        ).fetchone()[0]
     )
-    return cursor.rowcount if cursor.rowcount > 0 else 0
+    # 喵~防御：没有可删的就直接返回，省一次 DELETE 喵
+    if matched == 0:
+        return 0
+    # 真正删除喵
+    connection.execute(f"DELETE FROM {table} WHERE {condition}", (kind,))
+    return matched
 
 
 def touch_last_seen(connection: sqlite3.Connection, device_id: str, moment: datetime) -> None:

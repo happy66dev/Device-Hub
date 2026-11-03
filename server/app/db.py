@@ -74,6 +74,12 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     # 窗口快照表：每次上报落一份"当前打开的窗口"，按时间留存供后续分析喵
+    # 喵~注意：下面的 reported_at 列名有误导性，它存的**不是**客户端上报的时刻，
+    # 而是服务端收到这次上报的时刻（等价于 reports.received_at）。
+    # 之所以这样命名，是因为它和 reports.reported_at 用了同一套列名习惯，
+    # 但写入时走的是 ingest 里的 received_text 喵。
+    # 后果是：时间轴的心跳区间与窗口标题区间用的是同一个时间基准，
+    # 不存在「一个按客户端时间、一个按服务端时间」的错位喵。
     """
     CREATE TABLE IF NOT EXISTS window_samples (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,6 +100,21 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         package    TEXT NOT NULL DEFAULT '',
         png        BLOB NOT NULL,
         updated_at TEXT NOT NULL
+    )
+    """,
+    # 每日使用时长汇总：一天一台设备一行，给统计页的长程热力图用喵
+    # 喵~注意：`usage_samples` 只保留 30 天，热力图却要看一年，
+    # 中间必然是一大片空白。这张表按天固化「那天用了多少秒」，
+    # 明细过期之后靠它补齐长程视图，一年 365 行/设备，体积可以忽略喵。
+    # `local_day` 存的是**本地日期**（已按 tz_offset 换算过），
+    # 因为热力图的行列本来就是本地日历天，存 UTC 还要再换算一次容易出错喵。
+    """
+    CREATE TABLE IF NOT EXISTS daily_usage (
+        device_id   TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+        local_day   TEXT NOT NULL,
+        seconds     INTEGER NOT NULL DEFAULT 0,
+        updated_at  TEXT NOT NULL,
+        PRIMARY KEY (device_id, local_day)
     )
     """,
     # 机器人见过的发言人：只记成功执行了命令的人，供「最近发言」列表反查 openid 喵
@@ -228,6 +249,57 @@ def days_ago_text(days: int, now: datetime | None = None) -> str:
     base_moment = now or utc_now()
     # 减去对应天数后转成文本喵
     return to_utc_text(base_moment - timedelta(days=safe_days))
+
+
+def local_day_start(moment: datetime, tz_offset_minutes: int = 480) -> datetime:
+    """把时刻向下取整到它所在的「本地日零点」，返回带时区的 datetime 喵。
+
+    输入：任意带时区的时刻、本地时区偏移（分钟）。
+    输出：同一本地日 00:00 对应的时刻（UTC 时区）。
+    边界：偏移量会被夹到 -720..840，避免算出不存在的时区喵。
+
+    喵~注意：这个函数专门给清理用。清理如果按「now - N 天」这个精确时刻切，
+    落在边界上的那个本地日就只会被删掉前半段，明细从此变成半截。
+    而热力图的每日汇总一旦用这半截明细重算，那一天就会凭空缩水，
+    真值又已经随明细删掉、再也算不回来——所以要按**整日**切，
+    让每个本地日的明细要么完整保留、要么整体清掉，不存在半截喵。
+    """
+    # 夹到合法偏移喵
+    offset_minutes = max(-720, min(840, int(tz_offset_minutes)))
+    # 换到本地时区再截掉时分秒喵
+    offset = timezone(timedelta(minutes=offset_minutes))
+    local = moment.astimezone(offset)
+    # 本地日零点喵
+    start_local = datetime(local.year, local.month, local.day, tzinfo=offset)
+    # 统一换算回 UTC 喵
+    return start_local.astimezone(timezone.utc)
+
+
+def local_day_start_text(moment: datetime, tz_offset_minutes: int = 480) -> str:
+    """同 `local_day_start`，但直接返回库里用的 UTC 文本喵。"""
+    # 复用上面的实现再格式化喵
+    return to_utc_text(local_day_start(moment, tz_offset_minutes))
+
+
+def local_day_text(moment: datetime, tz_offset_minutes: int = 480) -> str:
+    """把时刻换成「本地日的日期字符串」，格式与 `daily_usage.local_day` 一致喵。
+
+    输入：任意带时区的时刻、本地时区偏移（分钟）。
+    输出：`YYYY-MM-DD`，代表该时刻在本地时区属于哪一天。
+
+    喵~注意：**不要**用 `local_day_start(...).strftime("%Y-%m-%d")` 取日期。
+    `local_day_start` 的返回值已经换算回 UTC，再取 `.strftime` 得到的是
+    **UTC 日期**，比本地日期恒定早一天（东八区下 24 个小时全错）。
+    而 `daily_usage.local_day` 是用 `date(sampled_at, '+480 minutes')`
+    切的**本地**日期。两边口径不同，拿 UTC 日期去比 `local_day`，
+    就会把边界那天整天的汇总漏掉或多算，表现为
+    「合计 4200 / 按设备合计 3900」这种自相矛盾喵。
+    """
+    # 夹到合法偏移喵
+    offset_minutes = max(-720, min(840, int(tz_offset_minutes)))
+    # 换到本地时区后直接取年月日喵
+    local = moment.astimezone(timezone(timedelta(minutes=offset_minutes)))
+    return local.strftime("%Y-%m-%d")
 
 
 def connect(db_path: Path) -> sqlite3.Connection:

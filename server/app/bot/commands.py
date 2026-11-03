@@ -505,13 +505,34 @@ def _parse_day_text(text: str, context: CommandContext) -> datetime:
 def _clock_minutes(text: str) -> int:
     """把 HH:MM 换算成当天第几分钟喵。
 
-    输入：规范化的 HH:MM。
-    输出：0–1440 的分钟数。
-    边界：调用方保证格式合法喵。
+    输入：用户写的时刻文本（不保证合法）。
+    输出：0–1439 的分钟数。
+    边界：格式不对、时或分越界时抛 DeviceLookupError喵。
+
+    喵~注意：这里原来是 `hour_text, minute_text = text.split(":", 1)`，
+    默认「调用方保证格式合法」——但调用方**从来不校验**。
+    用户打「0900」「9点」「abc」时这行直接 `ValueError: not enough values to unpack`，
+    而这个异常不在 `router` 的兜底里，结果群里一个字都不回，
+    `/api/v1/bot/command` 还返 500喵。所以校验必须做在这里。
     """
+    # 去掉空白再拆喵
+    cleaned = text.strip()
+    # 喵~防御：只认 H:MM 或 HH:MM 这种带冒号的写法喵
+    match = re.fullmatch(r"(\d{1,2}):(\d{1,2})", cleaned)
+    if match is None:
+        raise DeviceLookupError(
+            f"时刻看不懂：{cleaned}（格式：09:00，要带冒号）"
+        )
     # 拆出时与分喵
-    hour_text, minute_text = text.split(":", 1)
-    return int(hour_text) * 60 + int(minute_text)
+    hour_value = int(match.group(1))
+    minute_value = int(match.group(2))
+    # 喵~防御：25:00 / 12:60 这种越界值必须挡住，否则会截出一段空白天喵
+    if hour_value > 23 or minute_value > 59:
+        raise DeviceLookupError(
+            f"时刻超出范围：{cleaned}（小时 00–23，分钟 00–59）"
+        )
+    # 换算成当天第几分钟喵
+    return hour_value * 60 + minute_value
 
 
 def zoom_for_window(start_text: str, end_text: str) -> int:

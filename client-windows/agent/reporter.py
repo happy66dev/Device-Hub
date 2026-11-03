@@ -65,20 +65,26 @@ class Reporter:
         rdp_target: str | None = None,
         rdp_client_ip: str | None = None,
         rdp_client_name: str | None = None,
+        reported_at: str | None = None,
     ) -> dict[str, Any]:
         """按协议组装上报字典喵。
 
         输入：硬件信息、电量、当前应用、使用时长增量数组、RDP 状态、投屏窗口标题、已打开窗口、
-              AFK 标记与两个精确边界时刻。
+              AFK 标记与两个精确边界时刻、可选的固定上报时刻。
         输出：可直接 JSON 序列化的字典。
         边界：usage_deltas 超过 500 条会被截断；无电量时省略 battery 字段喵。
+
+        喵~注意：`reported_at` 默认取当前时刻，但**重试时必须传入这一批第一次的
+        时刻**。服务端拿 `(device_id, reported_at)` 当幂等键，重试时重新取当前
+        时刻会被当成新的一批，把同一段秒数再加一遍喵。
         """
         # 组装基础字段喵
         payload: dict[str, Any] = {
             "device_id": self._config.device_id,
             "platform": "windows",
             # 带时区的 ISO 时间，服务端会统一换算成 UTC 喵
-            "reported_at": datetime.now(timezone.utc).isoformat(),
+            # 喵~注意：给了就用给的，保证重试期间身份不变喵
+            "reported_at": reported_at or datetime.now(timezone.utc).isoformat(),
             "hardware": hardware,
             "usage_delta": usage_deltas[:MAX_USAGE_ITEMS],
             "client_version": CLIENT_VERSION,

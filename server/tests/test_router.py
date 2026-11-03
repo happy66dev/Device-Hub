@@ -211,6 +211,82 @@ def test_inspect_event_rejects_private_message(app_config: AppConfig) -> None:
 
 
 
+def test_private_scope_respects_blacklist(app_config: AppConfig) -> None:
+    """拉黑必须对单聊同样生效喵。
+
+    喵~注意：这是真实缺陷。单聊分支原来在白名单校验之后**直接 return**，
+    跳过了黑名单检查——同一个用户在群里被拉黑后不响应，私聊却照样能查数据，
+    WebUI 里那个「拉黑」按钮对私聊看起来生效、实际无效。
+    《docs/qqbot.md》写明黑名单是两道闸门之一，群聊与单聊都必须过喵。
+    """
+    # 造一个既在私聊白名单、又在黑名单里的用户喵
+    from dataclasses import replace
+
+    from app.config import AclSection
+
+    # 私聊白名单放行 openid，同时把这个号加进官方通道黑名单喵
+    config = replace(
+        app_config,
+        acl=AclSection(
+            whitelist_groups=app_config.acl.whitelist_groups,
+            blacklist_users=app_config.acl.blacklist_users,
+            blacklist_member_openids=("BLOCKED_OPENID",),
+            private_user_openids=("BLOCKED_OPENID",),
+        ),
+    )
+    # 清掉运行时名单缓存，避免其它用例污染喵
+    from app import acl as acl_module
+
+    acl_module._CACHE.clear()
+    # 构造一条单聊消息喵
+    message = channel.NormalizedMessage(
+        channel=channel.CHANNEL_QQBOT,
+        group_key="",
+        user_key="BLOCKED_OPENID",
+        text="/happy设备",
+        mentioned=True,
+        scope=channel.SCOPE_PRIVATE,
+    )
+    # 必须被黑名单挡住喵
+    accepted, _text, reason = router.inspect_normalized(message, config)
+    assert accepted is False
+    assert reason == router.REASON_USER_BLACKLISTED
+
+
+def test_private_scope_allows_whitelisted_user_without_blacklist(app_config: AppConfig) -> None:
+    """没被拉黑的白名单用户，私聊照常能用喵。"""
+    # 只放私聊白名单，不进黑名单喵
+    from dataclasses import replace
+
+    from app.config import AclSection
+
+    config = replace(
+        app_config,
+        acl=AclSection(
+            whitelist_groups=app_config.acl.whitelist_groups,
+            blacklist_users=app_config.acl.blacklist_users,
+            blacklist_member_openids=(),
+            private_user_openids=("GOOD_OPENID",),
+        ),
+    )
+    # 清缓存喵
+    from app import acl as acl_module
+
+    acl_module._CACHE.clear()
+    # 构造单聊消息喵
+    message = channel.NormalizedMessage(
+        channel=channel.CHANNEL_QQBOT,
+        group_key="",
+        user_key="GOOD_OPENID",
+        text="/happy设备",
+        mentioned=True,
+        scope=channel.SCOPE_PRIVATE,
+    )
+    # 应放行喵
+    accepted, _text, _reason = router.inspect_normalized(message, config)
+    assert accepted is True
+
+
 def test_inspect_event_rejects_heartbeat(app_config: AppConfig) -> None:
     """心跳等非消息事件应被忽略喵。"""
     # 构造心跳事件喵
@@ -257,6 +333,47 @@ def _happy_context(
         args=(token, "排行榜"),
         now=datetime.now(timezone.utc),
     )
+
+
+def test_clock_minutes_rejects_bad_format() -> None:
+    """时刻写法不对时必须是可捕获的 DeviceLookupError，不能抛裸 ValueError 喵。
+
+    喵~注意：这条盯的是真实事故——`_clock_minutes` 以前是
+    `hour_text, minute_text = text.split(":", 1)`，默认「调用方保证格式合法」，
+    但调用方从来不校验。用户打「0900」「9点」「abc」直接
+    `ValueError: not enough values to unpack`，而这个异常不在 router 的兜底链里，
+    结果**群里一个字都不回**，`/api/v1/bot/command` 还返 500喵。
+    """
+    # 正常写法照常换算喵
+    assert commands._clock_minutes("09:00") == 540
+    assert commands._clock_minutes("9:05") == 545
+    assert commands._clock_minutes("00:00") == 0
+    assert commands._clock_minutes("23:59") == 1439
+    # 缺冒号、中文、乱写都必须报可读的错喵
+    for bad_format in ("0900", "9点", "abc", "", "9-00", "-1:00"):
+        with pytest.raises(commands.DeviceLookupError) as error:
+            commands._clock_minutes(bad_format)
+        # 提示要告诉用户正确格式喵
+        assert "格式" in str(error.value) or "看不懂" in str(error.value)
+
+
+def test_clock_minutes_rejects_out_of_range() -> None:
+    """25:00 / 12:60 这种越界时刻必须挡住喵。
+
+    喵~注意：不挡的话 `09:00 99:99` 能通过全部检查，
+    反算出的缩放倍数是 1，前端就截出一段**空白天**，
+    而且提示还会说「截止要晚于起点」——指错方向喵。
+    """
+    # 小时越界喵
+    for bad_hour in ("24:00", "25:00", "99:99"):
+        with pytest.raises(commands.DeviceLookupError) as error:
+            commands._clock_minutes(bad_hour)
+        assert "范围" in str(error.value)
+    # 分钟越界喵
+    for bad_minute in ("12:60", "09:99"):
+        with pytest.raises(commands.DeviceLookupError) as error:
+            commands._clock_minutes(bad_minute)
+        assert "范围" in str(error.value)
 
 
 def test_resolve_scope_exact_name(connection: sqlite3.Connection, app_config: AppConfig) -> None:

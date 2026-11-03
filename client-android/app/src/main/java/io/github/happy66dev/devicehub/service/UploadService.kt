@@ -20,10 +20,12 @@ import io.github.happy66dev.devicehub.collect.UsageReader
 import io.github.happy66dev.devicehub.core.AfkTracker
 import io.github.happy66dev.devicehub.core.IconHash
 import io.github.happy66dev.devicehub.core.IsoTime
+import io.github.happy66dev.devicehub.core.PendingBatch
 import io.github.happy66dev.devicehub.core.ReportInterval
 import io.github.happy66dev.devicehub.core.ReportPayload
 import io.github.happy66dev.devicehub.core.ReportStatus
 import io.github.happy66dev.devicehub.core.SampleCredit
+import io.github.happy66dev.devicehub.core.SampleGapCap
 import io.github.happy66dev.devicehub.core.ReportStatusText
 import io.github.happy66dev.devicehub.core.SampleInterval
 import io.github.happy66dev.devicehub.core.UsageDeltaCalculator
@@ -65,6 +67,13 @@ class UploadService : Service() {
     // 是否还有失败后缓存的数据等着补报，成功日志据此标注「含补报」喵
     private var hasPendingBacklog = false
 
+    // 待重发批次：失败的那一批原样留着，带着固定时刻重发，避免服务端重复累加喵
+    //
+    // 喵~注意：不能像以前那样失败就把秒数还回 usageCalculator。
+    // 服务端用 (deviceId, reportedAt) 做幂等键，还回去会让下一批变成超集、
+    // 且重新取当前时刻 → 被当成新批次再累加一遍，使用时长永久翻倍喵
+    private var pendingBatch: PendingBatch? = null
+
     // 上一轮不足 1 秒的余数，留到下一轮一起记，避免每轮都少半秒喵
     private var carryMillis = 0L
 
@@ -90,22 +99,38 @@ class UploadService : Service() {
         iconReader = IconReader(this)
         // 喵~防御：把上次已传图标的哈希恢复回来，图标没变就不用重传喵
         uploadedIconHashes.putAll(prefs.uploadedIconHashes)
-        // 喵~注意：服务重启后不再恢复上次残留的待上报秒数，只把它清掉。
-        // 原因：这份数据只有应用名和秒数、没有时间戳，重启后无法知道它们发生在
-        // 哪段时间里。服务端只能把它们铺在"上一次铺到的位置"之后；一旦进程被
-        // 系统杀掉且中断较久，这堆秒数就会盖到离线时段上，让离线期显示出使用色块。
-        // 主人要求「离线数据必须绝对真实，空档不那么精确没关系」，所以宁可丢掉
-        // 这点残留（每次上报成功都会清空，最多约一个上报周期的量）喵
-        val staleState = UsageStateCodec.decode(prefs.pendingUsageState)
-        if (staleState.isNotEmpty()) {
-            Log.i(logTag, "丢弃上次未上报的残留时长：${staleState.size} 个应用（无时间戳，不再补报）")
-            // 清掉持久化内容，避免下次启动又读到同一份陈旧数据喵
-            prefs.pendingUsageState = ""
+        // 喵~注意：这里分两种情况，不能一刀切丢掉：
+        // 1. **新格式**（带固定上报时刻）——我们确切知道这批秒数属于哪个时刻，
+        //    服务端能靠 (deviceId, reportedAt) 认出是同一批，重发只会加一次，
+        //    所以**必须重发**，否则那几十秒凭空消失喵。
+        // 2. **旧格式**（只有应用名和秒数、没有时间戳）——重启后无法知道它们发生在
+        //    哪段时间里，服务端只能铺在"上一次铺到的位置"之后；进程被杀且中断较久时，
+        //    这堆秒数就会盖到离线时段上，让离线期显示出使用色块。
+        //    主人要求「离线数据必须绝对真实」，所以这种**只能丢弃**喵。
+        val restoredBatch = PendingBatch.decode(prefs.pendingUsageState)
+        if (restoredBatch != null) {
+            // 新格式：原样恢复成待重发批次，下一轮直接重发喵
+            pendingBatch = restoredBatch
+            Log.i(
+                logTag,
+                "恢复上次未上报的批次：${restoredBatch.items.size} 个应用共 ${restoredBatch.totalSeconds} 秒，将按原时刻重发",
+            )
+            AgentLog.info(
+                "恢复待重发批次：${restoredBatch.items.size} 个应用共 ${restoredBatch.totalSeconds} 秒",
+            )
+        } else {
+            // 老格式：读一下把日志写清楚，然后丢掉喵
+            val staleState = UsageStateCodec.decode(prefs.pendingUsageState)
+            if (staleState.isNotEmpty()) {
+                Log.i(logTag, "丢弃上次未上报的残留时长：${staleState.size} 个应用（旧格式无时间戳，不再补报）")
+                // 清掉持久化内容，避免下次启动又读到同一份陈旧数据喵
+                prefs.pendingUsageState = ""
+            }
         }
-        // 重启后待补报秒数必然是 0 喵
-        updatePendingSeconds(0)
-        // 没有补报批次，日志不用标"补报"喵
-        hasPendingBacklog = false
+        // 界面上显示的欠账 = 待重发批次 + 累加器里新攒的（启动时后者是 0）喵
+        updatePendingSeconds(pendingBatchSeconds())
+        // 有没有补报批次决定日志要不要标"补报"喵
+        hasPendingBacklog = pendingBatch != null
         // 喵~防御：把上次上报状态恢复回来，进程被杀后界面仍能看到上次结果喵
         val restoredReportStatus = prefs.readReportStatus()
         // 写进进程内快照，界面每秒读它显示"成功多久前 / 失败原因"喵
@@ -250,8 +275,10 @@ class UploadService : Service() {
                 // 喵~注意：按真实流逝时间累计，循环被拖慢时不会凭空少记喵
                 val nowMillis = System.currentTimeMillis()
                 // 喵~注意：上一轮亮屏却拿不到前台应用时放宽上限，把那段秒数补回来喵
-                val gapCap = if (recoverGap) MAX_RECOVER_MILLIS else MAX_SAMPLE_GAP_MILLIS
-                val elapsedMillis = (nowMillis - lastSampleAtMillis).coerceIn(1L, gapCap)
+                // 喵~注意：上限按**实际配置的**采集间隔算，不能用手写常量，
+                // 否则把采集间隔调到 60 秒后每轮只记 15 秒，会稳定丢时长喵
+                val gapCap = SampleGapCap.capMillis(sampleIntervalMillis)
+                val elapsedMillis = SampleGapCap.clampElapsed(nowMillis - lastSampleAtMillis, gapCap, recoverGap)
                 // 喵~防御：没有前台应用（锁屏或系统没给事件）时也不计时喵
                 if (foregroundApp != null && screenOn) {
                     // 喵~防御：新出现的应用顺手把图标传上去，同一个包只传一次喵
@@ -343,7 +370,12 @@ class UploadService : Service() {
      *
      * 输入：本次采样到的前台应用（可为空）、AFK 判定结果、AFK 起点与恢复时刻（毫秒，可为空）。
      * 输出：无，结果记录在 lastReportText 与 lastReportStatus 并刷新通知。
-     * 边界：drain 之后的任何异常都会把这一批数据还回累加器并落盘，绝不丢数据喵。
+     * 边界：失败时把这一批**冻结**成待重发批次（秒数 + 固定时刻）并落盘，绝不丢数据喵。
+     *
+     * 喵~注意：这里**不能**再按老办法「失败就把秒数还回累加器」。
+     * 服务端用 (deviceId, reportedAt) 做幂等键，还回去会让下一批变成「旧+新」的超集
+     * 并重新取当前时刻，服务端当成全新批次又加一遍，使用时长**永久翻倍**喵。
+     * 现在改成：失败就冻结这一批，下一轮原样重发；成功后才去发新攒的数据喵。
      */
     private fun reportOnce(
         foregroundApp: ForegroundApp?,
@@ -352,18 +384,33 @@ class UploadService : Service() {
         activeSince: Long? = null,
         usageEndedAtMillis: Long? = null,
     ) {
-        // 取出待上报增量喵
-        val pendingDeltas = usageCalculator.drain()
+        // 喵~注意：有上次没发出去的批次时优先重发它，这一轮不碰累加器喵
+        val retryBatch = pendingBatch
+        // 这一轮要发出去的增量喵
+        val pendingDeltas: List<UsageDelta>
+        // 这一批固定使用的上报时刻，重试期间绝不变喵
+        val batchReportedAt: String
+        if (retryBatch != null && !retryBatch.isEmpty) {
+            // 重发上次冻结的那一批，秒数原样喵
+            pendingDeltas = retryBatch.items
+            // 时刻沿用第一次的，服务端才能认出是同一批喵
+            batchReportedAt = retryBatch.reportedAt
+        } else {
+            // 正常路径：取走当前攒下的数据并清空累加器喵
+            pendingDeltas = usageCalculator.drain()
+            // 这一批的身份在这一刻定下来，之后重试都不再变喵
+            batchReportedAt = IsoTime.nowUtc()
+        }
         // 这一批的秒数与应用数先算好，日志与异常兜底都要用喵
         val pendingSeconds = pendingDeltas.sumOf { it.seconds }
         // 这一批涉及多少个应用喵
         val pendingApps = pendingDeltas.size
-        // 喵~注意：drain 之后内存里暂时是 0 秒，界面先归零，失败再补回去喵
-        updatePendingSeconds(0L)
+        // 喵~注意：重发期间累加器里的新数据原地留着，界面显示它还有多少没发喵
+        updatePendingSeconds(usageCalculator.totalSeconds())
         // 这一批里是否含着上次失败留下的补报数据喵
         val includesBacklog = hasPendingBacklog && pendingDeltas.isNotEmpty()
-        // 标记这一批是否已经还回累加器，避免 catch 重复累加喵
-        var restored = false
+        // 标记这一批是否已经冻结成待重发批次，避免 catch 重复处理喵
+        var frozen = false
         try {
             // 喵~注意：afk 与使用时长可以同时上报——服务端会把这一批秒数照常入库，
             // 空档只从"没有使用的分钟"算起，所以不必再把 afk 压成 false（那会晚一整拍）喵
@@ -373,7 +420,8 @@ class UploadService : Service() {
             // 组装 JSON 喵
             val payload = ReportPayload.build(
                 deviceId = prefs.deviceId(),
-                reportedAt = IsoTime.nowUtc(),
+                // 喵~注意：把这一批的身份一起传下去，重试时服务端才能认出是同一批喵
+                reportedAt = batchReportedAt,
                 displayName = prefs.displayName.ifBlank { prefs.defaultDisplayName() },
                 batteryPercent = battery?.percent,
                 batteryCharging = battery?.charging,
@@ -408,8 +456,9 @@ class UploadService : Service() {
             // 再落盘，进程被杀后下次启动还能显示上次结果喵
             prefs.saveReportStatus(reportStatus)
             if (result.success) {
-                // 成功就清空磁盘上的待上报状态喵
+                // 成功就把磁盘上的待重发批次清掉，这一批到此为止喵
                 updateLastReport("上报成功 ${IsoTime.nowUtc()}")
+                pendingBatch = null
                 prefs.pendingUsageState = ""
                 // 喵~注意：这一批含着上次失败补报的数据时，日志里点出来，方便排查积压喵
                 val backlogNote = if (includesBacklog) "（含补报）" else ""
@@ -417,42 +466,42 @@ class UploadService : Service() {
                 // 补报已经发出去，标记清掉，下一批不再重复标注喵
                 hasPendingBacklog = false
             } else {
-                // 喵~防御：失败要把增量还回去，否则这段时间的数据会永久丢失喵
-                usageCalculator.restore(pendingDeltas)
-                // 已经还回内存，catch 里不要再重复累加一次喵
-                restored = true
-                // 喵~防御：还回去之后立刻落盘，避免这期间服务被杀又丢一次喵
+                // 喵~防御：失败就把这一批**冻结**下来，秒数与时刻都原样，下一轮重发喵
+                pendingBatch = PendingBatch(reportedAt = batchReportedAt, items = pendingDeltas)
+                // 已经冻结好，catch 里不要再处理一次喵
+                frozen = true
+                // 喵~防御：冻结之后立刻落盘，避免这期间服务被杀又丢一次喵
                 persistPendingUsage()
-                // 还回去之后界面上的待补报秒数要立刻变多喵
-                updatePendingSeconds(usageCalculator.totalSeconds())
+                // 界面上要同时显示「重发批次」与「新攒的数据」合起来的欠账喵
+                updatePendingSeconds(pendingBatchSeconds() + usageCalculator.totalSeconds())
                 // 喵~注意：把这一批记成补报，下一次成功日志里带一句「含补报」喵
                 hasPendingBacklog = pendingDeltas.isNotEmpty()
                 updateLastReport("上报失败：${result.message}")
                 Log.w(logTag, lastReportText)
-                // 喵~注意：失败日志写清缓存了多少秒、多少个应用，主人一眼知道积压规模喵
+                // 喵~注意：失败日志写清冻结了多少秒、多少个应用，主人一眼知道积压规模喵
                 AgentLog.warn(
-                    "上报失败：${result.message}，已缓存 $pendingSeconds 秒 / $pendingApps 个应用待补报",
+                    "上报失败：${result.message}，已冻结 $pendingSeconds 秒 / $pendingApps 个应用待重发",
                 )
             }
         } catch (error: Exception) {
-            // 喵~防御：drain 之后的任何异常都要把这一批还回去，绝不能因为异常丢数据喵
-            if (!restored) {
-                // 先把数据还回内存，后面落盘失败也不会丢喵
-                usageCalculator.restore(pendingDeltas)
-                // 标记已经还回去，避免后续再走一次累加喵
-                restored = true
+            // 喵~防御：drain 之后的任何异常都要把这一批冻结住，绝不能因为异常丢数据喵
+            if (!frozen) {
+                // 把这一批冻起来，后面落盘失败也不会丢喵
+                pendingBatch = PendingBatch(reportedAt = batchReportedAt, items = pendingDeltas)
+                // 标记已经冻结，避免后续再处理一次喵
+                frozen = true
             }
-            // 喵~防御：不管异常发生在还回去之前还是之后，都再尝试落盘一次喵
+            // 喵~防御：不管异常发生在冻结之前还是之后，都再尝试落盘一次喵
             try {
-                // 把当前累计写回偏好，进程这时被杀也还能恢复喵
+                // 把当前待重发批次写回偏好，进程这时被杀也还能恢复喵
                 persistPendingUsage()
             } catch (persistError: Exception) {
-                // 写盘失败时数据还在内存里，至少本进程内还能补报喵
-                Log.w(logTag, "缓存待上报数据失败：${persistError.message}")
-                AgentLog.error("缓存待上报数据失败：${persistError.message}")
+                // 写盘失败时数据还在内存里，至少本进程内还能重试喵
+                Log.w(logTag, "缓存待重发批次失败：${persistError.message}")
+                AgentLog.error("缓存待重发批次失败：${persistError.message}")
             }
-            // 界面上的待补报秒数同步成还回去之后的值喵
-            updatePendingSeconds(usageCalculator.totalSeconds())
+            // 界面上的待补报秒数同步成冻结之后的欠账喵
+            updatePendingSeconds(pendingBatchSeconds() + usageCalculator.totalSeconds())
             // 有数据才算补报，空批次失败不必虚报喵
             if (pendingDeltas.isNotEmpty()) {
                 hasPendingBacklog = true
@@ -481,9 +530,21 @@ class UploadService : Service() {
     }
 
     /** 把当前待上报数据写进偏好设置，供下次启动恢复喵。 */
+    /**
+     * 把待重发批次写进偏好设置。
+     *
+     * 喵~注意：这里存的是「批次」而不是裸的秒数字典——批次要带上固定的上报时刻，
+     * 重启后才能原样重发、让服务端认出是同一批；只有秒数的话就没法保证幂等喵。
+     */
     private fun persistPendingUsage() {
         // 编码后写入，编码本身会过滤非法数据喵
-        prefs.pendingUsageState = UsageStateCodec.encode(usageCalculator.snapshot())
+        prefs.pendingUsageState = pendingBatch?.let { batch -> PendingBatch.encode(batch) } ?: ""
+    }
+
+    /** 当前待重发批次的总秒数，没有批次时是 0喵。 */
+    private fun pendingBatchSeconds(): Long {
+        // 没有批次就没有欠账喵
+        return pendingBatch?.totalSeconds ?: 0L
     }
 
     /** 创建通知渠道，Android 8 起必须先建渠道喵。 */
@@ -605,12 +666,16 @@ class UploadService : Service() {
         // 默认采样间隔，实际值取本地配置喵
         const val SAMPLE_INTERVAL_MILLIS = SampleInterval.DEFAULT_SECONDS * 1000L
         // 喵~注意：上报间隔不再写死，由本地配置 report_interval_seconds + ReportInterval 决定；
-        // 上限 60 秒是硬约束——服务端心跳超时 180 秒，正常两轮心跳远小于超时，留足重试余量喵
+        // 上限 60 秒是硬约束——服务端心跳超时是 60 秒，间隔再大就会被判离线喵
         // 采集摘要的间隔，5 分钟写一条日志喵
         const val SUMMARY_INTERVAL_MILLIS = 5 * 60_000L
         // 单轮采样最多补记多久：循环被系统冻结后不要凭空记上几个小时喵
-        // 喵~注意：这个上限只按采集间隔（5 秒）算，跟上报间隔是两个独立的量，别拿上报间隔来乘喵
-        const val MAX_SAMPLE_GAP_MILLIS = 3 * SAMPLE_INTERVAL_MILLIS
+        //
+        // 喵~注意：这是个**兜底常量**，真跑起来用 `SampleGapCap.capMillis(实际采集间隔)`。
+        // 因为 `SampleInterval` 允许把采集间隔调到 60 秒，
+        // 而这里按默认 5 秒乘 3 只有 15 秒——间隔调大后每轮只记 15 秒，
+        // 会稳定丢掉大量使用时长且毫无日志痕迹喵
+        const val MAX_SAMPLE_GAP_MILLIS = SampleGapCap.MIN_CAP_MILLIS
 
         // 喵~注意：上一轮拿不到前台应用时，这一段允许补记得更长，否则那几十秒直接消失喵
         // 喵~注意：这里同样是采样补记上限，与上报间隔无关，上报频率改到 10 秒也不会影响它喵

@@ -2,7 +2,9 @@
 
 设计要点：
 - 每采样到一次前台应用，就给该应用累加采样间隔秒数；
-- 上报成功后清空待发数据，上报失败则把数据还回去，等下次一起发；
+- 上报成功后清空待发数据；
+- 上报失败时**不把数据并回累加器**，而是冻结成一个「待重发批次」原样重发，
+  理由见 `PendingBatch` 的注释喵；
 - 只累计"还没上报过"的部分，符合服务端"usage_delta 是增量"的语义喵。
 """
 
@@ -21,6 +23,59 @@ MAX_SECONDS_PER_APP = 86400
 
 # 应用名与包名的分隔符，用 NUL 保证不会和应用名撞车喵
 KEY_SEPARATOR = "\u0000"
+
+
+class PendingBatch:
+    """一次上报失败后冻结下来的批次：数据 + 它原始的 reported_at喵。
+
+    为什么需要这个类型：服务端用 `(device_id, reported_at)` 做幂等键，
+    同一个键重复上报只更新设备状态、**不会重复累加秒数**。
+    原来客户端失败后把这批秒数并回累加器，下一批就变成「旧数据 + 新数据」的
+    超集、而且重新取了当前时刻 → 服务端认为这是全新的一批，
+    把旧数据又加了一遍，使用时长**永久翻倍**喵。
+
+    正确做法是把失败的那一批**原封不动**留着（同样的秒数、同样的 reported_at），
+    下一轮优先重发它；送成功之后才把这一批清掉，再去发新攒的数据。
+    这样即使重试十次，服务端也只会认第一次的键，秒数只加一次喵。
+
+    喵~注意：`reported_at` 必须**只在批次创建时取一次**，
+    重试时原样带着走，不能在每次发送前重新取当前时刻——那正是原来的 bug喵。
+    """
+
+    def __init__(self, seconds: dict[str, int], reported_at: str) -> None:
+        """记下这一批的秒数与它固定的上报时刻喵。
+
+        输入：应用键到秒数的字典、这一批的 reported_at 文本（ISO 8601）。
+        输出：无。
+        边界：两者都按只读语义使用，调用方不要再改动传进来的字典喵。
+        """
+        # 复制一份，避免调用方后续改动影响已经冻结的批次喵
+        self._seconds = dict(seconds)
+        # 这一批固定使用的上报时刻，重试期间绝不变喵
+        self._reported_at = reported_at
+
+    @property
+    def seconds(self) -> dict[str, int]:
+        """返回这一批的秒数副本喵。"""
+        # 返回副本，防止外部改到内部状态喵
+        return dict(self._seconds)
+
+    @property
+    def reported_at(self) -> str:
+        """返回这一批固定的上报时刻喵。"""
+        # 直接返回字符串，重试期间保持不变喵
+        return self._reported_at
+
+    def total_seconds(self) -> int:
+        """返回这一批的总秒数，用于日志与界面文案喵。"""
+        # 求和喵
+        return sum(self._seconds.values())
+
+    def is_empty(self) -> bool:
+        """这一批是否已经没有数据可发喵。"""
+        # 没有任何应用就算空喵
+        return not self._seconds
+
 
 
 def make_key(app_name: str, package: str) -> str:

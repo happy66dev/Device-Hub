@@ -4,10 +4,9 @@ package io.github.happy66dev.devicehub.core
  * 上报频率（上报间隔）的取值规则与到期判定，纯 Kotlin 实现，方便在 JVM 单元测试里直接验证。
  *
  * 口径：10 到 60 之间的整数秒，默认 60 秒一次。
- * 喵~注意：服务端心跳超时是 180 秒（server/app/presence.py 的 DEFAULT_HEARTBEAT_TIMEOUT_SECONDS），
- * 所以上报间隔上限只能取 60 秒——正常情况下两次心跳的间隔远小于超时，
- * 偶尔丢一轮也还有重试余量；把上限放宽到 90 秒以上，重试余量就不够了，
- * 会出现"服务还在跑、服务端却画成离线"的假空档喵。
+ * 喵~注意：服务端心跳超时是 **60 秒**（server/app/presence.py 的 DEFAULT_HEARTBEAT_TIMEOUT_SECONDS），
+ * 所以上报间隔上限只能取 60 秒——正好等于超时，容错余量其实只有「同一分钟内的抖动」，
+ * 把上限放宽到 90 秒以上会稳定出现「服务还在跑、服务端却画成离线」的假空档喵。
  */
 object ReportInterval {
 
@@ -17,11 +16,12 @@ object ReportInterval {
     // 允许的最小上报频率：10 秒，再小会让服务端心跳过密且更费电喵
     const val MIN_SECONDS = 10
 
-    // 允许的最大上报频率：60 秒，受服务端 180 秒心跳超时约束（见类注释）喵
+    // 允许的最大上报频率：60 秒，不能超过服务端心跳超时（见类注释）喵
     const val MAX_SECONDS = 60
 
-    // 服务端心跳超时（秒），只用于文档与单元测试校验上限安全性喵
-    const val HEARTBEAT_TIMEOUT_SECONDS = 180
+    // 服务端心跳超时（秒），必须和 server/app/presence.py 保持一致喵
+    // 喵~注意：这里原来写的是 180，与服务端实际的 60 对不上，是纯文档性错误喵
+    const val HEARTBEAT_TIMEOUT_SECONDS = 60
 
     /**
      * 把任意整数夹到合法区间。

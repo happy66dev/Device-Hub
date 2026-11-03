@@ -37,8 +37,8 @@ class ServerSection:
     port: int = 8080
     # SQLite 数据库文件绝对路径，加载配置时已按配置文件目录解析成绝对路径喵
     db_path: Path = Path("data/device_hub.db")
-    # 日志级别字符串喵
-    log_level: str = "info"
+    # 日志级别字符串，加载配置时已校验并规范成大写喵
+    log_level: str = "INFO"
 
 
 @dataclass(frozen=True)
@@ -245,6 +245,13 @@ class AppConfig:
     clock: ClockSection = field(default_factory=ClockSection)
     # 官方 QQ Bot 通道参数（带默认值，默认关闭）喵
     qqbot: QQBotSection = field(default_factory=QQBotSection)
+    # 这份配置是从哪个文件加载出来的，设置页读写都要用它喵
+    #
+    # 喵~注意：设置页原来直接用 resolve_config_path() 重新推一遍路径，
+    # 在正常启动（不传参）时两者恰好一致，但只要调用方显式传了 config_path，
+    # 或者测试里用 create_app(自己的配置)，设置页就会去读写**另一个** config.yaml，
+    # 于是「保存了却没生效」「把别的文件改坏了」都会发生喵
+    config_path: Path | None = None
 
     def gating_settings(self) -> "GatingSettings":
         """把配置转成门控模块需要的设置对象喵。"""
@@ -360,6 +367,43 @@ def _as_bool(section: dict[str, Any], section_name: str, key: str, default: bool
         # 类型不对直接报错喵
         raise ConfigError(f"{section_name}.{key} 必须是 true 或 false，实际是 {type(value).__name__}")
     return value
+
+
+# 日志级别合法取值，顺序即错误提示里的展示顺序喵
+LOG_LEVELS: tuple[str, ...] = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+# 日志级别缺省值：留空或没写这一项时统一用 INFO 喵
+DEFAULT_LOG_LEVEL = "INFO"
+
+
+def _as_log_level(section: dict[str, Any], section_name: str, key: str, default: str) -> str:
+    """读取日志级别并做枚举校验，返回大写规范值喵。
+
+    输入：所在节字典、节名、键名、缺省值。
+    输出：属于 LOG_LEVELS 的大写字符串。
+    边界：大小写不敏感；空串按缺省值处理（配置文件里常见 `log_level: ""`，
+    当作"没写"比让服务起不来更符合直觉）；其它取值抛 ConfigError喵。
+    """
+    # 取不到就用默认值喵
+    value = section.get(key, default)
+    # 喵~防御：YAML 里写成数字或布尔值时类型不对，直接报错喵
+    if not isinstance(value, str):
+        # 报错信息带上完整字段路径喵
+        raise ConfigError(f"{section_name}.{key} 必须是字符串，实际是 {type(value).__name__}")
+    # 去掉首尾空白后再判断，避免 " info " 这种肉眼看不出的差异喵
+    cleaned = value.strip()
+    # 空串按缺省值处理喵
+    if not cleaned:
+        cleaned = default
+    # 统一转大写，大小写不敏感喵
+    normalized = cleaned.upper()
+    # 喵~防御：日志级别写错要到启动 logging 或热更新时才炸，必须在配置层拦住喵
+    if normalized not in LOG_LEVELS:
+        # 错误信息列出全部合法取值，方便主人直接对照着改喵
+        raise ConfigError(
+            f"{section_name}.{key} 只能是 {' / '.join(LOG_LEVELS)} 之一，实际是 {value!r}"
+        )
+    return normalized
 
 
 def _as_int_tuple(section: dict[str, Any], section_name: str, key: str) -> tuple[int, ...]:
@@ -506,7 +550,7 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         host=_as_str(server_raw, "server", "host", "0.0.0.0"),
         port=_as_int(server_raw, "server", "port", 8080, minimum=1, maximum=65535),
         db_path=db_path_candidate,
-        log_level=_as_str(server_raw, "server", "log_level", "info"),
+        log_level=_as_log_level(server_raw, "server", "log_level", DEFAULT_LOG_LEVEL),
     )
     # 组装上报配置喵
     ingest_section = IngestSection(
@@ -625,4 +669,6 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         qqbot=qqbot_section,
         bot=bot_section,
         base_dir=resolved_path.parent,
+        # 喵~注意：记住来源文件，设置页读写都以它为准，不再自己重推一遍路径喵
+        config_path=resolved_path,
     )
