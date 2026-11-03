@@ -97,7 +97,6 @@ class Command:
             return self.alternate_template
         return self.template
 
-
 def _base_scope(context: CommandContext) -> dict[str, Any]:
     """构造所有命令共享的基础作用域喵。"""
     return {
@@ -109,7 +108,6 @@ def _base_scope(context: CommandContext) -> dict[str, Any]:
         "arg2": context.args[1] if len(context.args) > 1 else "",
         "now": context.now,
     }
-
 
 def _parse_window_text(text: str, default_text: str) -> tuple[str, int]:
     """解析时间窗口参数，返回 (原文本, 秒数)喵。"""
@@ -126,13 +124,30 @@ def _parse_window_text(text: str, default_text: str) -> tuple[str, int]:
 
 # ==================== 各命令的数据准备 ====================
 
+def _brand_of(config: object) -> str:
+    """取当前配置里的品牌词，供错误提示等「代码里拼出来的文案」使用喵。
+
+    输入：服务端配置对象。
+    输出：品牌词，缺配置时退回默认值。
+    边界：老配置对象没有 bot 节或没有该字段时退回默认值，不会抛异常喵。
+
+    喵~注意：模板正文里的品牌词由 `{品牌}` 占位符替换，
+    但 raise 出来的错误提示是 Python 字符串拼接的，得自己取一次喵
+    """
+    # 喵~防御：用 getattr 逐层兜底，测试里常传简化对象喵
+    section = getattr(config, "bot", None)
+    brand = getattr(section, "command_brand", DEFAULT_COMMAND_BRAND) if section is not None else DEFAULT_COMMAND_BRAND
+    return (brand or "").strip() or DEFAULT_COMMAND_BRAND
 
 def _happy_help_scope(context: CommandContext) -> Mapping[str, Any]:
     """happy 帮助命令：把命令清单摊成行喵。"""
     scope = _base_scope(context)
+    # 喵~注意：必须用「当前配置那张表」，否则主人改了品牌名之后，
+    # 帮助里列的还是 happy 那套命令，照抄会全部查不到喵
+    table = commands_for_config(context.config)
     # 逐条命令组装帮助行喵
     rows: list[dict[str, Any]] = []
-    for command in COMMANDS:
+    for command in table:
         # 喵~防御：完全不进帮助的命令（既没用法也没说明）才跳过喵
         if not command.summary and not command.usage:
             continue
@@ -153,7 +168,6 @@ def _happy_help_scope(context: CommandContext) -> Mapping[str, Any]:
     scope["commands"] = rows
     scope["command_count"] = len(rows)
     return scope
-
 
 def _happy_doing_scope(context: CommandContext) -> Mapping[str, Any]:
     """happy 在干嘛：三档状态各一份文案喵。"""
@@ -193,7 +207,6 @@ def _happy_doing_scope(context: CommandContext) -> Mapping[str, Any]:
     scope["has_last_usage"] = snapshot.last_usage is not None
     return scope
 
-
 def _happy_done_scope(context: CommandContext) -> Mapping[str, Any]:
     """happy 干了什么：近 24 小时前 10 的应用排行喵。"""
     scope = _base_scope(context)
@@ -214,7 +227,6 @@ def _happy_done_scope(context: CommandContext) -> Mapping[str, Any]:
     scope["range_note"] = group_note(devices, happy.resolve_group_name(context.config))
     return scope
 
-
 def group_note(devices: Sequence[happy.HappyDevice], group_name: str | None = None) -> str:
     """拼一句「组内有哪些设备」的说明喵。
 
@@ -229,7 +241,6 @@ def group_note(devices: Sequence[happy.HappyDevice], group_name: str | None = No
         return label
     return f"{label} · " + "、".join(device.name for device in devices)
 
-
 def _looks_like_time_window(text: str) -> bool:
     """判断一个参数是不是时长写法喵。
 
@@ -239,7 +250,6 @@ def _looks_like_time_window(text: str) -> bool:
     """
     # 带引号的形式先解析成秒，解析得出就算时长喵
     return expr.parse_duration_text(text.strip()) is not None
-
 
 def _parse_happy_scope(text: str, context: CommandContext) -> tuple[str, list[str], str]:
     """解析「全部」或设备名/ID 前缀喵。
@@ -278,7 +288,6 @@ def _parse_happy_scope(text: str, context: CommandContext) -> tuple[str, list[st
     available = "、".join(device.name for device in devices)
     raise DeviceLookupError(f"「{cleaned}」在{group_name}组里找不到。可用：全部、{available}")
 
-
 def _look_rank_scope(context: CommandContext) -> Mapping[str, Any]:
     """看看happy 排行榜：按时间窗口出图喵。"""
     scope = _base_scope(context)
@@ -308,7 +317,6 @@ def _look_rank_scope(context: CommandContext) -> Mapping[str, Any]:
     )
     return scope
 
-
 def _look_happy_scope(context: CommandContext) -> Mapping[str, Any]:
     """看看happy：按第二个参数分流到排行榜或时间轴喵。
 
@@ -318,10 +326,12 @@ def _look_happy_scope(context: CommandContext) -> Mapping[str, Any]:
     """
     # 喵~防御：至少要有范围和子命令两个参数喵
     if len(context.args) < 2:
+        # 喵~注意：提示里要用当前品牌名，否则改过名的主人照着抄会全部打错喵
+        prefix = _brand_of(context.config)
         raise DeviceLookupError(
-            "用法：/看看happy <全部/设备名> <排行榜/时间轴> [参数]\n"
-            "例如：/看看happy 全部 排行榜 7天\n"
-            "例如：/看看happy 手机 时间轴 09:00 12:00"
+            f"用法：/看看{prefix} <全部/设备名> <排行榜/时间轴> [参数]\n"
+            f"例如：/看看{prefix} 全部 排行榜 7天\n"
+            f"例如：/看看{prefix} 手机 时间轴 09:00 12:00"
         )
     # 第二个参数决定走哪条分支喵
     sub = context.args[1].strip().lower()
@@ -333,7 +343,6 @@ def _look_happy_scope(context: CommandContext) -> Mapping[str, Any]:
         return _look_timeline_scope(context)
     # 喵~防御：认不出的子命令要提示清楚喵
     raise DeviceLookupError(f"看不懂「{context.args[1]}」，第二个参数只能是「排行榜」或「时间轴」。")
-
 
 def _look_timeline_scope(context: CommandContext) -> Mapping[str, Any]:
     """看看happy 时间轴：按日期或起止时刻出图喵。
@@ -359,7 +368,7 @@ def _look_timeline_scope(context: CommandContext) -> Mapping[str, Any]:
     start = _parse_day_text(day_text, context)
     # 喵~防御：时刻最多两个喵
     if len(moment_args) > 2:
-        raise DeviceLookupError("时间轴最多写起止两个时刻，例如 /看看happy 全部 时间轴 09:00 12:00")
+        raise DeviceLookupError(f"时间轴最多写起止两个时刻，例如 /看看{_brand_of(context.config)} 全部 时间轴 09:00 12:00")
     # 没写时刻时截到「当前时刻 +10 分钟」，但不越过当天末尾喵
     start_text = moment_args[0] if moment_args else ""
     end_text = moment_args[1] if len(moment_args) > 1 else ""
@@ -396,7 +405,6 @@ def _look_timeline_scope(context: CommandContext) -> Mapping[str, Any]:
     )
     return scope
 
-
 def _default_timeline_end(context: CommandContext, day_start: datetime) -> str:
     """算时间轴的默认截止时刻：当前时刻 +10 分钟，封顶 23:59喵。
 
@@ -419,7 +427,6 @@ def _default_timeline_end(context: CommandContext, day_start: datetime) -> str:
     if target.date() != now_local.date():
         return "23:59"
     return target.strftime("%H:%M")
-
 
 def _happy_device_scope(context: CommandContext) -> Mapping[str, Any]:
     """happy 设备：happy 组每台设备一行喵。"""
@@ -467,7 +474,6 @@ def _happy_device_scope(context: CommandContext) -> Mapping[str, Any]:
     return scope
 
 
-
 def _looks_like_date(text: str) -> bool:
     """判断一个参数是不是日期写法喵。
 
@@ -477,7 +483,6 @@ def _looks_like_date(text: str) -> bool:
     """
     # 只认带分隔符的三段式写法喵
     return re.fullmatch(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", text.strip()) is not None
-
 
 def _parse_day_text(text: str, context: CommandContext) -> datetime:
     """把日期文本解析成当天零点（本地时区）喵。
@@ -500,7 +505,6 @@ def _parse_day_text(text: str, context: CommandContext) -> datetime:
     except ValueError as error:
         raise DeviceLookupError(f"日期看不懂：{cleaned}（格式：2026-11-01）") from error
     return parsed.replace(tzinfo=local_tz).astimezone(timezone.utc)
-
 
 def _clock_minutes(text: str) -> int:
     """把 HH:MM 换算成当天第几分钟喵。
@@ -533,7 +537,6 @@ def _clock_minutes(text: str) -> int:
         )
     # 换算成当天第几分钟喵
     return hour_value * 60 + minute_value
-
 
 def zoom_for_window(start_text: str, end_text: str) -> int:
     """按自定义窗口反算「铺满视口」需要的缩放倍数喵。
@@ -570,62 +573,77 @@ FRAGMENTS: dict[str, str] = {
 
 # ==================== 命令表 ====================
 
+# 命令名里的品牌占位符喵
+#
+# 喵~注意：命令表里凡是用户看得见的名字都写成 `{品牌}`，由 build_commands()
+# 按 bot.command_brand 填成具体词（默认 happy）。这样换成别人的名字时
+# 只需要改配置，不必动代码喵
+BRAND_PLACEHOLDER = "{品牌}"
 
-COMMANDS: tuple[Command, ...] = (
+# 默认品牌词，与 config.BotSection.command_brand 的默认值保持一致喵
+DEFAULT_COMMAND_BRAND = "happy"
+
+
+# 基准命令表：写成占位符形式，名称里的 {品牌} 在 build_commands 里替换喵
+#
+# 喵~注意：`name` 字段是**稳定标识**，日志、测试、build_image 都拿它比对，
+# 所以它不参与替换（始终是 happy设备 / 看看happy 这些固定值）；
+# 用户能看到的只有 aliases、summary、usage 与模板正文喵
+COMMAND_BLUEPRINTS: tuple[Command, ...] = (
     Command(
         name="happy帮助",
-        aliases=("happy帮助", "happyhelp"),
-        summary="看看可以查询happy哪些信息",
+        aliases=("{品牌}帮助", "{品牌}help"),
+        summary="看看可以查询{品牌}哪些信息",
         template="""{查询 当前 列表=命令列表 行=帮助行}""",
         handler=_happy_help_scope,
     ),
     Command(
         name="happy在干嘛",
-        aliases=("happy在干嘛", "happydoing"),
-        summary="看看 happy 现在在做什么",
+        aliases=("{品牌}在干嘛", "{品牌}doing"),
+        summary="看看 {品牌} 现在在做什么",
         # 喵~注意：三档状态各一份文案，靠三个互斥开关挑分支。原来只有
         # 「主模板 + alternate」两个槽位，挂机那档会错走主模板说「正在使用」，
         # 「不在」那档的开头偏偏写的是「正在挂机」，两档口径全错喵
         # 喵~注意：三个 {若} 必须紧挨着写，中间不能换行，否则空档会多出空行喵
-        template="""{若 正在使用}happy正在使用{设备名}
+        template="""{若 正在使用}{品牌}正在使用{设备名}
 当前应用: {当前应用}{若 当前应用时长}（已持续 {当前应用时长|时长}）{/若}{若 有标题}
 {标题}{/若}{若 有电量}
-设备剩余电量：{电量|数字}%{/若}{/若}{若 挂机}happy正在挂机...? 可能在处理事情
+设备剩余电量：{电量|数字}%{/若}{/若}{若 挂机}{品牌}正在挂机...? 可能在处理事情
 最近使用: {设备名}
 当前应用: {当前应用}{若 有标题}
 {标题}{/若}{若 是手机}{若 有电量}
-手机剩余电量：{电量|数字}%{/若}{/若}{/若}{若 不在}happy不在诶...
+手机剩余电量：{电量|数字}%{/若}{/若}{/若}{若 不在}{品牌}不在诶...
 {若 有最近一次上线}最近一次使用: {最近使用} · {最近一次上线|相对}
 已经 {空档时长|时长}没有动静{否则}组内设备都还没有使用记录，客户端还没报过使用时长{/若}{/若}""",
         handler=_happy_doing_scope,
     ),
     Command(
         name="happy干了什么",
-        aliases=("happy干了什么", "happydone"),
-        summary="看看 happy 近 24 小时用了什么",
-        template="""近24小时内 happy使用了下面的东西（{范围说明}）
+        aliases=("{品牌}干了什么", "{品牌}done"),
+        summary="看看 {品牌} 近 24 小时用了什么",
+        template="""近24小时内 {品牌}使用了下面的东西（{范围说明}）
 
 {查询 当前 列表=应用列表 行=排行行 空="近 24 小时没有使用记录。"}""",
         handler=_happy_done_scope,
     ),
     Command(
         name="happy设备",
-        aliases=("happy设备", "happydevices"),
-        summary="看看 happy 名下各台设备的状态",
-        template="""happy 的设备
+        aliases=("{品牌}设备", "{品牌}devices"),
+        summary="看看 {品牌} 名下各台设备的状态",
+        template="""{品牌} 的设备
 
 {查询 当前 列表=设备列表 行=happy设备块 空="{设备组名}组里还没有设备。"}""",
         handler=_happy_device_scope,
     ),
     Command(
         name="看看happy",
-        aliases=("看看happy", "lookhappy"),
+        aliases=("看看{品牌}", "look{品牌}"),
         # 喵~注意：用法里已经写明参数格式，帮助里不必再重复一行摘要喵
         summary="",
         show_summary=False,
         # 喵~注意：时间范围的写法直接嵌在用法里，参数格式要一眼能抄喵
-        # 设备：全部 = happy 组所有设备合并；也可写设备名或名称前缀（本机、手机），
-        #       或者设备 ID 前缀（win-、and-），只认 happy 组里的设备喵
+        # 设备：全部 = 设备组所有设备合并；也可写设备名或名称前缀（本机、手机），
+        #       或者设备 ID 前缀（win-、and-），只认设备组里的设备喵
         # 排行榜 [时间范围]：默认近 24 小时，可写 30分钟 / 2小时 / 6小时 / 1天 / 3天 / 7天，
         #       超过 7 天按 7 天算喵
         # 时间轴 [起止时刻]：默认今天全天到此刻；可只写日期（2026-11-01），
@@ -634,35 +652,145 @@ COMMANDS: tuple[Command, ...] = (
     设备：全部 / 本机 / 手机 / 设备 ID 前缀（win-、and-）
     排行榜 [时间范围]：24小时（默认）/ 30分钟 / 2小时 / 6小时 / 1天 / 3天 / 7天，上限 7 天
     时间轴 [起止时刻]：今天（默认，到此刻）/ 2026-11-01 / 2026-11-01 09:00 12:00
-    例：/看看happy 全部 排行榜 6小时
-        /看看happy 手机 时间轴 09:00 12:00""",
-        template="""查看 happy 最近 {时间窗口} 的应用排行
+    例：/看看{品牌} 全部 排行榜 6小时
+        /看看{品牌} 手机 时间轴 09:00 12:00""",
+        template="""查看 {品牌} 最近 {时间窗口} 的应用排行
 
 这次排行图片没能生成出来，稍后再发一次试试吧。""",
         handler=_look_happy_scope,
         # 时间轴分支换一份文案，靠 kind 标记切换喵
         alternate_flag="is_timeline",
-        alternate_template="""查看 happy {起始日期}{若 时间窗口} {时间窗口}{/若} 的时间轴
+        alternate_template="""查看 {品牌} {起始日期}{若 时间窗口} {时间窗口}{/若} 的时间轴
 
 这次时间轴图片没能生成出来，稍后再发一次试试吧。""",
     ),
 )
 
 
-def command_by_name(name: str) -> Command | None:
+def _fill_brand(text: str, brand: str) -> str:
+    """把文本里的品牌占位符换成具体词喵。
+
+    输入：可能含 `{品牌}` 的文本、品牌词。
+    输出：替换后的文本；本来就没有占位符时原样返回。
+    边界：品牌词为空时退回默认值，不会替换出空命令名喵。
+    """
+    # 喵~防御：空品牌会让命令名变成 "/设备" 这种，退回默认值喵
+    cleaned = (brand or "").strip() or DEFAULT_COMMAND_BRAND
+    # 没有占位符就不必处理喵
+    if BRAND_PLACEHOLDER not in text:
+        return text
+    # 直接替换喵
+    return text.replace(BRAND_PLACEHOLDER, cleaned)
+
+def _fill_command_brand(command: Command, brand: str) -> Command:
+    """把一条命令里用户看得见的字段填上品牌词喵。
+
+    输入：基准命令、品牌词。
+    输出：新的 Command；`name` 与 `handler` 保持不变。
+
+    喵~注意：`name` 是稳定标识（日志、测试、build_image 都拿它比对），
+    绝对不能替换，否则出图判断会失效喵
+    """
+    return Command(
+        # 稳定标识原样保留喵
+        name=command.name,
+        # 别名要与用户输入的真实命令名一致喵
+        aliases=tuple(_fill_brand(alias, brand) for alias in command.aliases),
+        # 模板正文里也有品牌词喵
+        template=_fill_brand(command.template, brand),
+        # 数据准备函数与品牌无关喵
+        handler=command.handler,
+        # 帮助里显示的说明喵
+        summary=_fill_brand(command.summary, brand),
+        # 帮助里显示的用法喵
+        usage=_fill_brand(command.usage, brand),
+        # 帮助里是否再列一行说明喵
+        show_summary=command.show_summary,
+        # 分支模板开关原样保留喵
+        alternate_flag=command.alternate_flag,
+        # 分支模板正文也要替换喵
+        alternate_template=_fill_brand(command.alternate_template, brand),
+    )
+
+
+# 品牌词到命令表的缓存，避免每次请求都重建一遍喵
+_COMMAND_TABLE_CACHE: dict[str, tuple[Command, ...]] = {}
+
+def build_commands(brand: str = DEFAULT_COMMAND_BRAND) -> tuple[Command, ...]:
+    """按品牌词构造命令表喵。
+
+    输入：品牌词，例如 "happy" 或 "小王"。
+    输出：该品牌下的完整命令元组。
+    边界：空品牌退回默认值；同一个品牌只构造一次，之后走缓存喵。
+
+    喵~注意：命令表原来是模块级常量，改成函数之后仍然保持「同样输入得到同样结果」，
+    调用方可以放心反复取；真正变的只有用户看得见的名称喵
+    """
+    # 归一化品牌词喵
+    cleaned = (brand or "").strip() or DEFAULT_COMMAND_BRAND
+    # 命中缓存就直接返回喵
+    cached = _COMMAND_TABLE_CACHE.get(cleaned)
+    if cached is not None:
+        return cached
+    # 逐条填品牌喵
+    table = tuple(_fill_command_brand(command, cleaned) for command in COMMAND_BLUEPRINTS)
+    # 写进缓存喵
+    _COMMAND_TABLE_CACHE[cleaned] = table
+    return table
+
+def commands_for_config(config: object) -> tuple[Command, ...]:
+    """取某份配置对应的命令表喵。
+
+    输入：服务端配置对象（可以是任何带 bot.command_brand 的东西）。
+    输出：该配置下的命令表。
+    边界：老配置对象没有 bot 节或没有该字段时退回默认品牌喵。
+    """
+    # 喵~防御：用 getattr 兜底，测试里常传简化对象喵
+    section = getattr(config, "bot", None)
+    brand = getattr(section, "command_brand", DEFAULT_COMMAND_BRAND) if section is not None else DEFAULT_COMMAND_BRAND
+    # 交给带缓存的构造器喵
+    return build_commands(brand)
+
+
+# 默认品牌的命令表，保留这个名字给「不需要区分品牌」的调用方与测试用喵
+COMMANDS: tuple[Command, ...] = build_commands(DEFAULT_COMMAND_BRAND)
+
+
+def command_by_name(name: str, table: tuple[Command, ...] | None = None) -> Command | None:
     """按命令名或别名查找命令，大小写不敏感喵。
 
-    输入：用户输入的命令名。
+    输入：用户输入的命令名、可选的命令表。
     输出：命中的 Command，找不到时返回 None。
-    边界：全角问号等别名同样能命中喵。
+    边界：不给命令表时用默认品牌（happy）那张；全角问号等别名同样能命中喵。
+
+    喵~注意：命令名可配置之后，查找必须用「当前配置那张表」，
+    否则主人把品牌改成小王后，`/小王设备` 会查不到命令喵
     """
+    # 没指定就用默认品牌那张表喵
+    candidates = COMMANDS if table is None else table
     # 统一小写比较喵
     lowered = name.strip().lower()
-    for command in COMMANDS:
+    for command in candidates:
         if lowered in (alias.lower() for alias in command.aliases):
             return command
     return None
 
+def command_by_key(key: str, table: tuple[Command, ...] | None = None) -> Command | None:
+    """按**稳定标识**查找命令，供服务端内部引用固定命令时使用喵。
+
+    输入：稳定标识（Command.name，例如 "happy帮助"）、可选的命令表。
+    输出：命中的 Command，找不到时返回 None。
+    边界：不按别名匹配，只认 name；与 command_by_name 的分工不能混喵。
+
+    喵~注意：`Command.name` 不随品牌改名变化，所以内部代码（兜底帮助、
+    出图判断）要用这个名字找命令；用户输入则必须走 command_by_name 喵
+    """
+    # 没指定就用默认品牌那张表喵
+    candidates = COMMANDS if table is None else table
+    for command in candidates:
+        if command.name == key:
+            return command
+    return None
 
 def fragment_nodes() -> dict[str, tuple[Any, ...]]:
     """把所有片段解析成节点树，供渲染环境使用喵。

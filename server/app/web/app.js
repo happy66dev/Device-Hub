@@ -3055,14 +3055,24 @@ function renderBotStatus(status) {
   el.botConn.textContent = `${lines.join("；")}，${detail.join("；")}`;
 }
 
+/** 取当前配置里的命令品牌词，取不到时退回 happy 喵。 */
+function commandBrand() {
+  const field = (state.configFields || []).find((item) => item.section === "bot" && item.key === "command_brand");
+  const value = field && typeof field.value === "string" ? field.value.trim() : "";
+  return value || "happy";
+}
+
 /** 生成常用命令的快捷按钮喵。 */
 function renderBotChips() {
+  // 喵~注意：命令名可以按 bot.command_brand 改名，这里必须跟着变，
+  // 否则主人点一下按钮就发出一条「未知命令」，机器人会静默不理喵
+  const brand = commandBrand();
   const chips = [
-    { text: "/happy帮助" },
-    { text: "/happy在干嘛" },
-    { text: "/happy干了什么" },
-    { text: "/happy设备" },
-    { text: "/看看happy 全部 排行榜" },
+    { text: `/${brand}帮助` },
+    { text: `/${brand}在干嘛` },
+    { text: `/${brand}干了什么` },
+    { text: `/${brand}设备` },
+    { text: `/看看${brand} 全部 排行榜` },
     { text: "/foobar" },
   ];
   el.botChips.innerHTML = chips

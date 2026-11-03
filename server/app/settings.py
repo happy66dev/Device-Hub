@@ -70,6 +70,13 @@ SETTING_FIELDS: tuple[SettingField, ...] = (
     SettingField("acl", "blacklist_member_openids", "str_list", "黑名单成员 openid", "官方通道用"),
     SettingField("acl", "private_user_openids", "str_list", "允许私聊的 user openid", "留空表示私聊不响应"),
     SettingField("bot", "happy_group", "str", "happy 绑定的设备组名", "看板「设备组」里要有一模一样的组名"),
+    SettingField(
+        "bot",
+        "command_brand",
+        "str",
+        "命令名里的品牌词",
+        "改这里等于给整套命令改名，例如填「小王」后命令变成 /小王设备、/看看小王；留空或填 happy 与老版本一致",
+    ),
 )
 
 # 名字到字段定义的映射喵

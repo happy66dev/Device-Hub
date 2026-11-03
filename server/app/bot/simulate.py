@@ -166,7 +166,7 @@ def simulate_command(
     text_reply = ""
     image: bytes | None = None
     # 喵~防御：未知命令在真实机器人里是完全静默的，看板测试也必须给出同一个结论喵
-    if replied and router.is_silent_command(command_text):
+    if replied and router.is_silent_command(command_text, config):
         replied = False
         reason = router.REASON_UNKNOWN_COMMAND
     elif replied:

@@ -148,6 +148,8 @@ ALIASES: dict[str, str] = {
     # 命令计数喵
     "命令数": "command_count",
     "设备数": "device_count",
+    # 命令名里的品牌词（默认 happy，可在设置页改）喵
+    "品牌": "command_brand",
 }
 
 # 路径切分：按点与下标拆成一段一段喵

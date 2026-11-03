@@ -222,13 +222,19 @@ def _strip_optional_prefix(command_text: str) -> str:
     return stripped if hit else normalize_command_text(command_text)
 
 
-def resolve_command(command_text: str) -> tuple[ParsedCommand | None, commands.Command | None]:
+def resolve_command(
+    command_text: str,
+    config: AppConfig | None = None,
+) -> tuple[ParsedCommand | None, commands.Command | None]:
     """把命令文本解析成「命令名 + 参数」并查命令表喵。
 
-    输入：命令文本，允许带 "/" 前缀，也容忍零宽字符与全角空白。
+    输入：命令文本，允许带 "/" 前缀，也容忍零宽字符与全角空白；可选的服务端配置。
     输出：(解析结果, 命中的命令)；纯空白文本返回 (None, None)，
           命令名查不到时返回 (解析结果, None)。
     边界：前缀剥除、清洗、查表三条入口共用这一份实现，保证口径不漂移喵。
+
+    喵~注意：命令名可以按 bot.command_brand 改名，所以查表必须用配置对应的那张表；
+    不传 config 时退回默认品牌（happy），老调用方的行为不变喵
     """
     # 喵~注意：允许调用方带前缀，这里统一剥掉再解析喵
     cleaned = _strip_optional_prefix(command_text)
@@ -237,22 +243,25 @@ def resolve_command(command_text: str) -> tuple[ParsedCommand | None, commands.C
     # 喵~防御：没有命令可解析时两条都空，由调用方决定要不要回帮助喵
     if parsed is None:
         return None, None
-    # 查命令表喵
-    return parsed, commands.command_by_name(parsed.name)
+    # 按当前配置的品牌名查命令表喵
+    table = commands.commands_for_config(config) if config is not None else None
+    return parsed, commands.command_by_name(parsed.name, table)
 
 
-def is_silent_command(command_text: str) -> bool:
+def is_silent_command(command_text: str, config: AppConfig | None = None) -> bool:
     """判断这条命令是否应当完全静默（一个字都不回）喵。
 
-    输入：命令文本，允许带 "/" 前缀。
+    输入：命令文本，允许带 "/" 前缀；可选的服务端配置。
     输出：命令名不在命令表里时返回 True；解析不出命令（纯空白）时返回 False，
           因为「只 @ 机器人不说话」仍走帮助，那是原有行为。
 
     喵~注意：这是「未知命令静默」的唯一判定点，runner 与 simulate 都调它，
     免得真实机器人与看板「命令测试」对同一条消息给出两种结论喵。
+    命令名可配置之后，这里必须拿到同一份配置，否则真实机器人认得的命令
+    在看板「命令测试」里会被判成未知命令喵
     """
     # 解析并查表喵
-    parsed, command = resolve_command(command_text)
+    parsed, command = resolve_command(command_text, config)
     # 喵~防御：连命令名都没有，交回原有逻辑（空命令 → 帮助）喵
     if parsed is None:
         return False
@@ -268,11 +277,14 @@ def build_reply(connection: sqlite3.Connection, config: AppConfig, command_text:
     边界：模板渲染失败、设备找不到、参数写错都会退回可读的中文提示，
           只有「命令名不在命令表里」这一种情况返回空串静默喵。
     """
-    # 解析并查表喵
-    parsed, command = resolve_command(command_text)
+    # 按当前配置的品牌名解析并查表喵
+    parsed, command = resolve_command(command_text, config)
     # 喵~防御：只 @ 了机器人却没写命令时返回帮助，避免主人以为机器人没反应喵
+    # 喵~注意：这里要用**稳定标识**查，不能用别名——别名会随品牌改名而变，
+    # 传 "happy帮助" 进 command_by_name 在改过品牌之后是查不到的喵
     if parsed is None:
-        return _render_command(connection, config, commands.command_by_name("happy帮助"), (), "")
+        table = commands.commands_for_config(config)
+        return _render_command(connection, config, commands.command_by_key("happy帮助", table), (), "")
     # 喵~防御：未知命令完全静默，不回文本也不回图片，避免在群里刷屏喵
     if command is None:
         LOGGER.debug("未知命令 %r，静默忽略", parsed.name)
@@ -354,8 +366,9 @@ def build_image(connection: sqlite3.Connection, config: AppConfig, command_text:
     # 喵~防御：空命令没有图片可画喵
     if parsed is None:
         return None
-    # 查命令定义喵
-    command = commands.command_by_name(parsed.name)
+    # 按当前配置的品牌名查命令定义喵
+    # 喵~注意：下面用的是 command.name（稳定标识），不受品牌改名影响喵
+    command = commands.command_by_name(parsed.name, commands.commands_for_config(config))
     # 喵~防御：未知命令走文本路径喵
     if command is None:
         return None

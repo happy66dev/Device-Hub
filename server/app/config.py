@@ -178,6 +178,12 @@ class BotSection:
     # happy 系列命令绑定的设备组名，看板「设备组」里必须有同名组喵
     # 喵~注意：以前这里硬编码成「主人」，现在改成可配置，默认 happy喵
     happy_group: str = "happy"
+    # 命令名里那个品牌词，也就是原来写死的「happy」喵
+    #
+    # 喵~注意：命令名在 commands.py 里写成 `{品牌}` 占位符，发送前由这里填进去。
+    # 填 "happy" 就与老版本逐字节一致；换成别的词等于把整套命令改名，
+    # 例如填 "小王" 后命令变成 /小王设备、/看看小王喵
+    command_brand: str = "happy"
 
 
 @dataclass(frozen=True)
@@ -449,6 +455,54 @@ def _as_device_id_tuple(section: dict[str, Any], section_name: str, key: str) ->
     return tuple(collected)
 
 
+def _as_command_brand(section: dict[str, Any], section_name: str = "bot", key: str = "command_brand") -> str:
+    """读取命令名里的品牌词，并校验它不会把命令名切坏喵。
+
+    输入：配置节、段名、键名。
+    输出：校验过的品牌词；缺失或空白时退回默认值 "happy"。
+    边界：含空白、斜杠、控制字符或零宽字符时抛 ConfigError。
+
+    喵~注意：这个值会被直接拼进命令名（`{品牌}设备`），
+    所以必须挡住会破坏「一个词」这个前提的字符：
+    - 空白会让 `/小王 设备` 被切成命令名 `小王` + 参数 `设备`，命令再也匹配不上喵；
+    - 斜杠会与命令前缀 `/` 混淆，`/小王/设备` 的解析结果取决于前缀剥离顺序喵；
+    - 零宽字符肉眼看不见，会让「看起来一样」的两个命令名对不上喵。
+    """
+    # 取不到就用默认值喵
+    value = section.get(key, "happy")
+    # 喵~防御：类型不对时按配置错误报出来，别让它悄悄变成字符串喵
+    if not isinstance(value, str):
+        raise ConfigError(
+            f"{section_name}.{key} 必须是字符串，实际是 {type(value).__name__}"
+        )
+    # 去首尾空白后为空则回默认值，与 happy_group 的处理口径一致喵
+    cleaned = value.strip()
+    if not cleaned:
+        return "happy"
+    # 喵~防御：命令名必须是一个「词」，任何空白都会把它切开喵
+    if any(character.isspace() for character in cleaned):
+        raise ConfigError(
+            f"{section_name}.{key} 不能包含空格或制表符，否则命令名会被切成两截，实际是 {cleaned!r}"
+        )
+    # 喵~防御：斜杠会与命令前缀混淆喵
+    if "/" in cleaned or "／" in cleaned:
+        raise ConfigError(
+            f"{section_name}.{key} 不能包含斜杠（/ 或 ／），否则会与命令前缀混淆，实际是 {cleaned!r}"
+        )
+    # 喵~防御：控制字符与零宽字符肉眼不可见，会让同名命令对不上喵
+    if any(ord(character) < 0x20 or character in ("\u200b", "\u200c", "\u200d", "\ufeff") for character in cleaned):
+        raise ConfigError(
+            f"{section_name}.{key} 不能包含控制字符或零宽字符，实际是 {cleaned!r}"
+        )
+    # 长度给个上限，避免命令名长得没法在手机上打出来喵
+    if len(cleaned) > 16:
+        raise ConfigError(
+            f"{section_name}.{key} 最长 16 个字符，实际有 {len(cleaned)} 个"
+        )
+    # 通过全部校验喵
+    return cleaned
+
+
 def _as_str_tuple(section: dict[str, Any], section_name: str, key: str) -> tuple[str, ...]:
     """读取字符串列表（例如放行的客户端 IP / 机器名）喵。"""
     # 取不到就用空列表喵
@@ -537,7 +591,7 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
     gating_raw = _read_section(raw_config, "gating", ("enabled", "rdp_stale_seconds", "rdp_require_known_client", "rdp_allowed_clients"))
     clock_raw = _read_section(raw_config, "clock", ("enabled", "servers", "sync_interval_seconds", "timeout_seconds"))
     # happy 系列命令的配置节喵
-    bot_raw = _read_section(raw_config, "bot", ("happy_group",))
+    bot_raw = _read_section(raw_config, "bot", ("happy_group", "command_brand"))
 
     # 数据库路径按配置文件所在目录解析，保证从任何工作目录启动都指向同一个库喵
     raw_db_path = _as_str(server_raw, "server", "db_path", "data/device_hub.db")
@@ -624,6 +678,7 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
     # happy 系列命令绑定的设备组名喵
     bot_section = BotSection(
         happy_group=_as_str(bot_raw, "bot", "happy_group", "happy").strip() or "happy",
+        command_brand=_as_command_brand(bot_raw),
     )
 
     # 喵~防御：上报口令太短等于没有口令，白名单群之外任何人都能伪造数据喵

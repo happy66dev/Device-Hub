@@ -144,7 +144,7 @@ class BotRunner:
             return
         # 喵~防御：未知命令完全静默——不起忙、不记账、不查库、不发任何消息喵
         # 喵~注意：判定点放在占忙位之前，否则一条闲聊命令会白白挤掉真正的命令喵
-        if router.is_silent_command(command_text):
+        if router.is_silent_command(command_text, self._config):
             LOGGER.info("未知命令 %r，静默忽略：%s", command_text, message.channel)
             return
         # 找到消息所属通道喵
