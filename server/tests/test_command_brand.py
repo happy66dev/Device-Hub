@@ -171,3 +171,157 @@ def test_bot_section_without_brand_attribute_is_tolerated() -> None:
     # 要退回默认品牌，而不是抛 AttributeError 喵
     table = commands.commands_for_config(old_config)
     assert [c.name for c in table] == [c.name for c in commands.COMMANDS]
+
+
+def test_group_missing_error_uses_brand_as_subject(tmp_path: Path) -> None:
+    """设备组不存在时报错里的主语必须是当前品牌名喵。
+
+    喵~注意：这段提示是 happy.py 里 raise 的 Python 字符串，不走 `{品牌}`
+    模板替换，所以最容易漏改。改过品牌的主人若看到「happy 不知道该看谁」，
+    会以为自己配错了地方喵。
+    """
+    from app.bot import happy
+
+    config = _config_with_brand(tmp_path, BRAND)
+    # 组不存在：库里一个设备组都没有喵
+    with pytest.raises(happy.HappyError) as error:
+        happy.load_happy_devices(sqlite3.connect(":memory:"), config, db.utc_now())
+    message = str(error.value)
+    # 主语要是新品牌喵
+    assert f"{BRAND} 不知道该看谁" in message, f"提示里没用新品牌：{message}"
+    # 不能再出现把人说懵的老主语喵
+    assert "happy 不知道该看谁" not in message, f"提示里还有 happy：{message}"
+
+
+def _seed_device(tmp_path: Path, config, device_id: str = "win-test-0001") -> None:
+    """往临时库里塞一个设备组和一条上报，供出图用例使用喵。
+
+    输入：临时目录、配置、设备 ID。
+    输出：无；数据写进配置指向的临时库。
+    边界：组名固定用配置里的 happy_group，与真实用法一致喵。
+    """
+    from datetime import datetime, timezone
+
+    from app import ingest, people
+    from app.bot import happy
+    from app.models import ReportPayload
+
+    db_path = config.server.db_path
+    group_name = happy.resolve_group_name(config)
+    people.save_people(db_path, [people.PersonGroup(name=group_name, devices=(device_id,))])
+    # 造一条上报，让设备有名字与硬件信息喵
+    payload = ReportPayload(
+        device_id=device_id,
+        platform="windows",
+        reported_at=datetime.now(timezone.utc),
+        display_name="测试台式机",
+        hardware={"os_version": "Windows 10", "cpu": "Ryzen 7"},
+        current_app={"name": "Code.exe", "package": "Code.exe"},
+        usage_delta=[{"app": "Code.exe", "seconds": 60}],
+        client_version="0.1.0",
+    )
+    connection = db.connect(db_path)
+    try:
+        ingest.save_report(connection, payload, datetime.now(timezone.utc))
+    finally:
+        connection.close()
+
+
+def _capture_image_params(config, text: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """跑一遍 build_image，抓出传给截图函数的参数喵。
+
+    输入：配置、命令文本、monkeypatch。
+    输出：截图参数；没出图时返回空字典。
+    边界：截图与可用性检查都被打桩，不会真的去开浏览器喵。
+    """
+    from app.bot import snapshot
+
+    captured: dict[str, object] = {}
+
+    def fake_capture(base_url: str, token: str, tab: str, params: dict[str, str], **kwargs: object) -> bytes:
+        """假的截图函数，只记录参数喵。"""
+        captured["tab"] = tab
+        captured["params"] = dict(params)
+        return b"\x89PNG-fake"
+
+    # 替换截图并放行可用性检查喵
+    monkeypatch.setattr(snapshot, "capture_dashboard", fake_capture)
+    monkeypatch.setattr(snapshot, "_node_available", lambda: True)
+
+    connection = db.connect(config.server.db_path)
+    try:
+        image = router.build_image(connection, config, text)
+    finally:
+        connection.close()
+    # 没出图就把空的参数表交回去，让断言能区分「没出图」和「参数不对」喵
+    if image is None:
+        return {}
+    params = captured.get("params")
+    assert isinstance(params, dict)
+    return params
+
+
+def test_renamed_brand_still_produces_rank_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """改了品牌名之后，排行榜图片必须照样出得来喵。
+
+    喵~注意：这条守的是最隐蔽的坑——build_image 靠 `command.name != "看看happy"`
+    判断要不要出图。若 name 跟着品牌一起替换，这里会永远返回 None，
+    命令能响应、文字也正常，只有图片悄悄消失，看日志还以为截图失败喵。
+    """
+    from dataclasses import replace
+
+    config = _config_with_brand(tmp_path, BRAND)
+    # 图片默认是关的，这里显式打开喵
+    config = replace(config, render=replace(config.render, image_enabled=True))
+    db.init_db(config.server.db_path)
+    _seed_device(tmp_path, config)
+    # 用新品牌名发命令，必须出图喵
+    params = _capture_image_params(config, f"看看{BRAND} 全部 排行榜 6小时", monkeypatch)
+    assert params, "改了品牌名之后排行榜图片没出图"
+    assert params["hours"] == "6"
+    # 设备范围也要正确传下去喵
+    assert params["devices"] == "win-test-0001"
+
+
+def test_renamed_brand_still_produces_timeline_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """改了品牌名之后，时间轴图片也必须照样出得来喵。"""
+    from dataclasses import replace
+
+    config = _config_with_brand(tmp_path, BRAND)
+    config = replace(config, render=replace(config.render, image_enabled=True))
+    db.init_db(config.server.db_path)
+    _seed_device(tmp_path, config)
+    params = _capture_image_params(config, f"看看{BRAND} 全部 时间轴", monkeypatch)
+    assert params, "改了品牌名之后时间轴图片没出图"
+    # 时间轴走的是 from/to 参数，不是 hours 喵
+    assert "from" in params and "to" in params
+
+
+def test_old_brand_no_longer_produces_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """改名之后老命令名要彻底失效，连图也不能出喵。
+
+    喵~注意：这条防的是「新旧都生效」——那等于改名没改干净，
+    群友还能用老命令拿到数据喵。
+    """
+    from dataclasses import replace
+
+    config = _config_with_brand(tmp_path, BRAND)
+    config = replace(config, render=replace(config.render, image_enabled=True))
+    db.init_db(config.server.db_path)
+    _seed_device(tmp_path, config)
+    # 老命令必须静默且不出图喵
+    assert _capture_image_params(config, "看看happy 全部 排行榜 6小时", monkeypatch) == {}
+    assert router.is_silent_command("看看happy 全部 排行榜 6小时", config) is True
+
+
+def test_renamed_non_image_command_returns_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """改名后纯文字命令仍然不出图，不能因为 name 乱了而误出喵。"""
+    from dataclasses import replace
+
+    config = _config_with_brand(tmp_path, BRAND)
+    config = replace(config, render=replace(config.render, image_enabled=True))
+    db.init_db(config.server.db_path)
+    _seed_device(tmp_path, config)
+    # 这两条只该回文字喵
+    assert _capture_image_params(config, f"{BRAND}设备", monkeypatch) == {}
+    assert _capture_image_params(config, f"{BRAND}在干嘛", monkeypatch) == {}

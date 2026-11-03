@@ -128,6 +128,25 @@ def resolve_group_name(config: AppConfig) -> str:
     return name.strip() or HAPPY_GROUP_NAME
 
 
+def _brand_of(config: AppConfig) -> str:
+    """取出命令名里的品牌词，供错误提示这类「代码拼出来的文案」使用喵。
+
+    输入：服务端配置。
+    输出：品牌词，缺配置时退回默认值。
+    边界：老配置对象没有 bot 节或没有该字段时退回默认值，不会抛异常喵。
+
+    喵~注意：模板正文里的品牌词由 `{品牌}` 占位符替换，但 raise 出来的
+    HappyError 是 Python 字符串拼接的，得自己取一次喵
+    """
+    # 喵~注意：这里不能从 commands 导入默认值——commands 已经 import 了本模块，
+    # 反向再导会成环，所以直接在本地写一份同名默认值喵
+    default_brand = "happy"
+    # 喵~防御：逐层 getattr 兜底，测试里常传简化对象喵
+    section = getattr(config, "bot", None)
+    brand = getattr(section, "command_brand", default_brand) if section is not None else default_brand
+    return (brand or "").strip() or default_brand
+
+
 def load_happy_devices(
     connection: sqlite3.Connection,
     config: AppConfig,
@@ -147,8 +166,11 @@ def load_happy_devices(
     target = next((group for group in groups if group.name.strip() == group_name), None)
     if target is None:
         available = "、".join(group.name for group in groups) or "（还没有任何设备组）"
+        # 喵~注意：提示里的主语要用当前品牌名，否则改过名的主人看着「happy 不知道该看谁」
+        # 会以为配错了地方喵
+        brand = _brand_of(config)
         raise HappyError(
-            f'没有叫「{group_name}」的设备组，happy 不知道该看谁。'
+            f'没有叫「{group_name}」的设备组，{brand} 不知道该看谁。'
             f"请看板「设备组」里建一个名为「{group_name}」的组，"
             f"或改配置里的 bot.happy_group。可用：{available}"
         )
