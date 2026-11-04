@@ -12,6 +12,7 @@ simulate 五层，集中放一处方便后人看清边界喵。
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -32,14 +33,39 @@ def _config_with_brand(tmp_path: Path, brand: str, group: str = "happy"):
     输入：临时目录、品牌词、设备组名。
     输出：load_config 之后的 AppConfig。
     边界：配置文本基于仓库里的真实 config.yaml，改完写进临时目录，不碰原文件喵。
+
+    喵~注意：真实 config.yaml 里可能已经写了 command_brand（主人自己加过），
+    这时必须**覆盖**那一行而不是再插一行——YAML 出现重复键时后一个会静默
+    盖掉前一个，测试会拿到 happy 而不是期望的品牌词喵
     """
     source = Path(__file__).resolve().parent.parent / "config.yaml"
     text = source.read_text(encoding="utf-8")
-    # 喵~注意：happy_group 后面紧跟 command_brand，YAML 缩进要对齐喵
-    text = text.replace(
-        'happy_group: "happy"',
-        f'happy_group: "{group}"\n  command_brand: "{brand}"',
-    )
+    # 喵~防御：已有该键时只改值，避免写出重复键喵
+    existing = re.search(r'^(\s*)command_brand:\s*.*$', text, flags=re.MULTILINE)
+    if existing is not None:
+        # 保留原缩进，只换值喵
+        text = re.sub(
+            r'^(\s*)command_brand:\s*.*$',
+            lambda match: f'{match.group(1)}command_brand: "{brand}"',
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+    else:
+        # 没有该键时插在 happy_group 后面，缩进对齐喵
+        text = text.replace(
+            'happy_group: "happy"',
+            f'happy_group: "{group}"\n  command_brand: "{brand}"',
+        )
+    # 设备组名同样按需覆盖或插入喵
+    if existing is not None:
+        text = re.sub(
+            r'^(\s*)happy_group:\s*.*$',
+            lambda match: f'{match.group(1)}happy_group: "{group}"',
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
     # 数据库落到临时目录，避免污染真实库喵
     text = text.replace(
         'db_path: "data/device_hub.db"',

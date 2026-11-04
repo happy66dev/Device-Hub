@@ -365,6 +365,27 @@ def usage_seconds_since(
     return int(row["total"]) if row is not None else 0
 
 
+def _pick_latest(candidates: Sequence[HappyDevice]) -> HappyDevice | None:
+    """在一批候选设备里挑「最近有使用」的那台喵。
+
+    输入：候选设备序列（顺序无所谓）。
+    输出：最近一次使用时刻最晚的那台；都没记录时返回 None。
+    边界：时刻完全相同时取组内优先级高的（priority 小的）喵。
+
+    喵~注意：三档状态（在用 / 挂机 / 不在）共用这一套挑选规则，
+    原来前两档按组内顺序取第一个、第三档按时刻取最新，
+    同一份数据在跨档时会选中不同的设备，口径不一致喵
+    """
+    # 只看有使用记录的设备喵
+    recorded = [device for device in candidates if device.last_usage is not None]
+    # 喵~防御：全都没有记录时没有「最新」可言喵
+    if not recorded:
+        return None
+    # 时刻倒序（新的在前），同一时刻按优先级正序（组内靠前的在前）喵
+    recorded.sort(key=lambda device: (-device.last_usage.timestamp(), device.priority))  # type: ignore[union-attr]
+    return recorded[0]
+
+
 def judge_state(
     connection: sqlite3.Connection,
     devices: list[HappyDevice],
@@ -372,12 +393,13 @@ def judge_state(
 ) -> tuple[str, HappyDevice | None, str]:
     """判定主人现在处于哪一档状态喵。
 
-    输入：连接、按优先级排列的设备、基准时间。
+    输入：连接、设备列表、基准时间。
     输出：(状态, 该展示的设备, 理由)。
-    边界：规则按「在用 > 挂机 > 不在」短路，
-          多台设备同时满足时一律取优先级最高的那台喵。
+    边界：规则按「在用 > 挂机 > 不在」短路；每一档内部若有多台设备同时满足，
+          统一取「最近一次使用时刻最晚」的那台，时刻相同时才看组内优先级喵。
     """
     # 先看最近 3 分钟：在线且有足够长的使用记录就算在用喵
+    active: list[HappyDevice] = []
     for device in devices:
         # 窗口内的使用秒数喵
         # 喵~防御：上界卡在 now，未来时刻的采样不能点亮「在用」喵
@@ -386,16 +408,28 @@ def judge_state(
         )
         # 喵~注意：单次误采样不算，要求累计达到下限且设备在线喵
         if seconds >= MIN_ACTIVITY_SECONDS and device.online:
-            return STATE_ACTIVE, device, f"{device.name} 最近 3 分钟使用了 {seconds} 秒"
+            active.append(device)
+    # 多台同时「在用」时取最近有使用的那台喵
+    picked_active = _pick_latest(active)
+    if picked_active is not None:
+        seconds = usage_seconds_since(
+            connection, picked_active.device_id, now - timedelta(seconds=ACTIVE_WINDOW_SECONDS), now
+        )
+        return STATE_ACTIVE, picked_active, f"{picked_active.name} 最近 3 分钟使用了 {seconds} 秒"
     # 再看空档时长：在线但空档不超过 10 分钟，说明人还在，只是没在动喵
+    afk: list[HappyDevice] = []
     for device in devices:
         # 喵~注意：判的是空档有多长（= 时间轴上那段斜纹），不是心跳里的 afk 标记；
         # 被门控暂停计时的设备 afk=false 但照样是空档，只看标记会漏掉它们喵
         if not device.online or device.gap_seconds is None:
             continue
         if device.gap_seconds <= AFK_WINDOW_SECONDS:
-            return STATE_AFK, device, f"{device.name} 空档 {device.gap_seconds} 秒，还没到 10 分钟"
-    # 其余一律算不在喵
+            afk.append(device)
+    # 多台同时「挂机」时同样取最近有使用的那台喵
+    picked_afk = _pick_latest(afk)
+    if picked_afk is not None:
+        return STATE_AFK, picked_afk, f"{picked_afk.name} 空档 {picked_afk.gap_seconds} 秒，还没到 10 分钟"
+    # 其余一律算不在，同样取最近有使用的那台喵
     best = most_recent_usage(devices)
     # 喵~防御：从来没记录过时连设备都不给，让模板走「没有记录」分支喵
     if best is None:
@@ -409,15 +443,11 @@ def most_recent_usage(devices: list[HappyDevice]) -> HappyDevice | None:
     输入：设备列表。
     输出：最近使用的那台；全都没有记录时返回 None。
     边界：时刻相同时取优先级高的喵。
+
+    喵~注意：实现委托给 _pick_latest，与三档状态判定共用同一套规则，
+    避免两处排序口径哪天改歪了却没人发现喵
     """
-    # 只看有记录的设备喵
-    candidates = [device for device in devices if device.last_usage is not None]
-    # 喵~防御：一台都没有时返回 None 喵
-    if not candidates:
-        return None
-    # 时刻倒序，再按优先级正序，保证排序结果稳定喵
-    candidates.sort(key=lambda device: (-device.last_usage.timestamp(), device.priority))  # type: ignore[union-attr]
-    return candidates[0]
+    return _pick_latest(devices)
 
 
 def active_device(

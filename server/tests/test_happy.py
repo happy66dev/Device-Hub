@@ -454,9 +454,13 @@ def test_current_app_seconds_kept_when_names_match(connection: sqlite3.Connectio
 # ==================== 优先级 ====================
 
 
-def test_priority_picks_first_device(connection: sqlite3.Connection, app_config) -> None:
-    """两台都符合条件时取组内顺序靠前的那台喵。"""
-    # 两台设备都有近期使用喵
+def test_same_moment_falls_back_to_priority(connection: sqlite3.Connection, app_config) -> None:
+    """多台设备使用时刻完全相同时，按组内顺序取靠前的那台喵。
+
+    喵~注意：这条只测「时刻相同」这个回落分支。挑选规则的第一顺位是
+    「谁的使用时刻更新」，不是组内顺序——别把它当成优先级优先的证据喵
+    """
+    # 两台设备的使用时刻完全相同（都是 60 秒前）喵
     _seed_device(connection, "win-a", "本机 Windows")
     _seed_device(connection, "and-b", "手机")
     _seed_usage(connection, "win-a", 60, 60)
@@ -464,10 +468,62 @@ def test_priority_picks_first_device(connection: sqlite3.Connection, app_config)
     # 手机排在组内第一位喵
     _set_group(app_config, ("and-b", "win-a"))
     devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
-    # 应选手机喵
+    # 时刻打平时才轮到优先级，应选手机喵
     state, device, _reason = happy.judge_state(connection, devices, BASE_NOW)
     assert state == happy.STATE_ACTIVE
     assert device is not None and device.name == "手机"
+
+
+def test_active_picks_latest_usage_over_priority(connection: sqlite3.Connection, app_config) -> None:
+    """多台同时「在用」时，取使用时刻更新的那台，哪怕它组内排在后面喵。
+
+    喵~注意：这是 2026-11-04 主人明确的口径——挑选第一顺位是「最新」，
+    时刻打平才看优先级。旧实现按组内顺序短路，会挑中更早用过的那台喵
+    """
+    _seed_device(connection, "win-a", "甲机")
+    _seed_device(connection, "and-b", "乙机")
+    # 甲机组内靠前但 150 秒前用过，乙机组内靠后但 30 秒前用过喵
+    _seed_usage(connection, "win-a", 60, 150)
+    _seed_usage(connection, "and-b", 60, 30)
+    _set_group(app_config, ("win-a", "and-b"))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    state, device, _reason = happy.judge_state(connection, devices, BASE_NOW)
+    # 两台都在「在用」窗口内，应选时刻更新的乙机喵
+    assert state == happy.STATE_ACTIVE
+    assert device is not None and device.name == "乙机", "应该取使用时刻最新的那台"
+
+
+def test_afk_picks_latest_usage_over_priority(connection: sqlite3.Connection, app_config) -> None:
+    """多台同时「挂机」时同样取使用时刻更新的那台喵。"""
+    _seed_device(connection, "win-a", "甲机")
+    _seed_device(connection, "and-b", "乙机")
+    # 两台都超出「在用」窗口（>3 分钟），但都在「挂机」窗口内（<=10 分钟）喵
+    _seed_usage(connection, "win-a", 60, 500)
+    _seed_usage(connection, "and-b", 60, 200)
+    _set_group(app_config, ("win-a", "and-b"))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    state, device, _reason = happy.judge_state(connection, devices, BASE_NOW)
+    assert state == happy.STATE_AFK
+    assert device is not None and device.name == "乙机", "挂机档也要取使用时刻最新的那台"
+
+
+def test_pick_latest_prefers_newer_then_priority(connection: sqlite3.Connection, app_config) -> None:
+    """_pick_latest 的排序顺序：先看时刻，再看优先级喵。"""
+    _seed_device(connection, "win-a", "甲机")
+    _seed_device(connection, "and-b", "乙机")
+    _seed_usage(connection, "win-a", 60, 100)
+    _seed_usage(connection, "and-b", 60, 50)
+    _set_group(app_config, ("win-a", "and-b"))
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    # 时刻不同 -> 取新的喵
+    picked = happy._pick_latest(devices)
+    assert picked is not None and picked.name == "乙机"
+    # 把两台时刻改成一样 -> 回落到优先级喵
+    connection.execute("UPDATE usage_samples SET sampled_at = ? WHERE device_id = 'and-b'", (_stamp(BASE_NOW - timedelta(seconds=100)),))
+    connection.commit()
+    devices = happy.load_happy_devices(connection, app_config, BASE_NOW)
+    picked = happy._pick_latest(devices)
+    assert picked is not None and picked.name == "甲机"
 
 
 def test_priority_falls_through_to_second(connection: sqlite3.Connection, app_config) -> None:
